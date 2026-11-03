@@ -881,32 +881,38 @@ const MIGRATION_PENDING_MARKER = '.legacy-migration-pending'
 const MIGRATION_BACKUP_DIR = '.migration-backup'
 const DATABASE_DIR_NAMES = new Set(['Local Storage', 'Session Storage', 'IndexedDB'])
 
-function backupPreMigrationDestination(currentDir: string, backupDir: string): void {
-  fs.mkdirSync(backupDir, { recursive: true })
-  if (!fs.existsSync(currentDir)) return
-  const entries = fs.readdirSync(currentDir)
-  for (const entry of entries) {
-    if (
-      entry.startsWith('Singleton') ||
-      entry === 'Crashpad' ||
-      entry === '.migration-stage' ||
-      entry === MIGRATION_BACKUP_DIR ||
-      entry === MIGRATION_IN_PROGRESS_MARKER ||
-      entry === MIGRATION_PENDING_MARKER ||
-      entry === MIGRATION_COMPLETE_MARKER
-    ) {
-      continue
-    }
-    const src = path.join(currentDir, entry)
-    const dst = path.join(backupDir, entry)
-    try {
+function backupPreMigrationDestination(currentDir: string, backupDir: string): boolean {
+  try {
+    fs.mkdirSync(backupDir, { recursive: true })
+    if (!fs.existsSync(currentDir)) return true
+    const entries = fs.readdirSync(currentDir)
+    for (const entry of entries) {
+      if (
+        entry.startsWith('Singleton') ||
+        entry === 'Crashpad' ||
+        entry === '.migration-stage' ||
+        entry === MIGRATION_BACKUP_DIR ||
+        entry === MIGRATION_IN_PROGRESS_MARKER ||
+        entry === MIGRATION_PENDING_MARKER ||
+        entry === MIGRATION_COMPLETE_MARKER
+      ) {
+        continue
+      }
+      const src = path.join(currentDir, entry)
+      const dst = path.join(backupDir, entry)
       fs.cpSync(src, dst, { recursive: true })
+    }
+    return true
+  } catch {
+    try {
+      fs.rmSync(backupDir, { recursive: true, force: true })
     } catch {}
+    return false
   }
 }
 
 function rollbackMigrationDestination(currentDir: string, backupDir: string, stagedEntries: string[]): void {
-  // First remove any entries copied into currentDir
+  // First remove any entries copied into currentDir from staging
   for (const entry of stagedEntries) {
     try {
       fs.rmSync(path.join(currentDir, entry), { recursive: true, force: true })
@@ -920,6 +926,44 @@ function rollbackMigrationDestination(currentDir: string, backupDir: string, sta
         fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
       } catch {}
     }
+  }
+}
+
+function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): void {
+  try {
+    if (!fs.existsSync(legacyFile)) return
+    if (!fs.existsSync(currentFile)) {
+      fs.copyFileSync(legacyFile, currentFile)
+      return
+    }
+    const currentRegistry = JSON.parse(fs.readFileSync(currentFile, 'utf8'))
+    const legacyRegistry = JSON.parse(fs.readFileSync(legacyFile, 'utf8'))
+
+    if (Array.isArray(currentRegistry.connections) && Array.isArray(legacyRegistry.connections)) {
+      const existingIds = new Set(currentRegistry.connections.map((c: any) => c.id))
+      const existingLabels = new Set(
+        currentRegistry.connections.map((c: any) => String(c.label || '').trim().toLowerCase())
+      )
+      let modified = false
+
+      for (const conn of legacyRegistry.connections) {
+        if (!existingIds.has(conn.id)) {
+          let label = conn.label || conn.id
+          if (existingLabels.has(label.trim().toLowerCase())) {
+            label = `${label} (Legacy)`
+          }
+          currentRegistry.connections.push({ ...conn, label })
+          existingIds.add(conn.id)
+          existingLabels.add(label.trim().toLowerCase())
+          modified = true
+        }
+      }
+      if (modified) {
+        fs.writeFileSync(currentFile, JSON.stringify(currentRegistry, null, 2), 'utf8')
+      }
+    }
+  } catch {
+    // If reconciliation fails, keep active currentFile untouched
   }
 }
 
@@ -959,9 +1003,16 @@ function maybeMigrateLegacyDesktopState(): void {
         return
       }
 
-      // If a previous migration was interrupted before completion, restore pre-migration state
+      // If a previous migration was interrupted before completion, recover cleanly:
+      // First remove any staged entries that were partially applied, then restore original destination state.
       if (fs.existsSync(inProgressPath)) {
         try {
+          if (fs.existsSync(stagingDir)) {
+            const staged = fs.readdirSync(stagingDir)
+            for (const item of staged) {
+              fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
+            }
+          }
           if (fs.existsSync(backupDir)) {
             const backedUp = fs.readdirSync(backupDir)
             for (const entry of backedUp) {
@@ -970,11 +1021,6 @@ function maybeMigrateLegacyDesktopState(): void {
               } catch {}
             }
             fs.rmSync(backupDir, { recursive: true, force: true })
-          } else if (fs.existsSync(stagingDir)) {
-            const staged = fs.readdirSync(stagingDir)
-            for (const item of staged) {
-              fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
-            }
           }
         } catch {
           // ignore cleanup error
@@ -1023,14 +1069,22 @@ function maybeMigrateLegacyDesktopState(): void {
         })
 
         const stagedEntries = fs.readdirSync(stagingDir)
-        // Step 2: Mark migration in progress and snapshot destination before applying changes
+        // Step 2: Mark migration in progress and snapshot destination before applying changes.
+        // Abort migration if destination snapshot fails (per AGENTS.md failed-write recovery invariant).
         fs.writeFileSync(inProgressPath, '1\n', 'utf8')
-        backupPreMigrationDestination(currentDir, backupDir)
+        const backupOk = backupPreMigrationDestination(currentDir, backupDir)
+        if (!backupOk) {
+          console.warn('[noemetra] failed to complete destination backup snapshot; aborting migration to protect existing state')
+          try {
+            fs.rmSync(inProgressPath, { force: true })
+          } catch {}
+          return
+        }
 
         try {
           // Step 3: Transfer staging into currentDir.
-          // Database directories (LevelDB / IndexedDB) must be migrated as consistent atomic units;
-          // merging file-by-file retains colliding default files and risks LevelDB corruption.
+          // Database directories (LevelDB / IndexedDB) must never overwrite an active destination database;
+          // if destination already has active databases, preserve them in place and save legacy copies alongside.
           for (const entry of stagedEntries) {
             const stagedPath = path.join(stagingDir, entry)
             const destPath = path.join(currentDir, entry)
@@ -1039,17 +1093,19 @@ function maybeMigrateLegacyDesktopState(): void {
 
             if (isDatabaseDir) {
               if (fs.existsSync(destPath)) {
-                // If destination already has a database directory (e.g. from an intervening postponed session),
-                // preserve it aside to guarantee intervening user state is never discarded.
-                const preservedPath = path.join(currentDir, `${entry}.postponed-backup`)
-                if (!fs.existsSync(preservedPath)) {
+                // If destination already has an active database (e.g. from an intervening postponed session),
+                // preserve active state without replacing it; store legacy database alongside under .legacy
+                const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
+                if (!fs.existsSync(legacyPreservedPath)) {
                   try {
-                    fs.cpSync(destPath, preservedPath, { recursive: true })
+                    fs.cpSync(stagedPath, legacyPreservedPath, { recursive: true })
                   } catch {}
                 }
-                fs.rmSync(destPath, { recursive: true, force: true })
+              } else {
+                fs.cpSync(stagedPath, destPath, { recursive: true })
               }
-              fs.cpSync(stagedPath, destPath, { recursive: true })
+            } else if (entry === 'connections.json') {
+              reconcileConnectionsRegistry(destPath, stagedPath)
             } else {
               const stat = fs.statSync(stagedPath)
               if (stat.isDirectory()) {
@@ -1060,7 +1116,7 @@ function maybeMigrateLegacyDesktopState(): void {
                   force: false
                 })
               } else {
-                // Individual files: if already existing in destination, preserve intervening user state
+                // Individual files: if already existing in destination, preserve active user state
                 if (!fs.existsSync(destPath)) {
                   fs.copyFileSync(stagedPath, destPath)
                 }
