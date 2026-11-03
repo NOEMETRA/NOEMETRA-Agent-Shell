@@ -732,28 +732,6 @@ if (USER_DATA_OVERRIDE || process.env.HERMES_DATA_DIR_SUFFIX) {
   app.setPath('userData', resolvedUserData)
 }
 
-// Migrate legacy desktop state (connections, window bounds, active profile) from historical
-// Hermes installation if upgrading to NOEMETRA Agent Shell and new userData is empty.
-try {
-  const legacyDir = path.join(app.getPath('appData'), 'Hermes')
-  const currentDir = app.getPath('userData')
-  if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
-    if (!fs.existsSync(currentDir) || fs.readdirSync(currentDir).length === 0) {
-      fs.mkdirSync(currentDir, { recursive: true })
-      fs.cpSync(legacyDir, currentDir, {
-        recursive: true,
-        errorOnExist: false,
-        filter: (src) => {
-          const basename = path.basename(src)
-          return !basename.startsWith('Singleton') && basename !== 'Crashpad'
-        }
-      })
-    }
-  }
-} catch {
-  // Non-blocking best-effort migration
-}
-
 // Only the lock owner may persist launch recovery markers, adopt a workspace or start a
 // backend, so the lock is taken as soon as userData is final (#131055, #143056).
 // #78101: on Linux/X11 a zombie/defunct Electron process leaves the
@@ -784,6 +762,36 @@ if (!isPrimaryInstance) {
   console.error('[hermes] another Hermes Desktop instance holds the single-instance lock; exiting')
   app.exit(0)
 }
+
+// Migrate legacy desktop state (connections, window bounds, active profile) from historical
+// Hermes installation if upgrading to NOEMETRA Agent Shell and new userData is empty.
+// Strictly scoped to the primary lock holder of the default stable installation (never for isolated
+// USER_DATA_OVERRIDE / HERMES_DATA_DIR_SUFFIX or non-default variants).
+function maybeMigrateLegacyDesktopState(): void {
+  if (USER_DATA_OVERRIDE || process.env.HERMES_DATA_DIR_SUFFIX || IDENTITY_APP_NAME !== null) {
+    return
+  }
+  try {
+    const legacyDir = path.join(app.getPath('appData'), 'Hermes')
+    const currentDir = app.getPath('userData')
+    if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
+      if (!fs.existsSync(currentDir) || fs.readdirSync(currentDir).length === 0) {
+        fs.mkdirSync(currentDir, { recursive: true })
+        fs.cpSync(legacyDir, currentDir, {
+          recursive: true,
+          errorOnExist: false,
+          filter: (src) => {
+            const basename = path.basename(src)
+            return !basename.startsWith('Singleton') && basename !== 'Crashpad'
+          }
+        })
+      }
+    }
+  } catch {
+    // Non-blocking best-effort migration
+  }
+}
+maybeMigrateLegacyDesktopState()
 
 // `hermes desktop` shortens TMPDIR only so the lock above can bind its socket (#124688). The
 // backend and every other child get the real one (the profile scratch dir) back.

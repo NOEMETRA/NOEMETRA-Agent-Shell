@@ -141,9 +141,12 @@ A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono
 4. **Isolamento Fixture Test di Provider (`tests/providers/test_profile_home_layers.py`)**:
    - *Problema*: Un leak nello stato di discovery nella fixture `homes` causava la perdita del registro nei test eseguiti in sequenza.
    - *Risoluzione*: Garantita la pre-discovery del registro prima dello snapshot della fixture `homes`, portando la suite `tests/providers/` al 100% di successo (93/93 passati).
-5. **Migrazione Automatica Stato Desktop Legacy (`apps/desktop/electron/main.ts`)**:
-   - *Problema*: La modifica di `productName` in `package.json` indirizza Electron verso la nuova directory `userData` (`NOEMETRA Agent Shell`), rischiando di non caricare le impostazioni e i profili di preesistenti installazioni desktop `Hermes`.
-   - *Risoluzione*: Implementata la funzione `migrateLegacyDesktopState` in `main.ts` che esegue una copia sicura e atomica dei dati dalla directory storica `Hermes` se la nuova directory `userData` è vuota o appena creata, preservando connessioni, profili e credenziali. Aggiornati i test in `product-identity.test.ts` (10/10 passati).
+5. **Migrazione Automatica Stato Desktop Legacy Con Lock e Isolamento Scope (`apps/desktop/electron/main.ts`)**:
+   - *Problema*: La modifica di `productName` in `package.json` indirizza Electron verso la nuova directory `userData` (`NOEMETRA Agent Shell`). Una migrazione ingenua prima dell'acquisizione del lock o in istanze isolate (`HERMES_DESKTOP_USER_DATA_DIR` o varianti) poteva causare race condition tra processi concorrenti o inquinare directory isolate.
+   - *Risoluzione*: Implementata `maybeMigrateLegacyDesktopState` eseguita *esclusivamente* dopo l'acquisizione confermata del single-instance lock e vincolata all'installazione di default stabile (escludendo directory isolate o varianti `light`/`canary`). Aggiornati i test in `product-identity.test.ts` (10/10 passati).
 6. **Normalizzazione Endpoint con Trailing Slash (`hermes_cli/setup_quick.py`)**:
    - *Problema*: L'inserimento di un URL con slash finale (es. `http://127.0.0.1:11434/v1/`) causava la generazione errata di `.../v1/v1`.
    - *Risoluzione*: Normalizzazione preventiva con `.strip().rstrip("/")`, garantendo endpoint sempre ben formati in qualsiasi combinazione di input.
+7. **Disaccoppiamento Feed Aggiornamenti Desktop (`apps/desktop/electron-builder.config.cjs`, `update-notes.ts`, `update-status.tsx`)**:
+   - *Problema*: In assenza di variabile d'ambiente `GITHUB_REPOSITORY`, i pacchetti desktop compilati facevano fallback sull'update feed di `NousResearch/hermes-agent`, rischiando di proporre build upstream anziché NOEMETRA.
+   - *Risoluzione*: Impostato il fallback predefinito su `NOEMETRA/NOEMETRA-Agent-Shell` e allineati gli URL delle note di rilascio.
