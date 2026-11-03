@@ -565,7 +565,12 @@ import {
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
-import { removeStaleSingletonLock } from './singleton-lock'
+import {
+  isStaleSingletonLockOwner,
+  parseSingletonLockPid,
+  readLinuxProcState,
+  removeStaleSingletonLock
+} from './singleton-lock'
 import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
 import { resolveSourcePython } from './source-python'
 import { registerSpellcheckDictionaryIpc } from './spellcheck-dictionary-ipc'
@@ -811,38 +816,57 @@ function legacyDirectoryForVariant(): string | null {
 function isLegacyAppRunning(legacyDir: string): boolean {
   try {
     const lockFile = path.join(legacyDir, 'SingletonLock')
-    if (fs.existsSync(lockFile)) {
-      if (process.platform !== 'win32') {
-        try {
-          const target = fs.readlinkSync(lockFile)
-          const match = target.match(/-(\d+)$/)
-          if (match) {
-            const pid = Number.parseInt(match[1], 10)
-            if (pid > 0) {
-              process.kill(pid, 0)
-              return true
-            }
-          }
-        } catch (err: any) {
-          if (err.code === 'EPERM') return true
+
+    // Linux: SingletonLock is a symlink whose target is <hostname>-<pid>
+    if (process.platform === 'linux') {
+      try {
+        const target = fs.readlinkSync(lockFile)
+        const pid = parseSingletonLockPid(target, os.hostname())
+        if (pid !== null && !isStaleSingletonLockOwner(readLinuxProcState(pid))) {
+          return true
         }
-      } else {
-        try {
+      } catch {
+        // ENOENT / EINVAL / unreadable
+      }
+    } else if (process.platform === 'win32') {
+      // Windows: Electron holds an exclusive handle on SingletonLock
+      try {
+        if (fs.existsSync(lockFile)) {
           const fd = fs.openSync(lockFile, 'r+')
           fs.closeSync(fd)
-        } catch (err: any) {
-          if (err.code === 'EBUSY' || err.code === 'EPERM') return true
         }
+      } catch (err: any) {
+        if (err.code === 'EBUSY' || err.code === 'EPERM') return true
+      }
+    } else {
+      // macOS / BSD: ProcessSingleton symlink <hostname>-<pid>
+      try {
+        const target = fs.readlinkSync(lockFile)
+        const match = target.match(/-(\d+)$/)
+        if (match) {
+          const pid = Number.parseInt(match[1], 10)
+          if (pid > 0) {
+            try {
+              process.kill(pid, 0)
+              return true
+            } catch (err: any) {
+              if (err.code === 'EPERM') return true
+            }
+          }
+        }
+      } catch {
+        // ENOENT / EINVAL / unreadable
       }
     }
 
+    // Windows / POSIX additional LevelDB lock probe
     const levelDbLock = path.join(legacyDir, 'Local Storage', 'leveldb', 'LOCK')
-    if (fs.existsSync(levelDbLock)) {
+    if (fs.existsSync(levelDbLock) && process.platform === 'win32') {
       try {
         const fd = fs.openSync(levelDbLock, 'r+')
         fs.closeSync(fd)
       } catch (err: any) {
-        if (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EAGAIN') {
+        if (err.code === 'EBUSY' || err.code === 'EPERM') {
           return true
         }
       }
@@ -852,6 +876,8 @@ function isLegacyAppRunning(legacyDir: string): boolean {
   }
   return false
 }
+
+const MIGRATION_PENDING_MARKER = '.legacy-migration-pending'
 
 function maybeMigrateLegacyDesktopState(): void {
   if (
@@ -867,20 +893,26 @@ function maybeMigrateLegacyDesktopState(): void {
   try {
     const currentDir = app.getPath('userData')
     if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
-      // Coordinate with legacy app: require it to be closed before copying databases
-      // to ensure consistent, quiescent LevelDB and Local Storage snapshots.
-      if (isLegacyAppRunning(legacyDir)) {
-        console.warn('[noemetra] legacy Hermes application is currently running; postponing migration until it is closed')
-        return
-      }
-
       const markerPath = path.join(currentDir, MIGRATION_COMPLETE_MARKER)
       if (fs.existsSync(markerPath)) {
         return
       }
 
       const inProgressPath = path.join(currentDir, MIGRATION_IN_PROGRESS_MARKER)
+      const pendingMarkerPath = path.join(currentDir, MIGRATION_PENDING_MARKER)
       const stagingDir = path.join(currentDir, '.migration-stage')
+
+      // Coordinate with legacy app: require it to be closed before copying databases
+      // to ensure consistent, quiescent LevelDB and Local Storage snapshots.
+      if (isLegacyAppRunning(legacyDir)) {
+        // Record pending migration marker so a subsequent launch after legacy app
+        // exit can reclaim and merge the state instead of mistaking default files for user state.
+        try {
+          fs.writeFileSync(pendingMarkerPath, '1\n', 'utf8')
+        } catch {}
+        console.warn('[noemetra] legacy Hermes application is currently running; migration postponed until it is closed')
+        return
+      }
 
       // If a previous migration was interrupted before completion, clean up partial state
       if (fs.existsSync(inProgressPath)) {
@@ -907,8 +939,11 @@ function maybeMigrateLegacyDesktopState(): void {
         }
       }
 
-      // Ignore runtime lock files, crash reporter dirs, and migration markers/staging created before this check runs
+      const isPendingMigration = fs.existsSync(pendingMarkerPath)
+      // Ignore runtime lock files, crash reporter dirs, and migration markers/staging created before this check runs.
+      // If a migration was previously pending, initial default files are not considered meaningful user state.
       const hasMeaningfulState =
+        !isPendingMigration &&
         fs.existsSync(currentDir) &&
         fs.readdirSync(currentDir).some(
           (name) =>
@@ -916,6 +951,7 @@ function maybeMigrateLegacyDesktopState(): void {
             name !== 'Crashpad' &&
             name !== '.migration-stage' &&
             name !== MIGRATION_IN_PROGRESS_MARKER &&
+            name !== MIGRATION_PENDING_MARKER &&
             name !== MIGRATION_COMPLETE_MARKER
         )
 
@@ -953,10 +989,14 @@ function maybeMigrateLegacyDesktopState(): void {
                 name !== 'Crashpad' &&
                 name !== '.migration-stage' &&
                 name !== MIGRATION_IN_PROGRESS_MARKER &&
+                name !== MIGRATION_PENDING_MARKER &&
                 name !== MIGRATION_COMPLETE_MARKER
             )
           if (copiedSomething) {
             fs.writeFileSync(markerPath, 'ok\n', 'utf8')
+            try {
+              fs.rmSync(pendingMarkerPath, { force: true })
+            } catch {}
           }
           try {
             fs.rmSync(inProgressPath, { force: true })
