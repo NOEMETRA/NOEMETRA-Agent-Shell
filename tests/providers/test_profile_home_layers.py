@@ -37,6 +37,9 @@ def _install(home: Path, name: str) -> None:
 def homes(tmp_path, monkeypatch):
     import providers
 
+    if not providers._discovered:
+        providers._discover_providers()
+
     launch = tmp_path / "launch"
     secondary = tmp_path / "profiles" / "scaleup"
     launch.mkdir()

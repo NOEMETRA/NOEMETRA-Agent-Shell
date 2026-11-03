@@ -117,6 +117,21 @@ def _keep_imported_model(config: dict, imported_from: str) -> bool:
     ], 0, description=f"  Settings were imported from {imported_from}.") == 0
 
 
+def _keep_imported_model_local(config: dict, imported_from: str) -> bool:
+    """After an import that brought a model during local setup, ask whether to keep it (the default)
+    or configure local models with Ollama; True keeps it."""
+    from hermes_cli.setup import _info, print_header, prompt_choice
+    label = _imported_model_label(config) if imported_from else ""
+    if not label:
+        return False
+    print_header("Model & Provider", gap=True)
+    _info(f"Settings were imported from {imported_from}.")
+    return prompt_choice(f"Keep your imported model ({label}) or configure local models with Ollama?", [
+        f"Keep {label}",
+        "Configure local models with Ollama (offline, private, free)",
+    ], 0, description=f"  Settings were imported from {imported_from}.") == 0
+
+
 def _quick_setup_nous_portal(config: dict) -> None:
     """Quick Setup's Nous Portal step: OAuth login + model selection (provider set to "nous" by the save)."""
     from hermes_cli.setup import _info, print_header, print_info, print_warning
@@ -150,7 +165,7 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
     from hermes_cli.cli_output import line_input
 
     # Step 1: the imported model (if any) or local Ollama probe.
-    if _keep_imported_model(config, imported_from):
+    if _keep_imported_model_local(config, imported_from):
         setup_terminal_backend(config)
         _apply_default_agent_settings(config)
         save_config(config)
