@@ -238,9 +238,14 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
 
     if not isinstance(config.get("model"), dict):
         config["model"] = {}
-    config["model"]["provider"] = provider_name
-    config["model"]["base_url"] = base_v1
-    config["model"]["default"] = selected_model
+    model_cfg = config["model"]
+    from hermes_cli.config import clear_model_endpoint_credentials
+    clear_model_endpoint_credentials(model_cfg, clear_api_key=True, clear_api_mode=True)
+    for extra_key in ("wire_format", "headers", "extra_body", "auth_header"):
+        model_cfg.pop(extra_key, None)
+    model_cfg["provider"] = provider_name
+    model_cfg["base_url"] = base_v1
+    model_cfg["default"] = selected_model
 
     print_success(f"Configured provider: {provider_name} (model: {selected_model}, endpoint: {base_v1})")
 

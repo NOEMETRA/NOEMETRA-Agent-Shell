@@ -792,6 +792,8 @@ function legacyDirectoryForVariant(): string | null {
   return null
 }
 
+const MIGRATION_COMPLETE_MARKER = '.legacy-migration-complete'
+
 function maybeMigrateLegacyDesktopState(): void {
   if (
     USER_DATA_OVERRIDE ||
@@ -806,24 +808,66 @@ function maybeMigrateLegacyDesktopState(): void {
   try {
     const currentDir = app.getPath('userData')
     if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
-      // Ignore runtime lock files and crash reporter dirs created before this check runs
+      const markerPath = path.join(currentDir, MIGRATION_COMPLETE_MARKER)
+      if (fs.existsSync(markerPath)) {
+        return
+      }
+
+      const stagingDir = path.join(currentDir, '.migration-stage')
+      if (fs.existsSync(stagingDir)) {
+        try {
+          fs.rmSync(stagingDir, { recursive: true, force: true })
+        } catch {
+          // ignore cleanup error
+        }
+      }
+
+      // Ignore runtime lock files, crash reporter dirs, and migration markers/staging created before this check runs
       const hasMeaningfulState =
         fs.existsSync(currentDir) &&
-        fs.readdirSync(currentDir).some((name) => !name.startsWith('Singleton') && name !== 'Crashpad')
+        fs.readdirSync(currentDir).some(
+          (name) =>
+            !name.startsWith('Singleton') &&
+            name !== 'Crashpad' &&
+            name !== '.migration-stage' &&
+            name !== MIGRATION_COMPLETE_MARKER
+        )
+
       if (!hasMeaningfulState) {
-        fs.mkdirSync(currentDir, { recursive: true })
-        fs.cpSync(legacyDir, currentDir, {
+        fs.mkdirSync(stagingDir, { recursive: true })
+        // Step 1: Copy to staging directory first (transactional isolation)
+        fs.cpSync(legacyDir, stagingDir, {
           recursive: true,
           errorOnExist: false,
+          force: false,
           filter: (src) => {
             const basename = path.basename(src)
-            return !basename.startsWith('Singleton') && basename !== 'Crashpad'
+            return !basename.startsWith('Singleton') && basename !== 'Crashpad' && basename !== '.migration-stage'
           }
         })
+
+        // Step 2: Merge staging into currentDir
+        fs.cpSync(stagingDir, currentDir, {
+          recursive: true,
+          errorOnExist: false,
+          force: false,
+          filter: (src) => path.basename(src) !== '.migration-stage'
+        })
+
+        // Step 3: Record completion marker to track success independently from file presence
+        fs.writeFileSync(markerPath, 'ok\n', 'utf8')
+
+        // Step 4: Clean up staging
+        try {
+          fs.rmSync(stagingDir, { recursive: true, force: true })
+        } catch {
+          // best-effort cleanup
+        }
       }
     }
   } catch {
-    // Non-blocking best-effort migration
+    // Non-blocking best-effort migration: on error, staging is not marked complete,
+    // leaving migration cleanly retryable on next launch.
   }
 }
 maybeMigrateLegacyDesktopState()
