@@ -180,7 +180,7 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
     models = probe_ollama_local_models(local_url, timeout=2.0)
     selected_model = ""
 
-    if models:
+    if models is not None and len(models) > 0:
         print_success(f"Ollama detected at {local_url} ({len(models)} model{'s' if len(models) != 1 else ''} available):")
         for i, m in enumerate(models, 1):
             print(f"    {i}. {m}")
@@ -198,6 +198,12 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
                 selected_model = models[int(pick) - 1]
             else:
                 selected_model = pick or models[0]
+    elif models is not None:
+        print_warning(f"Ollama is running at {local_url}, but has no models downloaded yet.")
+        _info("  You can pull a model in another terminal with: `ollama run gemma4:12b` (or llama3, qwen2.5)",
+              "  Enter the model name you wish to use:")
+        selected_model = line_input("  Model name (e.g. gemma4:12b): ").strip() or "gemma4:12b"
+        print_info(f"  Configured model '{selected_model}'. Please run `ollama pull {selected_model}` before starting chat.")
     else:
         print_warning(f"Ollama was not detected on {local_url}.")
         _info("  Ensure Ollama is running (`ollama serve`), or provide your local endpoint.")

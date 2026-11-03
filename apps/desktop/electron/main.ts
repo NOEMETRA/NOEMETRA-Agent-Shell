@@ -764,18 +764,28 @@ if (!isPrimaryInstance) {
 }
 
 // Migrate legacy desktop state (connections, window bounds, active profile) from historical
-// Hermes installation if upgrading to NOEMETRA Agent Shell and new userData is empty.
+// Hermes installation if upgrading to NOEMETRA Agent Shell and new userData has no meaningful state.
 // Strictly scoped to the primary lock holder of the default stable installation (never for isolated
-// USER_DATA_OVERRIDE / HERMES_DATA_DIR_SUFFIX or non-default variants).
+// USER_DATA_OVERRIDE / HERMES_DATA_DIR_SUFFIX or non-default variants like light, bundled or canary).
 function maybeMigrateLegacyDesktopState(): void {
-  if (USER_DATA_OVERRIDE || process.env.HERMES_DATA_DIR_SUFFIX || IDENTITY_APP_NAME !== null) {
+  if (
+    USER_DATA_OVERRIDE ||
+    process.env.HERMES_DATA_DIR_SUFFIX ||
+    PRODUCT_IDENTITY.light ||
+    PRODUCT_IDENTITY.store ||
+    PRODUCT_IDENTITY.appNamePascal !== 'NoemetraAgentShell'
+  ) {
     return
   }
   try {
     const legacyDir = path.join(app.getPath('appData'), 'Hermes')
     const currentDir = app.getPath('userData')
     if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
-      if (!fs.existsSync(currentDir) || fs.readdirSync(currentDir).length === 0) {
+      // Ignore runtime lock files and crash reporter dirs created before this check runs
+      const hasMeaningfulState =
+        fs.existsSync(currentDir) &&
+        fs.readdirSync(currentDir).some((name) => !name.startsWith('Singleton') && name !== 'Crashpad')
+      if (!hasMeaningfulState) {
         fs.mkdirSync(currentDir, { recursive: true })
         fs.cpSync(legacyDir, currentDir, {
           recursive: true,
