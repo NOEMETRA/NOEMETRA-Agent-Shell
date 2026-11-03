@@ -1023,18 +1023,40 @@ function backupPreMigrationDestination(currentDir: string, backupDir: string): b
 function rollbackMigrationDestination(currentDir: string, backupDir: string, stagedEntries: string[]): boolean {
   try {
     let allStagedCleaned = true
-    // First remove any entries copied into currentDir from staging
+    // First remove any entries copied into currentDir from staging and their legacy sidecars
     for (const entry of stagedEntries) {
       const target = path.join(currentDir, entry)
+      const legacySidecar = path.join(currentDir, `${entry}.legacy`)
       try {
         if (fs.existsSync(target)) {
           fs.rmSync(target, { recursive: true, force: true })
         }
+        if (fs.existsSync(legacySidecar)) {
+          fs.rmSync(legacySidecar, { recursive: true, force: true })
+        }
       } catch (rmErr) {
-        console.error(`[noemetra] rollback failed to remove staged entry ${entry}:`, rmErr)
+        console.error(`[noemetra] rollback failed to remove staged entry ${entry} or sidecar:`, rmErr)
         allStagedCleaned = false
       }
     }
+    const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+    try {
+      if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
+    } catch {}
+
+    // Clean up any staging sidecars
+    if (fs.existsSync(currentDir)) {
+      try {
+        for (const item of fs.readdirSync(currentDir)) {
+          if (item.includes('.legacy-stage-') || item.includes('.swap-backup-')) {
+            try {
+              fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
     if (!allStagedCleaned) {
       console.error('[noemetra] rollback could not remove all staged destination remnants')
       return false
@@ -1058,14 +1080,47 @@ function rollbackMigrationDestination(currentDir: string, backupDir: string, sta
 
 function areConnectionsEquivalent(a: any, b: any): boolean {
   if (!a || !b) return false
-  return (
-    String(a.type || '') === String(b.type || '') &&
-    String(a.url || '') === String(b.url || '') &&
-    String(a.host || '') === String(b.host || '') &&
-    String(a.port || '') === String(b.port || '') &&
-    String(a.username || '') === String(b.username || '') &&
-    String(a.profile || '') === String(b.profile || '')
-  )
+  const kindA = String(a.kind || a.type || 'local')
+  const kindB = String(b.kind || b.type || 'local')
+  if (kindA !== kindB) return false
+
+  if (kindA === 'local') return true
+
+  if (kindA === 'ssh') {
+    const hostA = String(a.host || '').trim().toLowerCase()
+    const hostB = String(b.host || '').trim().toLowerCase()
+    const userA = String(a.user || a.username || '').trim().toLowerCase()
+    const userB = String(b.user || b.username || '').trim().toLowerCase()
+    const portA = Number(a.port) || 22
+    const portB = Number(b.port) || 22
+    const keyPathA = String(a.keyPath || '')
+    const keyPathB = String(b.keyPath || '')
+    const remoteHermesPathA = String(a.remoteHermesPath || '')
+    const remoteHermesPathB = String(b.remoteHermesPath || '')
+    const remoteProfileA = String(a.remoteProfile || a.profile || '')
+    const remoteProfileB = String(b.remoteProfile || b.profile || '')
+
+    return (
+      hostA === hostB &&
+      userA === userB &&
+      portA === portB &&
+      keyPathA === keyPathB &&
+      remoteHermesPathA === remoteHermesPathB &&
+      remoteProfileA === remoteProfileB
+    )
+  }
+
+  // remote or cloud
+  const urlA = String(a.url || '').trim().toLowerCase()
+  const urlB = String(b.url || '').trim().toLowerCase()
+  const authModeA = String(a.authMode || '')
+  const authModeB = String(b.authMode || '')
+  const orgA = String(a.org || '')
+  const orgB = String(b.org || '')
+  const nameA = String(a.name || '')
+  const nameB = String(b.name || '')
+
+  return urlA === urlB && authModeA === authModeB && orgA === orgB && nameA === nameB
 }
 
 function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): void {
@@ -1137,7 +1192,50 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
 function applyPendingLegacyDatabaseRestore(): void {
   try {
     const currentDir = app.getPath('userData')
+    const swapTxPath = path.join(currentDir, '.legacy-restore-tx.json')
     const pendingRestorePath = path.join(currentDir, '.legacy-restore-pending.json')
+
+    // STEP 0: Check for an interrupted swap transaction from a prior crash (per AGENTS.md:73-78)
+    if (fs.existsSync(swapTxPath)) {
+      console.warn('[noemetra] found interrupted swap transaction in .legacy-restore-tx.json; recovering')
+      try {
+        const tx = JSON.parse(fs.readFileSync(swapTxPath, 'utf8'))
+        if (tx && tx.phase === 'swapping' && Array.isArray(tx.databases)) {
+          // Transaction was interrupted mid-flight. Roll back any swapped databases to their pre-swap backup!
+          for (const db of tx.databases) {
+            if (db.swapped && db.backupPath && fs.existsSync(db.backupPath)) {
+              console.log(`[noemetra] rolling back swapped database ${db.name} from backup`)
+              try {
+                if (fs.existsSync(db.activePath)) {
+                  fs.rmSync(db.activePath, { recursive: true, force: true })
+                }
+                fs.cpSync(db.backupPath, db.activePath, { recursive: true })
+              } catch (rollbackDbErr) {
+                console.error(`[noemetra] failed to roll back database ${db.name}:`, rollbackDbErr)
+              }
+            }
+            // Clean up temporary backup directory
+            if (db.backupPath && fs.existsSync(db.backupPath)) {
+              try {
+                fs.rmSync(db.backupPath, { recursive: true, force: true })
+              } catch {}
+            }
+          }
+        }
+      } catch (txParseErr) {
+        console.error('[noemetra] failed to parse swap transaction:', txParseErr)
+      } finally {
+        // Clean up tx file and pending restore request so we don't loop on crashes
+        try {
+          fs.rmSync(swapTxPath, { force: true })
+        } catch {}
+        try {
+          fs.rmSync(pendingRestorePath, { force: true })
+        } catch {}
+      }
+      return
+    }
+
     if (!fs.existsSync(pendingRestorePath)) return
 
     let request: any = null
@@ -1154,109 +1252,194 @@ function applyPendingLegacyDatabaseRestore(): void {
         ? [{ name: request.database, legacyPreserved: request.source || `${request.database}.legacy` }]
         : []
 
-    let allSucceeded = true
-    const interveningBackups: Array<{ activePath: string; tempBackupPath: string; interveningPath: string }> = []
+    if (dbsToRestore.length === 0) {
+      fs.rmSync(pendingRestorePath, { force: true })
+      return
+    }
+
+    // Verify all source snapshots exist before modifying anything
+    for (const item of dbsToRestore) {
+      const legacyPath = path.join(currentDir, item.legacyPreserved)
+      if (!fs.existsSync(legacyPath)) {
+        console.warn(`[noemetra] legacy snapshot ${legacyPath} missing; cannot restore`)
+        fs.rmSync(pendingRestorePath, { force: true })
+        return
+      }
+    }
+
+    // Step 1: Initialize transaction record and prepare isolated backups of current active databases
+    const txId = Date.now()
+    const txDatabases: Array<{
+      name: string
+      sourcePath: string
+      activePath: string
+      backupPath: string
+      interveningPath: string
+      swapped: boolean
+    }> = []
 
     for (const item of dbsToRestore) {
       const activePath = path.join(currentDir, item.name)
       const legacyPath = path.join(currentDir, item.legacyPreserved)
       const interveningPath = path.join(currentDir, `${item.name}.intervening`)
+      const backupPath = path.join(currentDir, `.${item.name}.swap-backup-${txId}`)
 
-      if (!fs.existsSync(legacyPath)) {
-        console.warn(`[noemetra] legacy snapshot ${legacyPath} missing; cannot restore`)
-        allSucceeded = false
-        break
+      // Create pre-swap backup of active database if it exists
+      if (fs.existsSync(activePath)) {
+        fs.cpSync(activePath, backupPath, { recursive: true })
       }
 
-      // Safe temporary swap backup to isolate active database before replacement
-      const tempBackupPath = path.join(currentDir, `.${item.name}.swap-backup-${Date.now()}`)
-      try {
-        if (fs.existsSync(activePath)) {
-          fs.cpSync(activePath, tempBackupPath, { recursive: true })
-          interveningBackups.push({ activePath, tempBackupPath, interveningPath })
+      txDatabases.push({
+        name: item.name,
+        sourcePath: legacyPath,
+        activePath,
+        backupPath,
+        interveningPath,
+        swapped: false
+      })
+    }
 
-          // Only update interveningPath if the restore source is NOT the intervening snapshot itself
-          if (path.resolve(legacyPath) !== path.resolve(interveningPath)) {
-            if (fs.existsSync(interveningPath)) {
-              fs.rmSync(interveningPath, { recursive: true, force: true })
-            }
-            fs.cpSync(tempBackupPath, interveningPath, { recursive: true })
+    // Persist swap transaction BEFORE touching any active database or intervening snapshot
+    fs.writeFileSync(
+      swapTxPath,
+      JSON.stringify(
+        {
+          id: txId,
+          action: request.action || 'restore-legacy',
+          phase: 'swapping',
+          databases: txDatabases
+        },
+        null,
+        2
+      ),
+      'utf8'
+    )
+
+    // Step 2: If restoring legacy data, preserve the genuine active state in .intervening snapshots FIRST
+    if (request.action !== 'restore-intervening') {
+      for (const db of txDatabases) {
+        if (fs.existsSync(db.backupPath)) {
+          // Use temporary stage for atomic update of intervening snapshot
+          const interveningStage = `${db.interveningPath}.stage-${txId}`
+          if (fs.existsSync(interveningStage)) {
+            fs.rmSync(interveningStage, { recursive: true, force: true })
           }
-          fs.rmSync(activePath, { recursive: true, force: true })
+          fs.cpSync(db.backupPath, interveningStage, { recursive: true })
+          if (fs.existsSync(db.interveningPath)) {
+            fs.rmSync(db.interveningPath, { recursive: true, force: true })
+          }
+          fs.renameSync(interveningStage, db.interveningPath)
         }
-        fs.cpSync(legacyPath, activePath, { recursive: true })
+      }
+    }
+
+    // Step 3: Perform the swap for each database and mark progress
+    let allSucceeded = true
+    for (const db of txDatabases) {
+      try {
+        if (fs.existsSync(db.activePath)) {
+          fs.rmSync(db.activePath, { recursive: true, force: true })
+        }
+        fs.cpSync(db.sourcePath, db.activePath, { recursive: true })
+        db.swapped = true
+        // Record progress in transaction file
+        fs.writeFileSync(
+          swapTxPath,
+          JSON.stringify(
+            {
+              id: txId,
+              action: request.action || 'restore-legacy',
+              phase: 'swapping',
+              databases: txDatabases
+            },
+            null,
+            2
+          ),
+          'utf8'
+        )
       } catch (swapErr) {
-        console.error(`[noemetra] error swapping database ${item.name}:`, swapErr)
+        console.error(`[noemetra] error swapping database ${db.name}:`, swapErr)
         allSucceeded = false
         break
       }
     }
 
-    if (allSucceeded) {
-      fs.rmSync(pendingRestorePath, { force: true })
-      for (const backup of interveningBackups) {
-        try {
-          if (fs.existsSync(backup.tempBackupPath)) {
-            fs.rmSync(backup.tempBackupPath, { recursive: true, force: true })
-          }
-        } catch {}
-      }
-
-      const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
-      if (request.action === 'restore-intervening') {
-        // User restored their intervening setup: clean up manifest as reverse recovery cycle is complete
-        try {
-          if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
-        } catch {}
-      } else {
-        // User restored legacy data: retain an actionable recovery manifest for the displaced intervening databases!
-        // This satisfies [apps/desktop/AGENTS.md:73-78] by offering reverse restore after the restart.
-        const interveningDatabases: Array<{ name: string; interveningPreserved: string; activeRetained: string }> = []
-        for (const item of dbsToRestore) {
-          const interveningName = `${item.name}.intervening`
-          if (fs.existsSync(path.join(currentDir, interveningName))) {
-            interveningDatabases.push({
-              name: item.name,
-              interveningPreserved: interveningName,
-              activeRetained: item.name
-            })
-          }
-        }
-        if (interveningDatabases.length > 0) {
+    if (!allSucceeded) {
+      // Roll back swapped databases to their backups taken before the transaction
+      console.warn('[noemetra] swap failed mid-flight; rolling back to pre-swap backups')
+      for (const db of txDatabases) {
+        if (db.swapped && fs.existsSync(db.backupPath)) {
           try {
-            fs.writeFileSync(
-              manifestPath,
-              JSON.stringify(
-                {
-                  migratedAt: new Date().toISOString(),
-                  status: 'intervening-preserved-legacy-active',
-                  databases: interveningDatabases
-                },
-                null,
-                2
-              ),
-              'utf8'
-            )
+            if (fs.existsSync(db.activePath)) {
+              fs.rmSync(db.activePath, { recursive: true, force: true })
+            }
+            fs.cpSync(db.backupPath, db.activePath, { recursive: true })
+          } catch {}
+        }
+        if (fs.existsSync(db.backupPath)) {
+          try {
+            fs.rmSync(db.backupPath, { recursive: true, force: true })
           } catch {}
         }
       }
-      console.log('[noemetra] successfully restored database(s) before Chromium startup')
-    } else {
-      // Roll back any swapped databases from temporary backups
-      for (const backup of interveningBackups) {
+      fs.rmSync(swapTxPath, { force: true })
+      fs.rmSync(pendingRestorePath, { force: true })
+      return
+    }
+
+    // Step 4: Transaction committed successfully. Clean up backups and transaction record.
+    for (const db of txDatabases) {
+      if (fs.existsSync(db.backupPath)) {
         try {
-          if (fs.existsSync(backup.activePath)) {
-            fs.rmSync(backup.activePath, { recursive: true, force: true })
-          }
-          if (fs.existsSync(backup.tempBackupPath)) {
-            fs.cpSync(backup.tempBackupPath, backup.activePath, { recursive: true })
-            fs.rmSync(backup.tempBackupPath, { recursive: true, force: true })
-          }
+          fs.rmSync(db.backupPath, { recursive: true, force: true })
         } catch {}
       }
-      fs.rmSync(pendingRestorePath, { force: true })
-      console.error('[noemetra] failed to restore legacy database(s); rolled back to active state')
     }
+    fs.rmSync(swapTxPath, { force: true })
+    fs.rmSync(pendingRestorePath, { force: true })
+
+    // Step 5: Update recovery manifest according to the action taken
+    const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+    if (request.action === 'restore-intervening') {
+      // User restored their intervening setup: clean up manifest as reverse recovery cycle is complete
+      try {
+        if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
+      } catch {}
+    } else {
+      // User restored legacy data: retain an actionable recovery manifest for the displaced intervening databases!
+      // This satisfies [apps/desktop/AGENTS.md:73-78] by offering reverse restore after the restart.
+      const interveningDatabases: Array<{ name: string; interveningPreserved: string; activeRetained: string }> = []
+      for (const item of dbsToRestore) {
+        const interveningName = `${item.name}.intervening`
+        if (fs.existsSync(path.join(currentDir, interveningName))) {
+          interveningDatabases.push({
+            name: item.name,
+            interveningPreserved: interveningName,
+            activeRetained: item.name
+          })
+        }
+      }
+      if (interveningDatabases.length > 0) {
+        try {
+          fs.writeFileSync(
+            manifestPath,
+            JSON.stringify(
+              {
+                migratedAt: new Date().toISOString(),
+                status: 'intervening-preserved-legacy-active',
+                databases: interveningDatabases
+              },
+              null,
+              2
+            ),
+            'utf8'
+          )
+        } catch (manifestErr) {
+          console.error('[noemetra] failed to write intervening recovery manifest:', manifestErr)
+        }
+      }
+    }
+    console.log('[noemetra] successfully restored database(s) before Chromium startup')
   } catch (err) {
     console.error('[noemetra] unexpected error in applyPendingLegacyDatabaseRestore:', err)
   }
@@ -1319,15 +1502,23 @@ function maybeMigrateLegacyDesktopState(): void {
               const staged = fs.readdirSync(stagingDir)
               for (const item of staged) {
                 const target = path.join(currentDir, item)
+                const legacySidecar = path.join(currentDir, `${item}.legacy`)
                 try {
                   if (fs.existsSync(target)) {
                     fs.rmSync(target, { recursive: true, force: true })
                   }
+                  if (fs.existsSync(legacySidecar)) {
+                    fs.rmSync(legacySidecar, { recursive: true, force: true })
+                  }
                 } catch (rmErr) {
-                  console.error(`[noemetra] recovery failed to remove staged entry ${item}:`, rmErr)
+                  console.error(`[noemetra] recovery failed to remove staged entry ${item} or sidecar:`, rmErr)
                   allStagedRemoved = false
                 }
               }
+              const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+              try {
+                if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
+              } catch {}
             }
             if (!allStagedRemoved) {
               console.error('[noemetra] recovery could not remove all staged destination remnants; retaining backup snapshot for retry')
@@ -1433,8 +1624,26 @@ function maybeMigrateLegacyDesktopState(): void {
               // preserve active database intact in destPath so settings and workspace state are not lost.
               // Preserve legacy database to sidecar (.legacy) as an authoritative recovery affordance.
               const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
-              if (!fs.existsSync(legacyPreservedPath)) {
-                fs.cpSync(stagedPath, legacyPreservedPath, { recursive: true })
+              const legacyStagePath = path.join(currentDir, `.${entry}.legacy-stage-${Date.now()}`)
+              try {
+                if (fs.existsSync(legacyStagePath)) {
+                  fs.rmSync(legacyStagePath, { recursive: true, force: true })
+                }
+                fs.cpSync(stagedPath, legacyStagePath, { recursive: true })
+                // Verify complete database content was copied before publishing sidecar
+                if (!hasDatabaseContent(legacyStagePath)) {
+                  throw new Error(`staged legacy sidecar for ${entry} failed content verification`)
+                }
+                if (fs.existsSync(legacyPreservedPath)) {
+                  fs.rmSync(legacyPreservedPath, { recursive: true, force: true })
+                }
+                fs.renameSync(legacyStagePath, legacyPreservedPath)
+              } catch (sidecarErr) {
+                try {
+                  if (fs.existsSync(legacyStagePath)) fs.rmSync(legacyStagePath, { recursive: true, force: true })
+                  if (fs.existsSync(legacyPreservedPath)) fs.rmSync(legacyPreservedPath, { recursive: true, force: true })
+                } catch {}
+                throw sidecarErr
               }
               preservedDatabases.push({
                 name: entry,
