@@ -845,6 +845,26 @@ function isLegacyAppRunning(legacyDir: string): boolean {
         // ENOENT / EINVAL / unreadable
       }
     } else if (process.platform === 'win32') {
+      // Windows: check for running legacy Hermes executables
+      try {
+        const out = execFileSync('tasklist.exe', ['/NH', '/FO', 'CSV'], {
+          encoding: 'utf8',
+          timeout: 3000,
+          windowsHide: true
+        })
+        const isHermesRunning = out.split('\n').some((line) => {
+          const lower = line.toLowerCase()
+          return (
+            lower.includes('"hermes.exe"') ||
+            lower.includes('"hermes agent.exe"') ||
+            lower.includes('"hermes light.exe"')
+          )
+        })
+        if (isHermesRunning) return true
+      } catch {
+        // fallback to file handles
+      }
+
       // Windows: Electron holds an exclusive handle on SingletonLock
       try {
         if (fs.existsSync(lockFile)) {
@@ -905,23 +925,23 @@ function isDatabaseEmptyOrDefault(dbDir: string): boolean {
     if (!fs.existsSync(targetDir)) return true
     const files = fs.readdirSync(targetDir)
 
-    // In an empty/default LevelDB directory created on initial startup, there are no .ldb table files
-    // and log files are minimal (< 4KB). Active user databases contain .ldb table files or substantial logs.
-    let totalLdbSize = 0
+    // In an empty/default database directory created on initial startup, there are no table files
+    // (.ldb/.blob) and log files are minimal (< 4KB). Active user databases contain table files or substantial logs.
+    let totalTableSize = 0
     let maxLogSize = 0
 
     for (const file of files) {
       const fullPath = path.join(targetDir, file)
       const stat = fs.statSync(fullPath)
-      if (file.endsWith('.ldb')) {
-        totalLdbSize += stat.size
+      if (file.endsWith('.ldb') || file.endsWith('.blob')) {
+        totalTableSize += stat.size
       } else if (file.endsWith('.log')) {
         if (stat.size > maxLogSize) maxLogSize = stat.size
       }
     }
-    return totalLdbSize === 0 && maxLogSize < 4096
+    return totalTableSize === 0 && maxLogSize < 4096
   } catch {
-    return true
+    return false // If probe fails, conservatively treat as having active data to avoid clobbering
   }
 }
 
@@ -959,22 +979,28 @@ function backupPreMigrationDestination(currentDir: string, backupDir: string): b
   }
 }
 
-function rollbackMigrationDestination(currentDir: string, backupDir: string, stagedEntries: string[]): void {
-  // First remove any entries copied into currentDir from staging
-  for (const entry of stagedEntries) {
-    try {
-      fs.rmSync(path.join(currentDir, entry), { recursive: true, force: true })
-    } catch {}
-  }
-  // Restore original pre-migration destination state from backupDir so no existing user data is deleted
-  if (fs.existsSync(backupDir)) {
-    const backedUp = fs.readdirSync(backupDir)
-    for (const entry of backedUp) {
-      if (entry === '.backup-complete') continue
+function rollbackMigrationDestination(currentDir: string, backupDir: string, stagedEntries: string[]): boolean {
+  try {
+    // First remove any entries copied into currentDir from staging
+    for (const entry of stagedEntries) {
       try {
-        fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
+        fs.rmSync(path.join(currentDir, entry), { recursive: true, force: true })
       } catch {}
     }
+    // Restore original pre-migration destination state from backupDir so no existing user data is deleted
+    if (fs.existsSync(backupDir)) {
+      const backedUp = fs.readdirSync(backupDir)
+      for (const entry of backedUp) {
+        if (entry === '.backup-complete') continue
+        const src = path.join(backupDir, entry)
+        const dst = path.join(currentDir, entry)
+        fs.cpSync(src, dst, { recursive: true })
+      }
+    }
+    return true
+  } catch (rollbackErr) {
+    console.error('[noemetra] rollback failed to restore backup destination snapshot:', rollbackErr)
+    return false
   }
 }
 
@@ -1154,20 +1180,37 @@ function maybeMigrateLegacyDesktopState(): void {
             const isDatabaseDir = DATABASE_DIR_NAMES.has(entry) || fs.existsSync(path.join(stagedPath, 'leveldb'))
 
             if (isDatabaseDir) {
-              if (fs.existsSync(destPath)) {
-                if (!isDatabaseEmptyOrDefault(destPath)) {
-                  // Active user data exists from intervening session: preserve aside to ensure no user work is lost
-                  const interveningPreservedPath = path.join(currentDir, `${entry}.intervening`)
-                  if (!fs.existsSync(interveningPreservedPath)) {
-                    try {
-                      fs.cpSync(destPath, interveningPreservedPath, { recursive: true })
-                    } catch {}
-                  }
+              if (fs.existsSync(destPath) && !isDatabaseEmptyOrDefault(destPath)) {
+                // Active user data exists from intervening session: leave active database intact (merge, don't clobber).
+                // Store legacy database alongside under .legacy and record recoverable migration manifest.
+                const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
+                if (!fs.existsSync(legacyPreservedPath)) {
+                  fs.cpSync(stagedPath, legacyPreservedPath, { recursive: true })
                 }
-                // Replace destination database directory as a consistent unit so legacy settings and browser state are restored
-                fs.rmSync(destPath, { recursive: true, force: true })
+                const recoveryManifestPath = path.join(currentDir, 'legacy-migration-available.json')
+                try {
+                  fs.writeFileSync(
+                    recoveryManifestPath,
+                    JSON.stringify(
+                      {
+                        migratedAt: new Date().toISOString(),
+                        retainedActive: entry,
+                        legacyLocation: `${entry}.legacy`,
+                        status: 'active-state-retained'
+                      },
+                      null,
+                      2
+                    ),
+                    'utf8'
+                  )
+                } catch {}
+              } else {
+                // Destination is empty/default boilerplate: safe to restore legacy database as active unit
+                if (fs.existsSync(destPath)) {
+                  fs.rmSync(destPath, { recursive: true, force: true })
+                }
+                fs.cpSync(stagedPath, destPath, { recursive: true })
               }
-              fs.cpSync(stagedPath, destPath, { recursive: true })
             } else if (entry === 'connections.json') {
               reconcileConnectionsRegistry(destPath, stagedPath)
             } else {
@@ -1216,13 +1259,17 @@ function maybeMigrateLegacyDesktopState(): void {
         } catch (copyErr) {
           // Roll back destination copy on failure (per AGENTS.md authoritative write failure policy):
           // Restore pre-migration destination state from backupDir so no existing user state is lost.
-          rollbackMigrationDestination(currentDir, backupDir, stagedEntries)
-          try {
-            fs.rmSync(inProgressPath, { force: true })
-          } catch {}
-          try {
-            fs.rmSync(backupDir, { recursive: true, force: true })
-          } catch {}
+          const rollbackSucceeded = rollbackMigrationDestination(currentDir, backupDir, stagedEntries)
+          if (rollbackSucceeded) {
+            try {
+              fs.rmSync(inProgressPath, { force: true })
+            } catch {}
+            try {
+              fs.rmSync(backupDir, { recursive: true, force: true })
+            } catch {}
+          } else {
+            console.error('[noemetra] rollback did not complete; retaining backup and in-progress marker for recovery')
+          }
           throw copyErr
         } finally {
           // Step 5: Clean up staging
