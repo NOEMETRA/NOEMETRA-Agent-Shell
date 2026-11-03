@@ -156,3 +156,15 @@ A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono
 9. **Inizializzazione Mappatura Modello in Setup Locale (`hermes_cli/setup_quick.py`)**:
    - *Problema*: In configurazioni pulite `model` può essere presente come stringa vuota (`""`). `setdefault("model", {})` non rimpiazzava la stringa, generando `TypeError: 'str' object does not support item assignment`.
    - *Risoluzione*: Sostituito con check esplicito `if not isinstance(config.get("model"), dict): config["model"] = {}`, permettendo il salvataggio immediato e senza errori di `provider`, `base_url` e `default`.
+10. **Migrazione Stato Desktop per Tutte le Varianti Supportate (`apps/desktop/electron/main.ts`)**:
+    - *Problema*: La funzione di migrazione verificava solo la variante standard (`appNamePascal === 'NoemetraAgentShell'`), escludendo le installazioni `bundled` (`HermesAgent`) e `light` (`HermesLight`).
+    - *Risoluzione*: Creata la funzione ausiliaria `legacyDirectoryForVariant()` che mappa con precisione ciascuna variante desktop supportata (`HermesLight` per light, `HermesAgent` per bundled, `Hermes` per standard) garantendo la continuità per tutte le configurazioni utente, preservando l'isolamento in caso di override esplicito (`USER_DATA_OVERRIDE` o `HERMES_DATA_DIR_SUFFIX`).
+11. **Preservazione del Placeholder di Versione `0.0.0` in `pyproject.toml` per Compatibilità e Audit di Sicurezza**:
+    - *Problema*: Una modifica di `version` in `pyproject.toml` a `0.1.0` alterava il contratto di discovery dell'ambiente virtuale (`_discover_venv`) e i contratti attesi dagli audit di compatibilità/sicurezza descritti in `tests/compat/README.md`.
+    - *Risoluzione*: Ripristinato `version = "0.0.0"`. Il versioning applicativo viene governato dai tag di rilascio, da `apps/desktop/package.json` e dai canali di update di NOEMETRA, senza rompere i contratti di security audit sui sorgenti editabili.
+12. **Adozione di `prompt_choice` per la Selezione Modelli nel Setup Locale (`hermes_cli/setup_quick.py`)**:
+    - *Problema*: L'uso di raw `input()` nel setup rapido per la selezione dei modelli Ollama bypassava il seam ufficiale del wizard con navigazione da tastiera / frecce e supporto per replay / navigazione all'indietro (`prompt_choice`).
+    - *Risoluzione*: Sostituito l'input grezzo con `prompt_choice`, consentendo la navigazione interattiva tra i modelli rilevati, l'inserimento manuale di un nome alternativo o la configurazione di un endpoint alternativo.
+13. **Flessibilità Endpoint Locale con Selezione Alternativa anche con Ollama Attivo (`hermes_cli/setup_quick.py`)**:
+    - *Problema*: Se Ollama rispondeva sulla porta 11434, l'utente non aveva un'opzione diretta per scegliere un server alternativo locale (es. LM Studio su porta 1234, vLLM su 8000).
+    - *Risoluzione*: Aggiunta in modo trasparente l'opzione "Configure another local server (LM Studio, vLLM, custom endpoint)..." in tutti i branch di setup locale, configurando automaticamente il provider appropriato (`ollama` o `custom`) e normalizzando l'endpoint base.

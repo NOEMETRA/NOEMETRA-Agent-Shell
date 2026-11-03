@@ -179,48 +179,70 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
     local_url = "http://127.0.0.1:11434"
     models = probe_ollama_local_models(local_url, timeout=2.0)
     selected_model = ""
+    provider_name = "ollama"
 
     if models is not None and len(models) > 0:
         print_success(f"Ollama detected at {local_url} ({len(models)} model{'s' if len(models) != 1 else ''} available):")
         for i, m in enumerate(models, 1):
             print(f"    {i}. {m}")
         print()
-        if len(models) == 1:
-            default_m = models[0]
-            choice = input(f"  Use detected model '{default_m}'? [Y/n]: ").strip().lower()
-            if choice in {"", "y", "yes"}:
-                selected_model = default_m
-            else:
-                selected_model = line_input("  Enter model name: ").strip()
+        choices = [f"Use '{m}' (detected on Ollama)" for m in models]
+        choices.append("Enter a different Ollama model name...")
+        choices.append("Configure another local server (LM Studio, vLLM, custom endpoint)...")
+
+        choice_idx = prompt_choice("Select an Ollama model or configure another local server:", choices, 0)
+        if choice_idx < len(models):
+            selected_model = models[choice_idx]
+        elif choice_idx == len(models):
+            selected_model = line_input(f"  Ollama model name (e.g. {models[0]}): ").strip() or models[0]
         else:
-            pick = input(f"  Select model [1-{len(models)}] or type name: ").strip()
-            if pick.isdigit() and 1 <= int(pick) <= len(models):
-                selected_model = models[int(pick) - 1]
-            else:
-                selected_model = pick or models[0]
+            provider_name = "custom"
+            custom_base = line_input("  Local API Base URL (e.g. http://localhost:1234/v1): ").strip() or "http://localhost:1234/v1"
+            selected_model = line_input("  Model name (e.g. default): ").strip() or "default"
+            local_url = custom_base
     elif models is not None:
         print_warning(f"Ollama is running at {local_url}, but has no models downloaded yet.")
-        _info("  You can pull a model in another terminal with: `ollama run gemma4:12b` (or llama3, qwen2.5)",
-              "  Enter the model name you wish to use:")
-        selected_model = line_input("  Model name (e.g. gemma4:12b): ").strip() or "gemma4:12b"
-        print_info(f"  Configured model '{selected_model}'. Please run `ollama pull {selected_model}` before starting chat.")
+        _info("  You can pull a model in another terminal with: `ollama run gemma4:12b` (or llama3, qwen2.5)")
+        choices = [
+            "Specify an Ollama model name to use",
+            "Configure another local server (LM Studio, vLLM, custom endpoint)...",
+        ]
+        choice_idx = prompt_choice("Select an option:", choices, 0)
+        if choice_idx == 0:
+            selected_model = line_input("  Model name (e.g. gemma4:12b): ").strip() or "gemma4:12b"
+            print_info(f"  Configured model '{selected_model}'. Please run `ollama pull {selected_model}` before starting chat.")
+        else:
+            provider_name = "custom"
+            custom_base = line_input("  Local API Base URL (e.g. http://localhost:1234/v1): ").strip() or "http://localhost:1234/v1"
+            selected_model = line_input("  Model name (e.g. default): ").strip() or "default"
+            local_url = custom_base
     else:
         print_warning(f"Ollama was not detected on {local_url}.")
         _info("  Ensure Ollama is running (`ollama serve`), or provide your local endpoint.")
-        custom_base = line_input(f"  Local API Base URL [{local_url}/v1]: ").strip() or f"{local_url}/v1"
-        selected_model = line_input("  Model name (e.g. gemma4:12b): ").strip() or "gemma4:12b"
-        local_url = custom_base
+        choices = [
+            f"Set up Ollama at {local_url} (enter model to pull later)",
+            "Configure another local server (LM Studio, vLLM, custom endpoint)...",
+        ]
+        choice_idx = prompt_choice("Select local setup option:", choices, 0)
+        if choice_idx == 0:
+            selected_model = line_input("  Model name (e.g. gemma4:12b): ").strip() or "gemma4:12b"
+            print_info(f"  Configured model '{selected_model}'. Run `ollama serve` and `ollama pull {selected_model}` before chatting.")
+        else:
+            provider_name = "custom"
+            custom_base = line_input("  Local API Base URL [http://localhost:1234/v1]: ").strip() or "http://localhost:1234/v1"
+            selected_model = line_input("  Model name (e.g. default): ").strip() or "default"
+            local_url = custom_base
 
     norm_url = local_url.strip().rstrip("/")
     base_v1 = norm_url if norm_url.endswith("/v1") else f"{norm_url}/v1"
 
     if not isinstance(config.get("model"), dict):
         config["model"] = {}
-    config["model"]["provider"] = "ollama"
+    config["model"]["provider"] = provider_name
     config["model"]["base_url"] = base_v1
     config["model"]["default"] = selected_model
 
-    print_success(f"Configured provider: ollama (model: {selected_model}, endpoint: {base_v1})")
+    print_success(f"Configured provider: {provider_name} (model: {selected_model}, endpoint: {base_v1})")
 
     # Step 2: Terminal Backend; Step 3: defaults
     setup_terminal_backend(config)
