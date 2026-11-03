@@ -122,3 +122,22 @@ I test sono stati eseguiti con `uv run --group dev pytest`.
 | Avvio Effettivo GUI Desktop | **CONFERMATO** | Electron v44 + WebApp bundle funzionante con brand NOEMETRA |
 | Integrazione Hermes Voice come Plugin Puro | **CONFERMATO** | 8 tool caricati ed eseguiti, citazioni verificate, core 100% agnostico |
 | Isolamento Progetti | **CONFERMATO** | Supportato nativamente tramite profili dedicati (`--profile`) |
+
+---
+
+## 7. Risoluzione Rilievi Codex Review (Post-Baseline)
+
+A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono stati analizzati e risolti i seguenti rilievi:
+
+1. **Riconoscimento Installazioni Locali nel Setup Wizard (`hermes_cli/setup.py`)**:
+   - *Problema*: La condizione `is_existing` considerava solo chiavi remote o token attivi, trattando installazioni locali (Ollama/LM Studio) come nuove installazioni al riavvio del wizard.
+   - *Risoluzione*: Aggiornato `is_existing` per riconoscere configurazioni con provider/modello espliciti (`model.provider != "auto"` e `model.default` impostato).
+2. **Rimozione Voci Duplicate in `CANONICAL_PROVIDERS` (`hermes_cli/models_catalog_static.py`)**:
+   - *Problema*: 5 provider (`lmstudio`, `anthropic`, `openai-codex`, `openai-api`, `gemini`) risultavano duplicati nella tupla statica.
+   - *Risoluzione*: Rimosse le occorrenze duplicate mantenendo l'elenco coerente a 52 provider canonici unici.
+3. **Flusso di Importazione Modelli nel Setup Locale (`hermes_cli/setup_quick.py`)**:
+   - *Problema*: `_keep_imported_model` proponeva il passaggio a "Nous Portal" anche durante la configurazione locale offline.
+   - *Risoluzione*: Introdotto `_keep_imported_model_local` che propone coerentemente la scelta tra il modello importato e la configurazione Ollama locale offline.
+4. **Isolamento Fixture Test di Provider (`tests/providers/test_profile_home_layers.py`)**:
+   - *Problema*: Un leak nello stato di discovery nella fixture `homes` causava la perdita del registro nei test eseguiti in sequenza.
+   - *Risoluzione*: Garantita la pre-discovery del registro prima dello snapshot della fixture `homes`, portando la suite `tests/providers/` al 100% di successo (93/93 passati).

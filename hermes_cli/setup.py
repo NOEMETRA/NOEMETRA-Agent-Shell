@@ -703,10 +703,19 @@ def _run_setup_wizard_impl(args):
         _run_setup_section(config, section)
         return
 
-    # Existing installation == a provider is configured
+    # Existing installation == a provider is configured (remote key, active auth, or local model)
     from hermes_cli.auth import get_active_provider
-    is_existing = bool(get_env_value("OPENROUTER_API_KEY") or get_env_value("OPENAI_BASE_URL")
-                       or get_active_provider() is not None)
+    model_cfg = config.get("model") if isinstance(config.get("model"), dict) else {}
+    model_provider = model_cfg.get("provider")
+    has_configured_model = bool(
+        model_provider and model_provider not in ("auto", "") and model_cfg.get("default")
+    )
+    is_existing = bool(
+        get_env_value("OPENROUTER_API_KEY")
+        or get_env_value("OPENAI_BASE_URL")
+        or get_active_provider() is not None
+        or has_configured_model
+    )
     _print_banner("│            ☤ NOEMETRA Agent Shell Setup Wizard         │",
                   "├─────────────────────────────────────────────────────────┤",
                   "│  Let's configure your NOEMETRA Agent installation.     │",
