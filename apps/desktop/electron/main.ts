@@ -732,6 +732,28 @@ if (USER_DATA_OVERRIDE || process.env.HERMES_DATA_DIR_SUFFIX) {
   app.setPath('userData', resolvedUserData)
 }
 
+// Migrate legacy desktop state (connections, window bounds, active profile) from historical
+// Hermes installation if upgrading to NOEMETRA Agent Shell and new userData is empty.
+try {
+  const legacyDir = path.join(app.getPath('appData'), 'Hermes')
+  const currentDir = app.getPath('userData')
+  if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
+    if (!fs.existsSync(currentDir) || fs.readdirSync(currentDir).length === 0) {
+      fs.mkdirSync(currentDir, { recursive: true })
+      fs.cpSync(legacyDir, currentDir, {
+        recursive: true,
+        errorOnExist: false,
+        filter: (src) => {
+          const basename = path.basename(src)
+          return !basename.startsWith('Singleton') && basename !== 'Crashpad'
+        }
+      })
+    }
+  }
+} catch {
+  // Non-blocking best-effort migration
+}
+
 // Only the lock owner may persist launch recovery markers, adopt a workspace or start a
 // backend, so the lock is taken as soon as userData is final (#131055, #143056).
 // #78101: on Linux/X11 a zombie/defunct Electron process leaves the

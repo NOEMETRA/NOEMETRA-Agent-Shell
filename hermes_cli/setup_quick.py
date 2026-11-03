@@ -205,7 +205,8 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
         selected_model = line_input("  Model name (e.g. gemma4:12b): ").strip() or "gemma4:12b"
         local_url = custom_base
 
-    base_v1 = local_url if local_url.endswith("/v1") else local_url.rstrip("/") + "/v1"
+    norm_url = local_url.strip().rstrip("/")
+    base_v1 = norm_url if norm_url.endswith("/v1") else f"{norm_url}/v1"
 
     config.setdefault("model", {})
     config["model"]["provider"] = "ollama"

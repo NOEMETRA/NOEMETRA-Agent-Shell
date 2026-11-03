@@ -16,7 +16,7 @@ const variants = {
     pascal: 'NoemetraLight'
   },
   bundled: {
-    display: 'NOEMETRA Agent Shell',
+    display: 'NOEMETRA Agent Shell (Bundled)',
     kebab: 'noemetra-agent-shell-bundled',
     pascal: 'NoemetraAgentShellBundled'
   }
