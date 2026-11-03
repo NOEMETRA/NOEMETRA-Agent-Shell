@@ -1103,7 +1103,88 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
   }
 }
 
+function applyPendingLegacyDatabaseRestore(): void {
+  try {
+    const currentDir = app.getPath('userData')
+    const pendingRestorePath = path.join(currentDir, '.legacy-restore-pending.json')
+    if (!fs.existsSync(pendingRestorePath)) return
+
+    let request: any = null
+    try {
+      request = JSON.parse(fs.readFileSync(pendingRestorePath, 'utf8'))
+    } catch {
+      fs.rmSync(pendingRestorePath, { force: true })
+      return
+    }
+
+    const dbsToRestore: Array<{ name: string; legacyPreserved: string }> = Array.isArray(request.databases)
+      ? request.databases
+      : request.database
+        ? [{ name: request.database, legacyPreserved: request.source || `${request.database}.legacy` }]
+        : []
+
+    let allSucceeded = true
+    const interveningBackups: Array<{ activePath: string; interveningPath: string }> = []
+
+    for (const item of dbsToRestore) {
+      const activePath = path.join(currentDir, item.name)
+      const legacyPath = path.join(currentDir, item.legacyPreserved)
+      const interveningPath = path.join(currentDir, `${item.name}.intervening`)
+
+      if (!fs.existsSync(legacyPath)) {
+        console.warn(`[noemetra] legacy snapshot ${legacyPath} missing; cannot restore`)
+        allSucceeded = false
+        break
+      }
+
+      try {
+        if (fs.existsSync(activePath)) {
+          if (fs.existsSync(interveningPath)) {
+            fs.rmSync(interveningPath, { recursive: true, force: true })
+          }
+          fs.cpSync(activePath, interveningPath, { recursive: true })
+          interveningBackups.push({ activePath, interveningPath })
+          fs.rmSync(activePath, { recursive: true, force: true })
+        }
+        fs.cpSync(legacyPath, activePath, { recursive: true })
+      } catch (swapErr) {
+        console.error(`[noemetra] error swapping database ${item.name}:`, swapErr)
+        allSucceeded = false
+        break
+      }
+    }
+
+    if (allSucceeded) {
+      fs.rmSync(pendingRestorePath, { force: true })
+      for (const manifestName of ['legacy-migration-recovery.json', 'legacy-migration-available.json']) {
+        const manifestPath = path.join(currentDir, manifestName)
+        try {
+          if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
+        } catch {}
+      }
+      console.log('[noemetra] successfully restored legacy database(s) before Chromium startup')
+    } else {
+      // Roll back any swapped databases from intervening backups
+      for (const backup of interveningBackups) {
+        try {
+          if (fs.existsSync(backup.activePath)) {
+            fs.rmSync(backup.activePath, { recursive: true, force: true })
+          }
+          if (fs.existsSync(backup.interveningPath)) {
+            fs.cpSync(backup.interveningPath, backup.activePath, { recursive: true })
+          }
+        } catch {}
+      }
+      fs.rmSync(pendingRestorePath, { force: true })
+      console.error('[noemetra] failed to restore legacy database(s); rolled back to active state')
+    }
+  } catch (err) {
+    console.error('[noemetra] unexpected error in applyPendingLegacyDatabaseRestore:', err)
+  }
+}
+
 function maybeMigrateLegacyDesktopState(): void {
+  applyPendingLegacyDatabaseRestore()
   if (
     USER_DATA_OVERRIDE ||
     process.env.HERMES_DATA_DIR_SUFFIX
@@ -1213,181 +1294,173 @@ function maybeMigrateLegacyDesktopState(): void {
         }
       }
 
-      const isPendingMigration = fs.existsSync(pendingMarkerPath)
-      // Ignore runtime lock files, crash reporter dirs, and migration markers/staging created before this check runs.
-      // If a migration was previously pending, initial default files are not considered meaningful user state.
-      const hasMeaningfulState =
-        !isPendingMigration &&
-        fs.existsSync(currentDir) &&
-        fs.readdirSync(currentDir).some(
-          (name) =>
-            !name.startsWith('Singleton') &&
-            name !== 'Crashpad' &&
-            name !== '.migration-stage' &&
-            name !== MIGRATION_BACKUP_DIR &&
-            name !== MIGRATION_IN_PROGRESS_MARKER &&
-            name !== MIGRATION_PENDING_MARKER &&
-            name !== MIGRATION_COMPLETE_MARKER
-        )
+      // Non-destructive migration: if migration marker is not yet written, run the intent-preserving
+      // migration. Unlike legacy destructive overwrites, our migration merges connections, preserves
+      // newer active user intent intact, and retains legacy databases as recovery affordances,
+      // so it is always safe and beneficial even when destination already contains user state.
+      try {
+        fs.writeFileSync(pendingMarkerPath, '1\n', 'utf8')
+      } catch {}
 
-      if (!hasMeaningfulState) {
-        // Record pending migration marker before attempting staging, backup, or copy
-        // to preserve migration eligibility if a transient error occurs during the attempt.
-        try {
-          fs.writeFileSync(pendingMarkerPath, '1\n', 'utf8')
-        } catch {}
-
-        fs.mkdirSync(stagingDir, { recursive: true })
-        // Step 1: Copy to staging directory first (transactional isolation)
-        fs.cpSync(legacyDir, stagingDir, {
-          recursive: true,
-          errorOnExist: false,
-          force: false,
-          filter: (src) => {
-            const basename = path.basename(src)
-            return !basename.startsWith('Singleton') && basename !== 'Crashpad' && basename !== '.migration-stage'
-          }
-        })
-
-        const stagedEntries = fs.readdirSync(stagingDir)
-
-        // Step 2: Complete destination backup snapshot BEFORE marking migration in progress.
-        // If snapshot cannot be completed, abort immediately without touching destination
-        // (per AGENTS.md failed-write recovery invariant).
-        const backupOk = backupPreMigrationDestination(currentDir, backupDir)
-        if (!backupOk) {
-          console.warn('[noemetra] failed to complete destination backup snapshot; aborting migration to protect existing state')
-          return
+      fs.mkdirSync(stagingDir, { recursive: true })
+      // Step 1: Copy to staging directory first (transactional isolation)
+      fs.cpSync(legacyDir, stagingDir, {
+        recursive: true,
+        errorOnExist: false,
+        force: false,
+        filter: (src) => {
+          const basename = path.basename(src)
+          return !basename.startsWith('Singleton') && basename !== 'Crashpad' && basename !== '.migration-stage'
         }
+      })
 
-        // Only mark migration in progress after confirmed complete backup
-        fs.writeFileSync(inProgressPath, '1\n', 'utf8')
-        let rollbackFailed = false
+      const stagedEntries = fs.readdirSync(stagingDir)
 
-        try {
-          // Step 3: Transfer staging into currentDir.
-          // Restore legacy browser databases (Local Storage, Session Storage, IndexedDB) as cohesive atomic units.
-          // Per AGENTS.md (merge, don't clobber; newer intent takes precedence):
-          // If active user database already exists from an intervening session, preserve it intact in destPath
-          // and preserve legacy database to sidecar (.legacy) with an authoritative recovery manifest.
-          // If destination has only empty boot boilerplate, restore legacy database directly into destPath.
-          for (const entry of stagedEntries) {
-            const stagedPath = path.join(stagingDir, entry)
-            const destPath = path.join(currentDir, entry)
+      // Step 2: Complete destination backup snapshot BEFORE marking migration in progress.
+      // If snapshot cannot be completed, abort immediately without touching destination
+      // (per AGENTS.md failed-write recovery invariant).
+      const backupOk = backupPreMigrationDestination(currentDir, backupDir)
+      if (!backupOk) {
+        console.warn('[noemetra] failed to complete destination backup snapshot; aborting migration to protect existing state')
+        return
+      }
 
-            const isDatabaseDir = DATABASE_DIR_NAMES.has(entry) || fs.existsSync(path.join(stagedPath, 'leveldb'))
+      // Only mark migration in progress after confirmed complete backup
+      fs.writeFileSync(inProgressPath, '1\n', 'utf8')
+      let rollbackFailed = false
 
-            if (isDatabaseDir) {
-              const destExists = fs.existsSync(destPath)
-              const destHasContent = destExists && hasDatabaseContent(destPath)
+      try {
+        // Step 3: Transfer staging into currentDir.
+        // Restore legacy browser databases (Local Storage, Session Storage, IndexedDB) as cohesive atomic units.
+        // Per AGENTS.md (merge, don't clobber; newer intent takes precedence):
+        // If active user database already exists from an intervening session, preserve it intact in destPath
+        // and preserve legacy database to sidecar (.legacy) with an authoritative recovery manifest.
+        // If destination has only empty boot boilerplate, restore legacy database directly into destPath.
+        const preservedDatabases: Array<{ name: string; legacyPreserved: string; activeRetained: string }> = []
 
-              if (destHasContent) {
-                // Active user database already exists in destination from intervening session:
-                // Per AGENTS.md (merge, don't clobber; newer intent takes precedence),
-                // preserve active database intact in destPath so settings and workspace state are not lost.
-                // Preserve legacy database to sidecar (.legacy) as an authoritative recovery affordance.
-                const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
-                if (!fs.existsSync(legacyPreservedPath)) {
-                  fs.cpSync(stagedPath, legacyPreservedPath, { recursive: true })
-                }
-                const recoveryManifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
-                try {
-                  fs.writeFileSync(
-                    recoveryManifestPath,
-                    JSON.stringify(
-                      {
-                        migratedAt: new Date().toISOString(),
-                        database: entry,
-                        legacyPreserved: `${entry}.legacy`,
-                        activeRetained: entry,
-                        status: 'active-preserved-legacy-available'
-                      },
-                      null,
-                      2
-                    ),
-                    'utf8'
-                  )
-                } catch {}
-                console.log(`[noemetra] active user database preserved in ${entry}; legacy copy preserved in ${entry}.legacy`)
-              } else {
-                // Destination database does not exist or only contains empty boot boilerplate.
-                // Restore legacy database directly into destPath.
-                if (destExists) {
-                  fs.rmSync(destPath, { recursive: true, force: true })
-                }
-                fs.cpSync(stagedPath, destPath, { recursive: true })
+        for (const entry of stagedEntries) {
+          const stagedPath = path.join(stagingDir, entry)
+          const destPath = path.join(currentDir, entry)
+
+          const isDatabaseDir = DATABASE_DIR_NAMES.has(entry) || fs.existsSync(path.join(stagedPath, 'leveldb'))
+
+          if (isDatabaseDir) {
+            const destExists = fs.existsSync(destPath)
+            const destHasContent = destExists && hasDatabaseContent(destPath)
+
+            if (destHasContent) {
+              // Active user database already exists in destination from intervening session:
+              // Per AGENTS.md (merge, don't clobber; newer intent takes precedence),
+              // preserve active database intact in destPath so settings and workspace state are not lost.
+              // Preserve legacy database to sidecar (.legacy) as an authoritative recovery affordance.
+              const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
+              if (!fs.existsSync(legacyPreservedPath)) {
+                fs.cpSync(stagedPath, legacyPreservedPath, { recursive: true })
               }
-            } else if (entry === 'connections.json') {
-              reconcileConnectionsRegistry(destPath, stagedPath)
+              preservedDatabases.push({
+                name: entry,
+                legacyPreserved: `${entry}.legacy`,
+                activeRetained: entry
+              })
+              console.log(`[noemetra] active user database preserved in ${entry}; legacy copy preserved in ${entry}.legacy`)
             } else {
-              const stat = fs.statSync(stagedPath)
-              if (stat.isDirectory()) {
-                // Non-database directories: merge files without overwriting intervening user changes
-                fs.cpSync(stagedPath, destPath, {
-                  recursive: true,
-                  errorOnExist: false,
-                  force: false
-                })
-              } else {
-                // Individual files: if already existing in destination, preserve active user state
-                if (!fs.existsSync(destPath)) {
-                  fs.copyFileSync(stagedPath, destPath)
-                }
+              // Destination database does not exist or only contains empty boot boilerplate.
+              // Restore legacy database directly into destPath.
+              if (destExists) {
+                fs.rmSync(destPath, { recursive: true, force: true })
+              }
+              fs.cpSync(stagedPath, destPath, { recursive: true })
+            }
+          } else if (entry === 'connections.json') {
+            reconcileConnectionsRegistry(destPath, stagedPath)
+          } else {
+            const stat = fs.statSync(stagedPath)
+            if (stat.isDirectory()) {
+              // Non-database directories: merge files without overwriting intervening user changes
+              fs.cpSync(stagedPath, destPath, {
+                recursive: true,
+                errorOnExist: false,
+                force: false
+              })
+            } else {
+              // Individual files: if already existing in destination, preserve active user state
+              if (!fs.existsSync(destPath)) {
+                fs.copyFileSync(stagedPath, destPath)
               }
             }
           }
+        }
 
-          // Step 4: Record completion marker once meaningful state is confirmed in destination
-          const copiedSomething =
-            fs.existsSync(currentDir) &&
-            fs.readdirSync(currentDir).some(
-              (name) =>
-                !name.startsWith('Singleton') &&
-                name !== 'Crashpad' &&
-                name !== '.migration-stage' &&
-                name !== MIGRATION_BACKUP_DIR &&
-                name !== MIGRATION_IN_PROGRESS_MARKER &&
-                name !== MIGRATION_PENDING_MARKER &&
-                name !== MIGRATION_COMPLETE_MARKER
+        // Record recovery manifest for all preserved databases so UI recovery affordance exposes every one
+        if (preservedDatabases.length > 0) {
+          const recoveryManifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+          try {
+            fs.writeFileSync(
+              recoveryManifestPath,
+              JSON.stringify(
+                {
+                  migratedAt: new Date().toISOString(),
+                  status: 'active-preserved-legacy-available',
+                  databases: preservedDatabases
+                },
+                null,
+                2
+              ),
+              'utf8'
             )
-          if (copiedSomething) {
-            fs.writeFileSync(markerPath, 'ok\n', 'utf8')
-            try {
-              fs.rmSync(pendingMarkerPath, { force: true })
-            } catch {}
-          }
+          } catch {}
+        }
+
+        // Step 4: Record completion marker once meaningful state is confirmed in destination
+        const copiedSomething =
+          fs.existsSync(currentDir) &&
+          fs.readdirSync(currentDir).some(
+            (name) =>
+              !name.startsWith('Singleton') &&
+              name !== 'Crashpad' &&
+              name !== '.migration-stage' &&
+              name !== MIGRATION_BACKUP_DIR &&
+              name !== MIGRATION_IN_PROGRESS_MARKER &&
+              name !== MIGRATION_PENDING_MARKER &&
+              name !== MIGRATION_COMPLETE_MARKER
+          )
+        if (copiedSomething) {
+          fs.writeFileSync(markerPath, 'ok\n', 'utf8')
+          try {
+            fs.rmSync(pendingMarkerPath, { force: true })
+          } catch {}
+        }
+        try {
+          fs.rmSync(inProgressPath, { force: true })
+        } catch {}
+        try {
+          fs.rmSync(backupDir, { recursive: true, force: true })
+        } catch {}
+      } catch (copyErr) {
+        // Roll back destination copy on failure (per AGENTS.md authoritative write failure policy):
+        // Restore pre-migration destination state from backupDir so no existing user state is lost.
+        const rollbackSucceeded = rollbackMigrationDestination(currentDir, backupDir, stagedEntries)
+        if (rollbackSucceeded) {
           try {
             fs.rmSync(inProgressPath, { force: true })
           } catch {}
           try {
             fs.rmSync(backupDir, { recursive: true, force: true })
           } catch {}
-        } catch (copyErr) {
-          // Roll back destination copy on failure (per AGENTS.md authoritative write failure policy):
-          // Restore pre-migration destination state from backupDir so no existing user state is lost.
-          const rollbackSucceeded = rollbackMigrationDestination(currentDir, backupDir, stagedEntries)
-          if (rollbackSucceeded) {
-            try {
-              fs.rmSync(inProgressPath, { force: true })
-            } catch {}
-            try {
-              fs.rmSync(backupDir, { recursive: true, force: true })
-            } catch {}
-          } else {
-            rollbackFailed = true
-            console.error('[noemetra] rollback did not complete; retaining backup, staging and in-progress marker for recovery')
-          }
-          throw copyErr
-        } finally {
-          // Step 5: Clean up staging only when rollback did not fail.
-          // If rollback failed, keep stagingDir intact so interrupted-migration recovery can identify
-          // and clean up partially copied destination entries.
-          if (!rollbackFailed) {
-            try {
-              fs.rmSync(stagingDir, { recursive: true, force: true })
-            } catch {
-              // best-effort cleanup
-            }
+        } else {
+          rollbackFailed = true
+          console.error('[noemetra] rollback did not complete; retaining backup, staging and in-progress marker for recovery')
+        }
+        throw copyErr
+      } finally {
+        // Step 5: Clean up staging only when rollback did not fail.
+        // If rollback failed, keep stagingDir intact so interrupted-migration recovery can identify
+        // and clean up partially copied destination entries.
+        if (!rollbackFailed) {
+          try {
+            fs.rmSync(stagingDir, { recursive: true, force: true })
+          } catch {
+            // best-effort cleanup
           }
         }
       }
@@ -1863,33 +1936,96 @@ ipcMain.handle('hermes:migration:get-recovery-info', () => {
   return null
 })
 
-ipcMain.handle('hermes:migration:restore-legacy-database', async (_event, dbName: string) => {
+ipcMain.handle('hermes:migration:restore-legacy-database', async (_event, dbName?: string) => {
   try {
     const currentDir = app.getPath('userData')
-    const legacyPath = path.join(currentDir, `${dbName}.legacy`)
-    const activePath = path.join(currentDir, dbName)
-    if (fs.existsSync(legacyPath)) {
-      fs.rmSync(activePath, { recursive: true, force: true })
-      fs.cpSync(legacyPath, activePath, { recursive: true })
-      return { ok: true }
+    const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+    let databasesToRestore: Array<{ name: string; legacyPreserved: string }> = []
+
+    if (fs.existsSync(manifestPath)) {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+        if (Array.isArray(manifest.databases)) {
+          if (dbName && dbName !== 'all') {
+            const match = manifest.databases.find((d: any) => d.name === dbName)
+            if (match) databasesToRestore.push(match)
+          } else {
+            databasesToRestore = manifest.databases
+          }
+        }
+      } catch {}
     }
-    return { ok: false, error: 'no legacy database snapshot found' }
+
+    if (databasesToRestore.length === 0 && dbName && dbName !== 'all') {
+      databasesToRestore.push({ name: dbName, legacyPreserved: `${dbName}.legacy` })
+    }
+
+    if (databasesToRestore.length === 0) {
+      return { ok: false, error: 'no legacy databases found to restore' }
+    }
+
+    // Stage the restore request before closing/restarting the active Chromium session
+    // (per AGENTS.md:73-78: swap performed safely before Chromium opens LevelDB on restart)
+    const pendingRestorePath = path.join(currentDir, '.legacy-restore-pending.json')
+    fs.writeFileSync(
+      pendingRestorePath,
+      JSON.stringify(
+        {
+          requestedAt: new Date().toISOString(),
+          databases: databasesToRestore
+        },
+        null,
+        2
+      ),
+      'utf8'
+    )
+
+    // Safely relaunch the application so the swap is performed before Chromium opens the database
+    setImmediate(() => {
+      try {
+        relaunchApp(relauncher, { args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
+        void exitAfterBackendShutdown(0)
+      } catch (relaunchErr) {
+        console.error('[noemetra] relaunch failed during legacy database restore:', relaunchErr)
+      }
+    })
+
+    return { ok: true, relaunching: true }
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) }
   }
 })
 
-ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, dbName: string) => {
+ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, dbName?: string) => {
   try {
     const currentDir = app.getPath('userData')
-    const interveningPath = path.join(currentDir, `${dbName}.intervening`)
-    const activePath = path.join(currentDir, dbName)
-    if (fs.existsSync(interveningPath)) {
-      fs.rmSync(activePath, { recursive: true, force: true })
-      fs.cpSync(interveningPath, activePath, { recursive: true })
-      return { ok: true }
+    const targetName = dbName || 'Local Storage'
+    const interveningPath = path.join(currentDir, `${targetName}.intervening`)
+    if (!fs.existsSync(interveningPath)) {
+      return { ok: false, error: 'no intervening database snapshot found' }
     }
-    return { ok: false, error: 'no intervening database snapshot found' }
+    const pendingRestorePath = path.join(currentDir, '.legacy-restore-pending.json')
+    fs.writeFileSync(
+      pendingRestorePath,
+      JSON.stringify(
+        {
+          requestedAt: new Date().toISOString(),
+          databases: [{ name: targetName, legacyPreserved: `${targetName}.intervening` }]
+        },
+        null,
+        2
+      ),
+      'utf8'
+    )
+    setImmediate(() => {
+      try {
+        relaunchApp(relauncher, { args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
+        void exitAfterBackendShutdown(0)
+      } catch (relaunchErr) {
+        console.error('[noemetra] relaunch failed during intervening database restore:', relaunchErr)
+      }
+    })
+    return { ok: true, relaunching: true }
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) }
   }

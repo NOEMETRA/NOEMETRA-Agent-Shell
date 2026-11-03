@@ -780,13 +780,15 @@ declare global {
       migration?: {
         getRecoveryInfo: () => Promise<null | {
           migratedAt: string
-          database: string
-          legacyPreserved: string
-          activeRetained: string
           status: string
+          databases: Array<{
+            name: string
+            legacyPreserved: string
+            activeRetained: string
+          }>
         }>
-        restoreLegacyDatabase: (dbName: string) => Promise<{ ok: boolean; error?: string }>
-        restoreInterveningDatabase: (dbName: string) => Promise<{ ok: boolean; error?: string }>
+        restoreLegacyDatabase: (dbName?: string) => Promise<{ ok: boolean; relaunching?: boolean; error?: string }>
+        restoreInterveningDatabase: (dbName?: string) => Promise<{ ok: boolean; relaunching?: boolean; error?: string }>
         dismissRecoveryInfo: () => Promise<{ ok: boolean; error?: string }>
       }
     }
