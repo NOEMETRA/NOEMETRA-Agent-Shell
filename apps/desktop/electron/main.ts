@@ -784,14 +784,20 @@ const MIGRATION_IN_PROGRESS_MARKER = '.migration-in-progress'
 function legacyDirectoryForVariant(): string | null {
   const appData = app.getPath('appData')
 
-  // Stable releases
+  // Stable releases — probe historical packaged names (with and without spaces)
   if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraLight') {
-    const lightDir = path.join(appData, 'HermesLight')
-    return fs.existsSync(lightDir) ? lightDir : path.join(appData, 'Hermes')
+    for (const name of ['Hermes Light', 'HermesLight']) {
+      const p = path.join(appData, name)
+      if (fs.existsSync(p)) return p
+    }
+    return path.join(appData, 'Hermes')
   }
   if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShellBundled') {
-    const bundledDir = path.join(appData, 'HermesAgent')
-    return fs.existsSync(bundledDir) ? bundledDir : path.join(appData, 'Hermes')
+    for (const name of ['Hermes Agent', 'HermesAgent', 'Hermes Bundled', 'HermesBundled']) {
+      const p = path.join(appData, name)
+      if (fs.existsSync(p)) return p
+    }
+    return path.join(appData, 'Hermes')
   }
   if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShell') {
     return path.join(appData, 'Hermes')
@@ -799,14 +805,24 @@ function legacyDirectoryForVariant(): string | null {
 
   // Canary releases — migrate from corresponding upstream canary directory
   if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraLightCanary') {
-    const lightCanaryDir = path.join(appData, 'HermesLightCanary')
-    return fs.existsSync(lightCanaryDir) ? lightCanaryDir : path.join(appData, 'HermesCanary')
+    for (const name of ['Hermes Light Canary', 'HermesLightCanary', 'Hermes Canary', 'HermesCanary']) {
+      const p = path.join(appData, name)
+      if (fs.existsSync(p)) return p
+    }
+    return path.join(appData, 'HermesCanary')
   }
   if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShellBundledCanary') {
-    const bundledCanaryDir = path.join(appData, 'HermesBundledCanary')
-    return fs.existsSync(bundledCanaryDir) ? bundledCanaryDir : path.join(appData, 'HermesCanary')
+    for (const name of ['Hermes Agent Canary', 'HermesAgentCanary', 'Hermes Bundled Canary', 'HermesBundledCanary']) {
+      const p = path.join(appData, name)
+      if (fs.existsSync(p)) return p
+    }
+    return path.join(appData, 'HermesCanary')
   }
   if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShellCanary') {
+    for (const name of ['Hermes Canary', 'HermesCanary']) {
+      const p = path.join(appData, name)
+      if (fs.existsSync(p)) return p
+    }
     return path.join(appData, 'HermesCanary')
   }
 
@@ -881,10 +897,41 @@ const MIGRATION_PENDING_MARKER = '.legacy-migration-pending'
 const MIGRATION_BACKUP_DIR = '.migration-backup'
 const DATABASE_DIR_NAMES = new Set(['Local Storage', 'Session Storage', 'IndexedDB'])
 
+function isDatabaseEmptyOrDefault(dbDir: string): boolean {
+  try {
+    if (!fs.existsSync(dbDir)) return true
+    const levelDbDir = path.join(dbDir, 'leveldb')
+    const targetDir = fs.existsSync(levelDbDir) ? levelDbDir : dbDir
+    if (!fs.existsSync(targetDir)) return true
+    const files = fs.readdirSync(targetDir)
+
+    // In an empty/default LevelDB directory created on initial startup, there are no .ldb table files
+    // and log files are minimal (< 4KB). Active user databases contain .ldb table files or substantial logs.
+    let totalLdbSize = 0
+    let maxLogSize = 0
+
+    for (const file of files) {
+      const fullPath = path.join(targetDir, file)
+      const stat = fs.statSync(fullPath)
+      if (file.endsWith('.ldb')) {
+        totalLdbSize += stat.size
+      } else if (file.endsWith('.log')) {
+        if (stat.size > maxLogSize) maxLogSize = stat.size
+      }
+    }
+    return totalLdbSize === 0 && maxLogSize < 4096
+  } catch {
+    return true
+  }
+}
+
 function backupPreMigrationDestination(currentDir: string, backupDir: string): boolean {
   try {
     fs.mkdirSync(backupDir, { recursive: true })
-    if (!fs.existsSync(currentDir)) return true
+    if (!fs.existsSync(currentDir)) {
+      fs.writeFileSync(path.join(backupDir, '.backup-complete'), 'ok\n', 'utf8')
+      return true
+    }
     const entries = fs.readdirSync(currentDir)
     for (const entry of entries) {
       if (
@@ -902,6 +949,7 @@ function backupPreMigrationDestination(currentDir: string, backupDir: string): b
       const dst = path.join(backupDir, entry)
       fs.cpSync(src, dst, { recursive: true })
     }
+    fs.writeFileSync(path.join(backupDir, '.backup-complete'), 'ok\n', 'utf8')
     return true
   } catch {
     try {
@@ -922,6 +970,7 @@ function rollbackMigrationDestination(currentDir: string, backupDir: string, sta
   if (fs.existsSync(backupDir)) {
     const backedUp = fs.readdirSync(backupDir)
     for (const entry of backedUp) {
+      if (entry === '.backup-complete') continue
       try {
         fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
       } catch {}
@@ -990,6 +1039,7 @@ function maybeMigrateLegacyDesktopState(): void {
       const pendingMarkerPath = path.join(currentDir, MIGRATION_PENDING_MARKER)
       const stagingDir = path.join(currentDir, '.migration-stage')
       const backupDir = path.join(currentDir, MIGRATION_BACKUP_DIR)
+      const backupCompletePath = path.join(backupDir, '.backup-complete')
 
       // Coordinate with legacy app: require it to be closed before copying databases
       // to ensure consistent, quiescent LevelDB and Local Storage snapshots.
@@ -1003,28 +1053,38 @@ function maybeMigrateLegacyDesktopState(): void {
         return
       }
 
-      // If a previous migration was interrupted before completion, recover cleanly:
-      // First remove any staged entries that were partially applied, then restore original destination state.
+      // If an incomplete backup was left behind without migration in progress, clean it up safely
+      if (fs.existsSync(backupDir) && !fs.existsSync(inProgressPath)) {
+        try {
+          fs.rmSync(backupDir, { recursive: true, force: true })
+        } catch {}
+      }
+
+      // If a previous migration was interrupted after changes started:
+      // Only remove destination entries and roll back if backup-complete was confirmed
       if (fs.existsSync(inProgressPath)) {
         try {
-          if (fs.existsSync(stagingDir)) {
-            const staged = fs.readdirSync(stagingDir)
-            for (const item of staged) {
-              fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
+          if (fs.existsSync(backupCompletePath)) {
+            if (fs.existsSync(stagingDir)) {
+              const staged = fs.readdirSync(stagingDir)
+              for (const item of staged) {
+                fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
+              }
             }
-          }
-          if (fs.existsSync(backupDir)) {
             const backedUp = fs.readdirSync(backupDir)
             for (const entry of backedUp) {
+              if (entry === '.backup-complete') continue
               try {
                 fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
               } catch {}
             }
-            fs.rmSync(backupDir, { recursive: true, force: true })
           }
         } catch {
           // ignore cleanup error
         }
+        try {
+          fs.rmSync(backupDir, { recursive: true, force: true })
+        } catch {}
         try {
           fs.rmSync(inProgressPath, { force: true })
         } catch {}
@@ -1069,22 +1129,24 @@ function maybeMigrateLegacyDesktopState(): void {
         })
 
         const stagedEntries = fs.readdirSync(stagingDir)
-        // Step 2: Mark migration in progress and snapshot destination before applying changes.
-        // Abort migration if destination snapshot fails (per AGENTS.md failed-write recovery invariant).
-        fs.writeFileSync(inProgressPath, '1\n', 'utf8')
+
+        // Step 2: Complete destination backup snapshot BEFORE marking migration in progress.
+        // If snapshot cannot be completed, abort immediately without touching destination
+        // (per AGENTS.md failed-write recovery invariant).
         const backupOk = backupPreMigrationDestination(currentDir, backupDir)
         if (!backupOk) {
           console.warn('[noemetra] failed to complete destination backup snapshot; aborting migration to protect existing state')
-          try {
-            fs.rmSync(inProgressPath, { force: true })
-          } catch {}
           return
         }
 
+        // Only mark migration in progress after confirmed complete backup
+        fs.writeFileSync(inProgressPath, '1\n', 'utf8')
+
         try {
           // Step 3: Transfer staging into currentDir.
-          // Database directories (LevelDB / IndexedDB) must never overwrite an active destination database;
-          // if destination already has active databases, preserve them in place and save legacy copies alongside.
+          // Restore legacy browser databases (Local Storage, Session Storage, IndexedDB) as cohesive atomic units.
+          // If destination database is empty/default boilerplate from a postponed boot, replace it with legacy.
+          // If destination already holds active user data, preserve intervening state aside before restoring legacy.
           for (const entry of stagedEntries) {
             const stagedPath = path.join(stagingDir, entry)
             const destPath = path.join(currentDir, entry)
@@ -1093,17 +1155,19 @@ function maybeMigrateLegacyDesktopState(): void {
 
             if (isDatabaseDir) {
               if (fs.existsSync(destPath)) {
-                // If destination already has an active database (e.g. from an intervening postponed session),
-                // preserve active state without replacing it; store legacy database alongside under .legacy
-                const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
-                if (!fs.existsSync(legacyPreservedPath)) {
-                  try {
-                    fs.cpSync(stagedPath, legacyPreservedPath, { recursive: true })
-                  } catch {}
+                if (!isDatabaseEmptyOrDefault(destPath)) {
+                  // Active user data exists from intervening session: preserve aside to ensure no user work is lost
+                  const interveningPreservedPath = path.join(currentDir, `${entry}.intervening`)
+                  if (!fs.existsSync(interveningPreservedPath)) {
+                    try {
+                      fs.cpSync(destPath, interveningPreservedPath, { recursive: true })
+                    } catch {}
+                  }
                 }
-              } else {
-                fs.cpSync(stagedPath, destPath, { recursive: true })
+                // Replace destination database directory as a consistent unit so legacy settings and browser state are restored
+                fs.rmSync(destPath, { recursive: true, force: true })
               }
+              fs.cpSync(stagedPath, destPath, { recursive: true })
             } else if (entry === 'connections.json') {
               reconcileConnectionsRegistry(destPath, stagedPath)
             } else {
