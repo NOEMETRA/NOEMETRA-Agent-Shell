@@ -138,6 +138,94 @@ def _quick_setup_nous_portal(config: dict) -> None:
     _reload_config_into(config)
 
 
+def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, imported_from: str = ""):
+    """Streamlined first-time setup for Local Ollama / local models:
+    100% offline, zero external API calls, private and free.
+    Probes local Ollama instance, selects local model, sets up terminal & minimal defaults."""
+    from hermes_cli.setup import (
+        _apply_default_agent_settings, _info, print_info, _print_setup_summary, print_success,
+        print_warning, print_header, prompt_choice, save_config, setup_gateway, setup_terminal_backend
+    )
+    from hermes_cli.models_local import probe_ollama_local_models
+    from hermes_cli.cli_output import line_input
+
+    # Step 1: the imported model (if any) or local Ollama probe.
+    if _keep_imported_model(config, imported_from):
+        setup_terminal_backend(config)
+        _apply_default_agent_settings(config)
+        save_config(config)
+        _print_setup_summary(config, hermes_home)
+        return
+
+    print_header("Local Inference Setup (Ollama / Local Models)", gap=True)
+    _info("NOEMETRA Agent Shell runs 100% locally with Ollama, vLLM, or LM Studio.",
+          "Zero telemetry, no external accounts, private and free.", None)
+
+    local_url = "http://127.0.0.1:11434"
+    models = probe_ollama_local_models(local_url, timeout=2.0)
+    selected_model = ""
+
+    if models:
+        print_success(f"Ollama detected at {local_url} ({len(models)} model{'s' if len(models) != 1 else ''} available):")
+        for i, m in enumerate(models, 1):
+            print(f"    {i}. {m}")
+        print()
+        if len(models) == 1:
+            default_m = models[0]
+            choice = input(f"  Use detected model '{default_m}'? [Y/n]: ").strip().lower()
+            if choice in {"", "y", "yes"}:
+                selected_model = default_m
+            else:
+                selected_model = line_input("  Enter model name: ").strip()
+        else:
+            pick = input(f"  Select model [1-{len(models)}] or type name: ").strip()
+            if pick.isdigit() and 1 <= int(pick) <= len(models):
+                selected_model = models[int(pick) - 1]
+            else:
+                selected_model = pick or models[0]
+    else:
+        print_warning(f"Ollama was not detected on {local_url}.")
+        _info("  Ensure Ollama is running (`ollama serve`), or provide your local endpoint.")
+        custom_base = line_input(f"  Local API Base URL [{local_url}/v1]: ").strip() or f"{local_url}/v1"
+        selected_model = line_input("  Model name (e.g. gemma4:12b): ").strip() or "gemma4:12b"
+        local_url = custom_base
+
+    base_v1 = local_url if local_url.endswith("/v1") else local_url.rstrip("/") + "/v1"
+
+    config.setdefault("model", {})
+    config["model"]["provider"] = "ollama"
+    config["model"]["base_url"] = base_v1
+    config["model"]["default"] = selected_model
+
+    print_success(f"Configured provider: ollama (model: {selected_model}, endpoint: {base_v1})")
+
+    # Step 2: Terminal Backend; Step 3: defaults
+    setup_terminal_backend(config)
+    _apply_default_agent_settings(config)
+    save_config(config)
+
+    # Step 4: Optional messaging platform
+    print()
+    gateway_choice = prompt_choice("Connect a messaging platform? (Telegram, Discord, etc.)", [
+        "Skip for now (recommended for local use)", "Set up messaging now",
+    ], 0)
+    if gateway_choice == 1:
+        setup_gateway(config)
+        save_config(config)
+    else:
+        from hermes_cli.gateway_setup_service import ensure_gateway_service
+        ensure_gateway_service(context="setup", interactive=False, config=config)
+
+    print()
+    print_success("Setup complete! Your local NOEMETRA Agent is ready.")
+    _info(None, "  Start chatting:     hermes",
+          "  Change model:       hermes model",
+          "  Agent settings:     hermes setup agent", None)
+    _print_macos_fda_tip()
+    print()
+    _print_setup_summary(config, hermes_home)
+
+
 def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool, imported_from: str = ""):
     """Streamlined first-time setup via Nous Portal: OAuth, model, terminal & messaging;
     everything else gets defaults. A model brought by an agent import (*imported_from* names the
