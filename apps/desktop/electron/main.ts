@@ -1201,13 +1201,46 @@ function applyPendingLegacyDatabaseRestore(): void {
           }
         } catch {}
       }
-      for (const manifestName of ['legacy-migration-recovery.json', 'legacy-migration-available.json']) {
-        const manifestPath = path.join(currentDir, manifestName)
+
+      const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+      if (request.action === 'restore-intervening') {
+        // User restored their intervening setup: clean up manifest as reverse recovery cycle is complete
         try {
           if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
         } catch {}
+      } else {
+        // User restored legacy data: retain an actionable recovery manifest for the displaced intervening databases!
+        // This satisfies [apps/desktop/AGENTS.md:73-78] by offering reverse restore after the restart.
+        const interveningDatabases: Array<{ name: string; interveningPreserved: string; activeRetained: string }> = []
+        for (const item of dbsToRestore) {
+          const interveningName = `${item.name}.intervening`
+          if (fs.existsSync(path.join(currentDir, interveningName))) {
+            interveningDatabases.push({
+              name: item.name,
+              interveningPreserved: interveningName,
+              activeRetained: item.name
+            })
+          }
+        }
+        if (interveningDatabases.length > 0) {
+          try {
+            fs.writeFileSync(
+              manifestPath,
+              JSON.stringify(
+                {
+                  migratedAt: new Date().toISOString(),
+                  status: 'intervening-preserved-legacy-active',
+                  databases: interveningDatabases
+                },
+                null,
+                2
+              ),
+              'utf8'
+            )
+          } catch {}
+        }
       }
-      console.log('[noemetra] successfully restored legacy database(s) before Chromium startup')
+      console.log('[noemetra] successfully restored database(s) before Chromium startup')
     } else {
       // Roll back any swapped databases from temporary backups
       for (const backup of interveningBackups) {
@@ -2048,18 +2081,49 @@ ipcMain.handle('hermes:migration:restore-legacy-database', async (_event, dbName
 ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, dbName?: string) => {
   try {
     const currentDir = app.getPath('userData')
-    const targetName = dbName || 'Local Storage'
-    const interveningPath = path.join(currentDir, `${targetName}.intervening`)
-    if (!fs.existsSync(interveningPath)) {
+    const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+    let databasesToRestore: Array<{ name: string; legacyPreserved: string }> = []
+
+    if (fs.existsSync(manifestPath)) {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+        if (Array.isArray(manifest.databases)) {
+          for (const d of manifest.databases) {
+            const interveningName = d.interveningPreserved || `${d.name}.intervening`
+            if (fs.existsSync(path.join(currentDir, interveningName))) {
+              if (!dbName || dbName === 'all' || dbName === d.name) {
+                databasesToRestore.push({ name: d.name, legacyPreserved: interveningName })
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    if (databasesToRestore.length === 0) {
+      // Fallback: check standard database names for .intervening snapshots
+      for (const dName of DATABASE_DIR_NAMES) {
+        const interveningName = `${dName}.intervening`
+        if (fs.existsSync(path.join(currentDir, interveningName))) {
+          if (!dbName || dbName === 'all' || dbName === dName) {
+            databasesToRestore.push({ name: dName, legacyPreserved: interveningName })
+          }
+        }
+      }
+    }
+
+    if (databasesToRestore.length === 0) {
       return { ok: false, error: 'no intervening database snapshot found' }
     }
+
     const pendingRestorePath = path.join(currentDir, '.legacy-restore-pending.json')
     fs.writeFileSync(
       pendingRestorePath,
       JSON.stringify(
         {
           requestedAt: new Date().toISOString(),
-          databases: [{ name: targetName, legacyPreserved: `${targetName}.intervening` }]
+          databases: databasesToRestore,
+          action: 'restore-intervening'
         },
         null,
         2
