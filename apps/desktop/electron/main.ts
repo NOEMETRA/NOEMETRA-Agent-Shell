@@ -773,11 +773,13 @@ if (!isPrimaryInstance) {
 // Hermes installation if upgrading to NOEMETRA Agent Shell and new userData has no meaningful state.
 // Scoped to the primary lock holder of supported desktop variants (standard, bundled, light).
 // Never runs for isolated environments (USER_DATA_OVERRIDE / HERMES_DATA_DIR_SUFFIX).
+const MIGRATION_COMPLETE_MARKER = '.legacy-migration-complete'
+const MIGRATION_IN_PROGRESS_MARKER = '.migration-in-progress'
+
 function legacyDirectoryForVariant(): string | null {
-  // Upstream stable installs across all variants (standard, bundled, light) retained
-  // package.json's productName 'Hermes', storing user data in the 'Hermes' directory.
-  // Check candidate variant-specific directory if it exists, falling back to canonical 'Hermes'.
   const appData = app.getPath('appData')
+
+  // Stable releases
   if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraLight') {
     const lightDir = path.join(appData, 'HermesLight')
     return fs.existsSync(lightDir) ? lightDir : path.join(appData, 'Hermes')
@@ -789,10 +791,22 @@ function legacyDirectoryForVariant(): string | null {
   if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShell') {
     return path.join(appData, 'Hermes')
   }
+
+  // Canary releases — migrate from corresponding upstream canary directory
+  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraLightCanary') {
+    const lightCanaryDir = path.join(appData, 'HermesLightCanary')
+    return fs.existsSync(lightCanaryDir) ? lightCanaryDir : path.join(appData, 'HermesCanary')
+  }
+  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShellBundledCanary') {
+    const bundledCanaryDir = path.join(appData, 'HermesBundledCanary')
+    return fs.existsSync(bundledCanaryDir) ? bundledCanaryDir : path.join(appData, 'HermesCanary')
+  }
+  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShellCanary') {
+    return path.join(appData, 'HermesCanary')
+  }
+
   return null
 }
-
-const MIGRATION_COMPLETE_MARKER = '.legacy-migration-complete'
 
 function maybeMigrateLegacyDesktopState(): void {
   if (
@@ -813,7 +827,26 @@ function maybeMigrateLegacyDesktopState(): void {
         return
       }
 
+      const inProgressPath = path.join(currentDir, MIGRATION_IN_PROGRESS_MARKER)
       const stagingDir = path.join(currentDir, '.migration-stage')
+
+      // If a previous migration was interrupted before completion, clean up partial state
+      if (fs.existsSync(inProgressPath)) {
+        try {
+          if (fs.existsSync(stagingDir)) {
+            const staged = fs.readdirSync(stagingDir)
+            for (const item of staged) {
+              fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
+            }
+          }
+        } catch {
+          // ignore cleanup error
+        }
+        try {
+          fs.rmSync(inProgressPath, { force: true })
+        } catch {}
+      }
+
       if (fs.existsSync(stagingDir)) {
         try {
           fs.rmSync(stagingDir, { recursive: true, force: true })
@@ -830,6 +863,7 @@ function maybeMigrateLegacyDesktopState(): void {
             !name.startsWith('Singleton') &&
             name !== 'Crashpad' &&
             name !== '.migration-stage' &&
+            name !== MIGRATION_IN_PROGRESS_MARKER &&
             name !== MIGRATION_COMPLETE_MARKER
         )
 
@@ -846,37 +880,58 @@ function maybeMigrateLegacyDesktopState(): void {
           }
         })
 
-        // Step 2: Merge staging into currentDir (stagingDir is already filtered)
-        fs.cpSync(stagingDir, currentDir, {
-          recursive: true,
-          errorOnExist: false,
-          force: false
-        })
+        const stagedEntries = fs.readdirSync(stagingDir)
+        // Step 2: Mark migration in progress before destination merge
+        fs.writeFileSync(inProgressPath, '1\n', 'utf8')
 
-        // Step 3: Record completion marker once meaningful state is confirmed in destination
-        const copiedSomething =
-          fs.existsSync(currentDir) &&
-          fs.readdirSync(currentDir).some(
-            (name) =>
-              !name.startsWith('Singleton') &&
-              name !== 'Crashpad' &&
-              name !== '.migration-stage' &&
-              name !== MIGRATION_COMPLETE_MARKER
-          )
-        if (copiedSomething) {
-          fs.writeFileSync(markerPath, 'ok\n', 'utf8')
-        }
-
-        // Step 4: Clean up staging
         try {
-          fs.rmSync(stagingDir, { recursive: true, force: true })
-        } catch {
-          // best-effort cleanup
+          // Step 3: Merge staging into currentDir (stagingDir is already filtered)
+          fs.cpSync(stagingDir, currentDir, {
+            recursive: true,
+            errorOnExist: false,
+            force: false
+          })
+
+          // Step 4: Record completion marker once meaningful state is confirmed in destination
+          const copiedSomething =
+            fs.existsSync(currentDir) &&
+            fs.readdirSync(currentDir).some(
+              (name) =>
+                !name.startsWith('Singleton') &&
+                name !== 'Crashpad' &&
+                name !== '.migration-stage' &&
+                name !== MIGRATION_IN_PROGRESS_MARKER &&
+                name !== MIGRATION_COMPLETE_MARKER
+            )
+          if (copiedSomething) {
+            fs.writeFileSync(markerPath, 'ok\n', 'utf8')
+          }
+          try {
+            fs.rmSync(inProgressPath, { force: true })
+          } catch {}
+        } catch (copyErr) {
+          // Roll back partial destination copy on failure (per AGENTS.md authoritative write failure policy)
+          for (const entry of stagedEntries) {
+            try {
+              fs.rmSync(path.join(currentDir, entry), { recursive: true, force: true })
+            } catch {}
+          }
+          try {
+            fs.rmSync(inProgressPath, { force: true })
+          } catch {}
+          throw copyErr
+        } finally {
+          // Step 5: Clean up staging
+          try {
+            fs.rmSync(stagingDir, { recursive: true, force: true })
+          } catch {
+            // best-effort cleanup
+          }
         }
       }
     }
   } catch {
-    // Non-blocking best-effort migration: on error, staging is not marked complete,
+    // Non-blocking best-effort migration: on error, rollback ensures no partial state remains,
     // leaving migration cleanly retryable on next launch.
   }
 }
