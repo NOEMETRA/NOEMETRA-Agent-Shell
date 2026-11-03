@@ -846,16 +846,26 @@ function maybeMigrateLegacyDesktopState(): void {
           }
         })
 
-        // Step 2: Merge staging into currentDir
+        // Step 2: Merge staging into currentDir (stagingDir is already filtered)
         fs.cpSync(stagingDir, currentDir, {
           recursive: true,
           errorOnExist: false,
-          force: false,
-          filter: (src) => path.basename(src) !== '.migration-stage'
+          force: false
         })
 
-        // Step 3: Record completion marker to track success independently from file presence
-        fs.writeFileSync(markerPath, 'ok\n', 'utf8')
+        // Step 3: Record completion marker once meaningful state is confirmed in destination
+        const copiedSomething =
+          fs.existsSync(currentDir) &&
+          fs.readdirSync(currentDir).some(
+            (name) =>
+              !name.startsWith('Singleton') &&
+              name !== 'Crashpad' &&
+              name !== '.migration-stage' &&
+              name !== MIGRATION_COMPLETE_MARKER
+          )
+        if (copiedSomething) {
+          fs.writeFileSync(markerPath, 'ok\n', 'utf8')
+        }
 
         // Step 4: Clean up staging
         try {
