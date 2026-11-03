@@ -917,14 +917,59 @@ const MIGRATION_PENDING_MARKER = '.legacy-migration-pending'
 const MIGRATION_BACKUP_DIR = '.migration-backup'
 const DATABASE_DIR_NAMES = new Set(['Local Storage', 'Session Storage', 'IndexedDB'])
 
-function isDatabaseVerifiablyEmpty(dbDir: string): boolean {
+function hasDatabaseContent(dbDir: string): boolean {
   try {
-    if (!fs.existsSync(dbDir)) return true
-    const files = fs.readdirSync(dbDir)
-    return files.length === 0
-  } catch {
-    return false
-  }
+    if (!fs.existsSync(dbDir)) return false
+    const files = fs.readdirSync(dbDir, { recursive: true })
+    for (const file of files) {
+      const filePath = path.join(dbDir, String(file))
+      try {
+        const stat = fs.statSync(filePath)
+        if (stat.isDirectory()) continue
+        const basename = path.basename(filePath)
+        if (basename.endsWith('.ldb') && stat.size > 0) {
+          return true
+        }
+        if (basename.endsWith('.log') && stat.size > 1024) {
+          return true
+        }
+      } catch {}
+    }
+  } catch {}
+  return false
+}
+
+const USER_CONFIG_FILE_NAMES = [
+  'connections.json',
+  'active-profile.json',
+  'window-state.json',
+  'native-theme.json',
+  'minimize-to-tray.json',
+  'storage.json'
+]
+
+function hasInterveningUserState(dir: string): boolean {
+  try {
+    if (!fs.existsSync(dir)) return false
+    for (const name of USER_CONFIG_FILE_NAMES) {
+      const target = path.join(dir, name)
+      if (fs.existsSync(target)) {
+        try {
+          const stat = fs.statSync(target)
+          if (stat.size > 2) return true
+        } catch {}
+      }
+    }
+    for (const dbName of DATABASE_DIR_NAMES) {
+      const dbPath = path.join(dir, dbName)
+      if (hasDatabaseContent(dbPath)) return true
+    }
+  } catch {}
+  return false
+}
+
+function isDatabaseVerifiablyEmpty(dbDir: string): boolean {
+  return !hasDatabaseContent(dbDir)
 }
 
 function backupPreMigrationDestination(currentDir: string, backupDir: string): boolean {
@@ -963,11 +1008,22 @@ function backupPreMigrationDestination(currentDir: string, backupDir: string): b
 
 function rollbackMigrationDestination(currentDir: string, backupDir: string, stagedEntries: string[]): boolean {
   try {
+    let allStagedCleaned = true
     // First remove any entries copied into currentDir from staging
     for (const entry of stagedEntries) {
+      const target = path.join(currentDir, entry)
       try {
-        fs.rmSync(path.join(currentDir, entry), { recursive: true, force: true })
-      } catch {}
+        if (fs.existsSync(target)) {
+          fs.rmSync(target, { recursive: true, force: true })
+        }
+      } catch (rmErr) {
+        console.error(`[noemetra] rollback failed to remove staged entry ${entry}:`, rmErr)
+        allStagedCleaned = false
+      }
+    }
+    if (!allStagedCleaned) {
+      console.error('[noemetra] rollback could not remove all staged destination remnants')
+      return false
     }
     // Restore original pre-migration destination state from backupDir so no existing user data is deleted
     if (fs.existsSync(backupDir)) {
@@ -1075,26 +1131,38 @@ function maybeMigrateLegacyDesktopState(): void {
         let recoverySucceeded = false
         try {
           if (fs.existsSync(backupCompletePath)) {
+            let allStagedRemoved = true
             if (fs.existsSync(stagingDir)) {
               const staged = fs.readdirSync(stagingDir)
               for (const item of staged) {
+                const target = path.join(currentDir, item)
                 try {
-                  fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
-                } catch {}
+                  if (fs.existsSync(target)) {
+                    fs.rmSync(target, { recursive: true, force: true })
+                  }
+                } catch (rmErr) {
+                  console.error(`[noemetra] recovery failed to remove staged entry ${item}:`, rmErr)
+                  allStagedRemoved = false
+                }
               }
             }
-            const backedUp = fs.readdirSync(backupDir)
-            let allRestored = true
-            for (const entry of backedUp) {
-              if (entry === '.backup-complete') continue
-              try {
-                fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
-              } catch (restoreErr) {
-                console.error(`[noemetra] recovery failed to restore ${entry}:`, restoreErr)
-                allRestored = false
+            if (!allStagedRemoved) {
+              console.error('[noemetra] recovery could not remove all staged destination remnants; retaining backup snapshot for retry')
+              recoverySucceeded = false
+            } else {
+              const backedUp = fs.readdirSync(backupDir)
+              let allRestored = true
+              for (const entry of backedUp) {
+                if (entry === '.backup-complete') continue
+                try {
+                  fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
+                } catch (restoreErr) {
+                  console.error(`[noemetra] recovery failed to restore ${entry}:`, restoreErr)
+                  allRestored = false
+                }
               }
+              recoverySucceeded = allRestored
             }
-            recoverySucceeded = allRestored
           }
         } catch (err) {
           console.error('[noemetra] recovery error:', err)
@@ -1176,8 +1244,10 @@ function maybeMigrateLegacyDesktopState(): void {
         try {
           // Step 3: Transfer staging into currentDir.
           // Restore legacy browser databases (Local Storage, Session Storage, IndexedDB) as cohesive atomic units.
-          // If destination database exists (e.g. from an intervening postponed session), preserve it under .intervening
-          // and record recovery metadata so intervening state is recoverable while legacy state becomes active.
+          // Per AGENTS.md (merge, don't clobber; newer intent takes precedence):
+          // If active user database already exists from an intervening session, preserve it intact in destPath
+          // and preserve legacy database to sidecar (.legacy) with an authoritative recovery manifest.
+          // If destination has only empty boot boilerplate, restore legacy database directly into destPath.
           for (const entry of stagedEntries) {
             const stagedPath = path.join(stagingDir, entry)
             const destPath = path.join(currentDir, entry)
@@ -1185,12 +1255,19 @@ function maybeMigrateLegacyDesktopState(): void {
             const isDatabaseDir = DATABASE_DIR_NAMES.has(entry) || fs.existsSync(path.join(stagedPath, 'leveldb'))
 
             if (isDatabaseDir) {
-              if (fs.existsSync(destPath)) {
-                const interveningPreservedPath = path.join(currentDir, `${entry}.intervening`)
-                if (!fs.existsSync(interveningPreservedPath)) {
-                  fs.cpSync(destPath, interveningPreservedPath, { recursive: true })
+              const destExists = fs.existsSync(destPath)
+              const destHasContent = destExists && hasDatabaseContent(destPath)
+
+              if (destHasContent) {
+                // Active user database already exists in destination from intervening session:
+                // Per AGENTS.md (merge, don't clobber; newer intent takes precedence),
+                // preserve active database intact in destPath so settings and workspace state are not lost.
+                // Preserve legacy database to sidecar (.legacy) as an authoritative recovery affordance.
+                const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
+                if (!fs.existsSync(legacyPreservedPath)) {
+                  fs.cpSync(stagedPath, legacyPreservedPath, { recursive: true })
                 }
-                const recoveryManifestPath = path.join(currentDir, 'legacy-migration-available.json')
+                const recoveryManifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
                 try {
                   fs.writeFileSync(
                     recoveryManifestPath,
@@ -1198,8 +1275,9 @@ function maybeMigrateLegacyDesktopState(): void {
                       {
                         migratedAt: new Date().toISOString(),
                         database: entry,
-                        interveningBackup: `${entry}.intervening`,
-                        status: 'legacy-restored-intervening-preserved'
+                        legacyPreserved: `${entry}.legacy`,
+                        activeRetained: entry,
+                        status: 'active-preserved-legacy-available'
                       },
                       null,
                       2
@@ -1207,10 +1285,15 @@ function maybeMigrateLegacyDesktopState(): void {
                     'utf8'
                   )
                 } catch {}
-                fs.rmSync(destPath, { recursive: true, force: true })
+                console.log(`[noemetra] active user database preserved in ${entry}; legacy copy preserved in ${entry}.legacy`)
+              } else {
+                // Destination database does not exist or only contains empty boot boilerplate.
+                // Restore legacy database directly into destPath.
+                if (destExists) {
+                  fs.rmSync(destPath, { recursive: true, force: true })
+                }
+                fs.cpSync(stagedPath, destPath, { recursive: true })
               }
-              // Restore legacy database as active unit so settings, themes, and workspace state appear in the app
-              fs.cpSync(stagedPath, destPath, { recursive: true })
             } else if (entry === 'connections.json') {
               reconcileConnectionsRegistry(destPath, stagedPath)
             } else {
@@ -1743,16 +1826,34 @@ if (IS_WINDOWS || process.platform === 'linux') {
 ipcMain.handle('hermes:get-remote-display-reason', () => REMOTE_DISPLAY_REASON)
 ipcMain.handle('hermes:embed-host:origin', () => embedHostOrigin())
 
-// Authoritative desktop migration recovery handlers (recover intervening databases if needed)
+// Authoritative desktop migration recovery handlers (recover intervening or legacy databases if needed)
 ipcMain.handle('hermes:migration:get-recovery-info', () => {
   try {
     const currentDir = app.getPath('userData')
-    const manifestPath = path.join(currentDir, 'legacy-migration-available.json')
-    if (fs.existsSync(manifestPath)) {
-      return JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    for (const manifestName of ['legacy-migration-recovery.json', 'legacy-migration-available.json']) {
+      const manifestPath = path.join(currentDir, manifestName)
+      if (fs.existsSync(manifestPath)) {
+        return JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      }
     }
   } catch {}
   return null
+})
+
+ipcMain.handle('hermes:migration:restore-legacy-database', async (_event, dbName: string) => {
+  try {
+    const currentDir = app.getPath('userData')
+    const legacyPath = path.join(currentDir, `${dbName}.legacy`)
+    const activePath = path.join(currentDir, dbName)
+    if (fs.existsSync(legacyPath)) {
+      fs.rmSync(activePath, { recursive: true, force: true })
+      fs.cpSync(legacyPath, activePath, { recursive: true })
+      return { ok: true }
+    }
+    return { ok: false, error: 'no legacy database snapshot found' }
+  } catch (err: any) {
+    return { ok: false, error: err?.message || String(err) }
+  }
 })
 
 ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, dbName: string) => {
