@@ -93,6 +93,21 @@ I test sono stati eseguiti con `uv run --group dev pytest`.
 - **Regression Suite Eseguita**:
   - 75 test eseguiti tra provider profiles, transport parity, profile wiring, provider parity e guardrails: **75 PASSED / 0 FAILED** (18.43s).
 
+### Prova 6: Esecuzione dell'Applicazione "Hermes Voice" come Plugin Puro Disaccoppiato
+- **Architettura di Disaccoppiamento**: Il core di NOEMETRA Agent Shell rimane 100% universale, agnostico e privo di codice audio, TTS o PDF. L'applicazione `voice-document-assistant` è installata ed eseguita come plugin nativo all'interno del profilo `noemetra`.
+- **Suite di Test del Prototipo Audio**: 21 test su 21 superati al 100% in 102.36s:
+  - `test_agents.py`: 6/6 passed (Bibliotecario, Analista, Verificatore).
+  - `test_extractor.py`: 2/2 passed (Estrazione deterministica PyMuPDF).
+  - `test_player.py`: 2/2 passed (Stato riproduzione e offset audio).
+  - `test_router.py`: 4/4 passed (Routing verso Ollama locale).
+  - `test_server_api.py`: 6/6 passed (Endpoint FastAPI e stato REST).
+  - `test_end_to_end.py`: 1/1 passed (Interrogazione completa con LLM locale).
+- **Verifica Funzionale degli Strumenti sul Runtime NOEMETRA**:
+  - Rilevamento e registrazione: 8 strumenti registrati con successo (`tools: 8`, `error: None`).
+  - Esecuzione `voice_get_status()`: stato lettore e agenti operativi in modalità locale.
+  - Esecuzione `voice_load_document()` su PDF italiano di test: 3 pagine estratte, 18 frasi identificate.
+  - Esecuzione `voice_ask_document("Quali sono i tre agenti?")`: elaborazione multi-agente completata con Ollama `gemma4:12b`, risposta esatta generata con citazione verbatim a pagina 3 e riscontro certificato dal Verificatore (`citation_match_score: 1.0`, `is_valid: true`).
+
 ---
 
 ## 4. Riepilogo Indicatori di Qualità
@@ -105,4 +120,5 @@ I test sono stati eseguiti con `uv run --group dev pytest`.
 | Persistenza Stato e Sessioni | **CONFERMATO** | SQLite WAL, sessioni tracciate e verificabili dopo riavvio |
 | Installazione e Ricarica Plugin Utente | **CONFERMATO** | Plugin esterno `noemetra-echo-plugin` caricato dinamicamente a runtime |
 | Avvio Effettivo GUI Desktop | **CONFERMATO** | Electron v44 + WebApp bundle funzionante con brand NOEMETRA |
+| Integrazione Hermes Voice come Plugin Puro | **CONFERMATO** | 8 tool caricati ed eseguiti, citazioni verificate, core 100% agnostico |
 | Isolamento Progetti | **CONFERMATO** | Supportato nativamente tramite profili dedicati (`--profile`) |
