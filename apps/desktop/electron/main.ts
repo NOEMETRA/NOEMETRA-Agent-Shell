@@ -1111,7 +1111,8 @@ function maybeMigrateLegacyDesktopState(): void {
             fs.rmSync(stagingDir, { recursive: true, force: true })
           } catch {}
         } else {
-          console.error('[noemetra] interrupted-migration recovery did not complete; retaining backup, staging and in-progress marker for next launch')
+          console.error('[noemetra] interrupted-migration recovery did not complete; aborting migration to preserve snapshot for later retry')
+          return
         }
       } else if (fs.existsSync(stagingDir)) {
         try {
@@ -1139,6 +1140,12 @@ function maybeMigrateLegacyDesktopState(): void {
         )
 
       if (!hasMeaningfulState) {
+        // Record pending migration marker before attempting staging, backup, or copy
+        // to preserve migration eligibility if a transient error occurs during the attempt.
+        try {
+          fs.writeFileSync(pendingMarkerPath, '1\n', 'utf8')
+        } catch {}
+
         fs.mkdirSync(stagingDir, { recursive: true })
         // Step 1: Copy to staging directory first (transactional isolation)
         fs.cpSync(legacyDir, stagingDir, {
@@ -1169,8 +1176,8 @@ function maybeMigrateLegacyDesktopState(): void {
         try {
           // Step 3: Transfer staging into currentDir.
           // Restore legacy browser databases (Local Storage, Session Storage, IndexedDB) as cohesive atomic units.
-          // If destination database is empty/unpopulated, replace it with legacy.
-          // If destination already holds active user data, leave active database intact and record recoverable manifest.
+          // If destination database exists (e.g. from an intervening postponed session), preserve it under .intervening
+          // and record recovery metadata so intervening state is recoverable while legacy state becomes active.
           for (const entry of stagedEntries) {
             const stagedPath = path.join(stagingDir, entry)
             const destPath = path.join(currentDir, entry)
@@ -1178,12 +1185,10 @@ function maybeMigrateLegacyDesktopState(): void {
             const isDatabaseDir = DATABASE_DIR_NAMES.has(entry) || fs.existsSync(path.join(stagedPath, 'leveldb'))
 
             if (isDatabaseDir) {
-              if (fs.existsSync(destPath) && !isDatabaseVerifiablyEmpty(destPath)) {
-                // Active user data exists from intervening session: leave active database intact (merge, don't clobber).
-                // Store legacy database alongside under .legacy and record recoverable migration manifest.
-                const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
-                if (!fs.existsSync(legacyPreservedPath)) {
-                  fs.cpSync(stagedPath, legacyPreservedPath, { recursive: true })
+              if (fs.existsSync(destPath)) {
+                const interveningPreservedPath = path.join(currentDir, `${entry}.intervening`)
+                if (!fs.existsSync(interveningPreservedPath)) {
+                  fs.cpSync(destPath, interveningPreservedPath, { recursive: true })
                 }
                 const recoveryManifestPath = path.join(currentDir, 'legacy-migration-available.json')
                 try {
@@ -1192,9 +1197,9 @@ function maybeMigrateLegacyDesktopState(): void {
                     JSON.stringify(
                       {
                         migratedAt: new Date().toISOString(),
-                        retainedActive: entry,
-                        legacyLocation: `${entry}.legacy`,
-                        status: 'active-state-retained'
+                        database: entry,
+                        interveningBackup: `${entry}.intervening`,
+                        status: 'legacy-restored-intervening-preserved'
                       },
                       null,
                       2
@@ -1202,13 +1207,10 @@ function maybeMigrateLegacyDesktopState(): void {
                     'utf8'
                   )
                 } catch {}
-              } else {
-                // Destination is empty/unpopulated: safe to restore legacy database as active unit
-                if (fs.existsSync(destPath)) {
-                  fs.rmSync(destPath, { recursive: true, force: true })
-                }
-                fs.cpSync(stagedPath, destPath, { recursive: true })
+                fs.rmSync(destPath, { recursive: true, force: true })
               }
+              // Restore legacy database as active unit so settings, themes, and workspace state appear in the app
+              fs.cpSync(stagedPath, destPath, { recursive: true })
             } else if (entry === 'connections.json') {
               reconcileConnectionsRegistry(destPath, stagedPath)
             } else {
@@ -1740,6 +1742,34 @@ if (IS_WINDOWS || process.platform === 'linux') {
 
 ipcMain.handle('hermes:get-remote-display-reason', () => REMOTE_DISPLAY_REASON)
 ipcMain.handle('hermes:embed-host:origin', () => embedHostOrigin())
+
+// Authoritative desktop migration recovery handlers (recover intervening databases if needed)
+ipcMain.handle('hermes:migration:get-recovery-info', () => {
+  try {
+    const currentDir = app.getPath('userData')
+    const manifestPath = path.join(currentDir, 'legacy-migration-available.json')
+    if (fs.existsSync(manifestPath)) {
+      return JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    }
+  } catch {}
+  return null
+})
+
+ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, dbName: string) => {
+  try {
+    const currentDir = app.getPath('userData')
+    const interveningPath = path.join(currentDir, `${dbName}.intervening`)
+    const activePath = path.join(currentDir, dbName)
+    if (fs.existsSync(interveningPath)) {
+      fs.rmSync(activePath, { recursive: true, force: true })
+      fs.cpSync(interveningPath, activePath, { recursive: true })
+      return { ok: true }
+    }
+    return { ok: false, error: 'no intervening database snapshot found' }
+  } catch (err: any) {
+    return { ok: false, error: err?.message || String(err) }
+  }
+})
 
 // Keep the renderer's PROCESS priority normal while its windows are hidden —
 // a deprioritized renderer streams a live answer visibly slower once the
