@@ -808,6 +808,51 @@ function legacyDirectoryForVariant(): string | null {
   return null
 }
 
+function isLegacyAppRunning(legacyDir: string): boolean {
+  try {
+    const lockFile = path.join(legacyDir, 'SingletonLock')
+    if (fs.existsSync(lockFile)) {
+      if (process.platform !== 'win32') {
+        try {
+          const target = fs.readlinkSync(lockFile)
+          const match = target.match(/-(\d+)$/)
+          if (match) {
+            const pid = Number.parseInt(match[1], 10)
+            if (pid > 0) {
+              process.kill(pid, 0)
+              return true
+            }
+          }
+        } catch (err: any) {
+          if (err.code === 'EPERM') return true
+        }
+      } else {
+        try {
+          const fd = fs.openSync(lockFile, 'r+')
+          fs.closeSync(fd)
+        } catch (err: any) {
+          if (err.code === 'EBUSY' || err.code === 'EPERM') return true
+        }
+      }
+    }
+
+    const levelDbLock = path.join(legacyDir, 'Local Storage', 'leveldb', 'LOCK')
+    if (fs.existsSync(levelDbLock)) {
+      try {
+        const fd = fs.openSync(levelDbLock, 'r+')
+        fs.closeSync(fd)
+      } catch (err: any) {
+        if (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EAGAIN') {
+          return true
+        }
+      }
+    }
+  } catch {
+    // Non-blocking probe
+  }
+  return false
+}
+
 function maybeMigrateLegacyDesktopState(): void {
   if (
     USER_DATA_OVERRIDE ||
@@ -822,6 +867,13 @@ function maybeMigrateLegacyDesktopState(): void {
   try {
     const currentDir = app.getPath('userData')
     if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
+      // Coordinate with legacy app: require it to be closed before copying databases
+      // to ensure consistent, quiescent LevelDB and Local Storage snapshots.
+      if (isLegacyAppRunning(legacyDir)) {
+        console.warn('[noemetra] legacy Hermes application is currently running; postponing migration until it is closed')
+        return
+      }
+
       const markerPath = path.join(currentDir, MIGRATION_COMPLETE_MARKER)
       if (fs.existsSync(markerPath)) {
         return
