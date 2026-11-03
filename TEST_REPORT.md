@@ -73,14 +73,36 @@ I test sono stati eseguiti con `uv run --group dev pytest`.
   ```
 - **Esito**: Persistenza convalidata su disco, pronta per il comando `--resume`.
 
+### Prova 4: Compilazione ed Avvio Reale della GUI Desktop (Electron)
+- **Componenti Compilati**:
+  - WebApp bundle React (`npm run build:webapp`): 16.210 moduli trasformati con Vite in 70s in `apps/desktop/dist-webapp/` (3.2 MB bundle principale, rendering Markdown KaTeX e Shiki).
+  - Main process bundle Electron (`node scripts/bundle-electron-main.mjs --dev`): `dist/electron-main.mjs` (3.0 MB) e `dist/electron-preload.js` (45.5 KB).
+- **Identità Grafica e Integrazione**:
+  - `product-identity.cjs`: aggiornato con nome applicativo `NOEMETRA Agent Shell` e appId `org.noemetra.noemetra-agent-shell`.
+  - `apps/desktop/electron/main.ts`: titolazione finestre browser legata dinamicamente a `PRODUCT_IDENTITY.displayName` e AppUserModelID configurato per Windows toast notification.
+  - `apps/desktop/index.html`: `<title>NOEMETRA Agent Shell</title>`.
+- **Esecuzione Effettiva**:
+  - Avvio verificato con `npx electron .` in `apps/desktop/`: istanza GUI attiva, finestra visualizzata correttamente su Windows 11 senza errori di caricamento asar o assets mancanti.
+
+### Prova 5: Riorganizzazione Provider e Setup Wizard Offline-First
+- **Setup Wizard (`hermes setup`)**:
+  - Aggiunta modalità `_run_first_time_local_setup` come prima opzione (`[0]` - raccomandata): rileva automaticamente server Ollama attivo su `127.0.0.1:11434`, interroga `/api/tags`, elenca i modelli disponibili ed imposta `model.provider=ollama` con zero chiamate esterne.
+  - Nous Portal spostato in fondo alle opzioni come servizio cloud opzionale per chi ne ha esplicita necessità.
+- **Catalogo Canonico (`models_catalog_static.py`)**:
+  - Riorganizzato l'ordine dei provider canonici: aggregatori e provider aperti/standard (`openrouter`, `openai-codex`, `anthropic`, `openai-api`, `lmstudio`, `fireworks`, `gemini`) prioritari rispetto al portale proprietario Nous.
+- **Regression Suite Eseguita**:
+  - 75 test eseguiti tra provider profiles, transport parity, profile wiring, provider parity e guardrails: **75 PASSED / 0 FAILED** (18.43s).
+
 ---
 
 ## 4. Riepilogo Indicatori di Qualità
 
 | Requisito di Verifica | Esito | Dettaglio |
 |---|---|---|
-| Esecuzione CLI su Windows 11 | **CONFERMATO** | `hermes --version`, `hermes status` funzionanti su CPython 3.14.9 |
-| Inferenza Locale senza dipendenza Nous | **CONFERMATO** | Testata e completata con Ollama `gemma4:12b` |
+| Esecuzione CLI su Windows 11 | **CONFERMATO** | `hermes --version`, `hermes status` con banner personalizzato NOEMETRA |
+| Inferenza Locale senza dipendenza Nous | **CONFERMATO** | Testata e completata con Ollama `gemma4:12b` (100% offline) |
 | Orchestrazione Subagenti Reali | **CONFERMATO** | 71 test passati (`test_delegate.py`) |
-| Persistenza Stato e Sessioni | **CONFERMATO** | SQLite WAL, sessioni tracciate e verificabili |
+| Persistenza Stato e Sessioni | **CONFERMATO** | SQLite WAL, sessioni tracciate e verificabili dopo riavvio |
+| Installazione e Ricarica Plugin Utente | **CONFERMATO** | Plugin esterno `noemetra-echo-plugin` caricato dinamicamente a runtime |
+| Avvio Effettivo GUI Desktop | **CONFERMATO** | Electron v44 + WebApp bundle funzionante con brand NOEMETRA |
 | Isolamento Progetti | **CONFERMATO** | Supportato nativamente tramite profili dedicati (`--profile`) |

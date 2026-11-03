@@ -4,8 +4,8 @@
 
 [project]
 name = "hermes-agent"
-version = "0.0.0"
-description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
+version = "0.1.0"
+description = "NOEMETRA Agent Shell — Universal, modular, multi-model & multi-agent AI shell"
 readme = "README.md"
 # 3.14 is the newest python we know we have wheels for.
 # we *only* support 3.14, BUT we need to allow old hermes installs on <3.14
@@ -13,7 +13,7 @@ readme = "README.md"
 # Shortly after they do, we update to our latest python.
 # See tests/compat/README.md for the updater contract this keeps.
 requires-python = ">=3.11,<3.15"
-authors = [{ name = "Nous Research" }]
+authors = [{ name = "NOEMETRA" }, { name = "Nous Research" }]
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [

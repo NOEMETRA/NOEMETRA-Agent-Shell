@@ -372,9 +372,14 @@ class ProviderEntry(NamedTuple):
 
 
 CANONICAL_PROVIDERS: list[ProviderEntry] = [ProviderEntry(*row) for row in (
-    ("nous", "Nous Portal", "Nous Portal (Everything your agent needs, 300+ models with bundled tool use)"),
+    ("openrouter", "OpenRouter", "OpenRouter (Pay-per-use API aggregator — 300+ open & commercial models)"),
+    ("openai-codex", "ChatGPT or Codex Subscription", "ChatGPT or Codex Subscription (Sign in with your ChatGPT account, uses Codex models)"),
+    ("anthropic", "Anthropic", "Anthropic (Claude models via API key or Claude Code)"),
+    ("openai-api", "OpenAI API", "OpenAI API (api.openai.com, API key)"),
+    ("lmstudio", "LM Studio", "LM Studio (Local desktop app with built-in model server)"),
     ("fireworks", "Fireworks AI", "Fireworks AI (OpenAI-compatible direct model API)"),
-    ("openrouter", "OpenRouter", "OpenRouter (Pay-per-use API aggregator)"),
+    ("gemini", "Google AI Studio", "Google AI Studio (Native Gemini API)"),
+    ("nous", "Nous Portal", "Nous Portal (Optional Nous account, hosted models with bundled tool use)"),
     ("moa", "Mixture of Agents", "Mixture of Agents (named presets; aggregator acts after reference models)"),
     ("novita", "NovitaAI", "NovitaAI (Cloud: Model API, Agent Sandbox, GPU Cloud)"),
     ("lmstudio", "LM Studio", "LM Studio (Local desktop app with built-in model server)"),
