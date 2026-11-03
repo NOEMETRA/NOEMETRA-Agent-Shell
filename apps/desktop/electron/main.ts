@@ -768,9 +768,21 @@ if (!isPrimaryInstance) {
 // Scoped to the primary lock holder of supported desktop variants (standard, bundled, light).
 // Never runs for isolated environments (USER_DATA_OVERRIDE / HERMES_DATA_DIR_SUFFIX).
 function legacyDirectoryForVariant(): string | null {
-  if (PRODUCT_IDENTITY.light) return path.join(app.getPath('appData'), 'HermesLight')
-  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShellBundled') return path.join(app.getPath('appData'), 'HermesAgent')
-  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShell') return path.join(app.getPath('appData'), 'Hermes')
+  // Upstream stable installs across all variants (standard, bundled, light) retained
+  // package.json's productName 'Hermes', storing user data in the 'Hermes' directory.
+  // Check candidate variant-specific directory if it exists, falling back to canonical 'Hermes'.
+  const appData = app.getPath('appData')
+  if (PRODUCT_IDENTITY.light) {
+    const lightDir = path.join(appData, 'HermesLight')
+    return fs.existsSync(lightDir) ? lightDir : path.join(appData, 'Hermes')
+  }
+  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShellBundled') {
+    const bundledDir = path.join(appData, 'HermesAgent')
+    return fs.existsSync(bundledDir) ? bundledDir : path.join(appData, 'Hermes')
+  }
+  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShell') {
+    return path.join(appData, 'Hermes')
+  }
   return null
 }
 
