@@ -1198,24 +1198,32 @@ function applyPendingLegacyDatabaseRestore(): void {
     // STEP 0: Check for an interrupted swap transaction from a prior crash (per AGENTS.md:73-78)
     if (fs.existsSync(swapTxPath)) {
       console.warn('[noemetra] found interrupted swap transaction in .legacy-restore-tx.json; recovering')
+      let allRollbacksSucceeded = true
       try {
         const tx = JSON.parse(fs.readFileSync(swapTxPath, 'utf8'))
         if (tx && tx.phase === 'swapping' && Array.isArray(tx.databases)) {
-          // Transaction was interrupted mid-flight. Roll back any swapped databases to their pre-swap backup!
+          // Transaction was interrupted mid-flight. Roll back any database that started swapping or was swapped!
           for (const db of tx.databases) {
-            if (db.swapped && db.backupPath && fs.existsSync(db.backupPath)) {
-              console.log(`[noemetra] rolling back swapped database ${db.name} from backup`)
+            const wasTouched = db.state === 'in_progress' || db.state === 'swapped' || db.swapped === true
+            if (wasTouched && db.backupPath && fs.existsSync(db.backupPath)) {
+              console.log(`[noemetra] rolling back touched database ${db.name} from backup`)
               try {
                 if (fs.existsSync(db.activePath)) {
                   fs.rmSync(db.activePath, { recursive: true, force: true })
                 }
                 fs.cpSync(db.backupPath, db.activePath, { recursive: true })
+                // Only clean up backup after confirmed successful restore!
+                try {
+                  fs.rmSync(db.backupPath, { recursive: true, force: true })
+                } catch {}
+                db.state = 'pending'
+                db.swapped = false
               } catch (rollbackDbErr) {
                 console.error(`[noemetra] failed to roll back database ${db.name}:`, rollbackDbErr)
+                allRollbacksSucceeded = false
               }
-            }
-            // Clean up temporary backup directory
-            if (db.backupPath && fs.existsSync(db.backupPath)) {
+            } else if (!wasTouched && db.backupPath && fs.existsSync(db.backupPath)) {
+              // Untouched database: safe to clean up its backup
               try {
                 fs.rmSync(db.backupPath, { recursive: true, force: true })
               } catch {}
@@ -1224,14 +1232,19 @@ function applyPendingLegacyDatabaseRestore(): void {
         }
       } catch (txParseErr) {
         console.error('[noemetra] failed to parse swap transaction:', txParseErr)
-      } finally {
-        // Clean up tx file and pending restore request so we don't loop on crashes
+        allRollbacksSucceeded = false
+      }
+
+      // Preserve the backup and transaction marker until every rollback succeeds (per AGENTS.md:73-78)
+      if (allRollbacksSucceeded) {
         try {
           fs.rmSync(swapTxPath, { force: true })
         } catch {}
         try {
           fs.rmSync(pendingRestorePath, { force: true })
         } catch {}
+      } else {
+        console.error('[noemetra] not all rollbacks succeeded; retaining swapTxPath and backups for next launch retry')
       }
       return
     }
@@ -1275,6 +1288,7 @@ function applyPendingLegacyDatabaseRestore(): void {
       activePath: string
       backupPath: string
       interveningPath: string
+      state: 'pending' | 'in_progress' | 'swapped'
       swapped: boolean
     }> = []
 
@@ -1295,6 +1309,7 @@ function applyPendingLegacyDatabaseRestore(): void {
         activePath,
         backupPath,
         interveningPath,
+        state: 'pending',
         swapped: false
       })
     }
@@ -1337,12 +1352,31 @@ function applyPendingLegacyDatabaseRestore(): void {
     let allSucceeded = true
     for (const db of txDatabases) {
       try {
+        // Record intent to swap this database BEFORE removing active directory (per AGENTS.md:73-78)
+        db.state = 'in_progress'
+        fs.writeFileSync(
+          swapTxPath,
+          JSON.stringify(
+            {
+              id: txId,
+              action: request.action || 'restore-legacy',
+              phase: 'swapping',
+              databases: txDatabases
+            },
+            null,
+            2
+          ),
+          'utf8'
+        )
+
         if (fs.existsSync(db.activePath)) {
           fs.rmSync(db.activePath, { recursive: true, force: true })
         }
         fs.cpSync(db.sourcePath, db.activePath, { recursive: true })
+        db.state = 'swapped'
         db.swapped = true
-        // Record progress in transaction file
+
+        // Record completed swap in transaction file
         fs.writeFileSync(
           swapTxPath,
           JSON.stringify(
@@ -1365,25 +1399,45 @@ function applyPendingLegacyDatabaseRestore(): void {
     }
 
     if (!allSucceeded) {
-      // Roll back swapped databases to their backups taken before the transaction
+      // Roll back touched databases (in_progress or swapped) to their pre-swap backups
       console.warn('[noemetra] swap failed mid-flight; rolling back to pre-swap backups')
+      let allRollbacksSucceeded = true
       for (const db of txDatabases) {
-        if (db.swapped && fs.existsSync(db.backupPath)) {
+        const wasTouched = db.state === 'in_progress' || db.state === 'swapped'
+        if (wasTouched && fs.existsSync(db.backupPath)) {
           try {
             if (fs.existsSync(db.activePath)) {
               fs.rmSync(db.activePath, { recursive: true, force: true })
             }
             fs.cpSync(db.backupPath, db.activePath, { recursive: true })
-          } catch {}
-        }
-        if (fs.existsSync(db.backupPath)) {
+            db.state = 'pending'
+            db.swapped = false
+            // Only clean up backup after confirmed successful restore!
+            try {
+              fs.rmSync(db.backupPath, { recursive: true, force: true })
+            } catch {}
+          } catch (rbErr) {
+            console.error(`[noemetra] rollback failed for ${db.name}:`, rbErr)
+            allRollbacksSucceeded = false
+          }
+        } else if (!wasTouched && fs.existsSync(db.backupPath)) {
           try {
             fs.rmSync(db.backupPath, { recursive: true, force: true })
           } catch {}
         }
       }
-      fs.rmSync(swapTxPath, { force: true })
-      fs.rmSync(pendingRestorePath, { force: true })
+
+      // Retain transaction record and backups if rollback encountered errors
+      if (allRollbacksSucceeded) {
+        try {
+          fs.rmSync(swapTxPath, { force: true })
+        } catch {}
+        try {
+          fs.rmSync(pendingRestorePath, { force: true })
+        } catch {}
+      } else {
+        console.error('[noemetra] swap rollback had errors; retaining transaction record for recovery on next launch')
+      }
       return
     }
 
@@ -1623,34 +1677,39 @@ function maybeMigrateLegacyDesktopState(): void {
               // Per AGENTS.md (merge, don't clobber; newer intent takes precedence),
               // preserve active database intact in destPath so settings and workspace state are not lost.
               // Preserve legacy database to sidecar (.legacy) as an authoritative recovery affordance.
-              const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
-              const legacyStagePath = path.join(currentDir, `.${entry}.legacy-stage-${Date.now()}`)
-              try {
-                if (fs.existsSync(legacyStagePath)) {
-                  fs.rmSync(legacyStagePath, { recursive: true, force: true })
-                }
-                fs.cpSync(stagedPath, legacyStagePath, { recursive: true })
-                // Verify complete database content was copied before publishing sidecar
-                if (!hasDatabaseContent(legacyStagePath)) {
-                  throw new Error(`staged legacy sidecar for ${entry} failed content verification`)
-                }
-                if (fs.existsSync(legacyPreservedPath)) {
-                  fs.rmSync(legacyPreservedPath, { recursive: true, force: true })
-                }
-                fs.renameSync(legacyStagePath, legacyPreservedPath)
-              } catch (sidecarErr) {
+              const legacyHasContent = hasDatabaseContent(stagedPath)
+              if (legacyHasContent) {
+                const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
+                const legacyStagePath = path.join(currentDir, `.${entry}.legacy-stage-${Date.now()}`)
                 try {
-                  if (fs.existsSync(legacyStagePath)) fs.rmSync(legacyStagePath, { recursive: true, force: true })
-                  if (fs.existsSync(legacyPreservedPath)) fs.rmSync(legacyPreservedPath, { recursive: true, force: true })
-                } catch {}
-                throw sidecarErr
+                  if (fs.existsSync(legacyStagePath)) {
+                    fs.rmSync(legacyStagePath, { recursive: true, force: true })
+                  }
+                  fs.cpSync(stagedPath, legacyStagePath, { recursive: true })
+                  // Verify files were copied successfully into the staging sidecar
+                  if (!fs.existsSync(legacyStagePath) || fs.readdirSync(legacyStagePath).length === 0) {
+                    throw new Error(`staged legacy sidecar for ${entry} was not copied completely`)
+                  }
+                  if (fs.existsSync(legacyPreservedPath)) {
+                    fs.rmSync(legacyPreservedPath, { recursive: true, force: true })
+                  }
+                  fs.renameSync(legacyStagePath, legacyPreservedPath)
+                } catch (sidecarErr) {
+                  try {
+                    if (fs.existsSync(legacyStagePath)) fs.rmSync(legacyStagePath, { recursive: true, force: true })
+                    if (fs.existsSync(legacyPreservedPath)) fs.rmSync(legacyPreservedPath, { recursive: true, force: true })
+                  } catch {}
+                  throw sidecarErr
+                }
+                preservedDatabases.push({
+                  name: entry,
+                  legacyPreserved: `${entry}.legacy`,
+                  activeRetained: entry
+                })
+                console.log(`[noemetra] active user database preserved in ${entry}; legacy copy preserved in ${entry}.legacy`)
+              } else {
+                console.log(`[noemetra] legacy database ${entry} is empty; keeping active destination database intact without sidecar`)
               }
-              preservedDatabases.push({
-                name: entry,
-                legacyPreserved: `${entry}.legacy`,
-                activeRetained: entry
-              })
-              console.log(`[noemetra] active user database preserved in ${entry}; legacy copy preserved in ${entry}.legacy`)
             } else {
               // Destination database does not exist or only contains empty boot boilerplate.
               // Restore legacy database directly into destPath.
