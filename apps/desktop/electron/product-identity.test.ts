@@ -118,9 +118,9 @@ test('nonstable runtime pins userData before the app name can change', async ():
 })
 
 test.each([
-  [undefined, 'Hermes', 'hermes', 'latest', 'canary'],
-  ['bundled', 'Hermes Agent', 'hermes', 'latest', 'canary'],
-  ['light', 'Hermes Light', 'hermes-light', 'light', 'light-canary']
+  [undefined, 'NOEMETRA Agent Shell', 'hermes', 'latest', 'canary'],
+  ['bundled', 'NOEMETRA Agent Shell (Bundled)', 'hermes', 'latest', 'canary'],
+  ['light', 'NOEMETRA Light', 'hermes-light', 'light', 'light-canary']
 ] as const)(
   '%s separates stable, canary and independent commits',
   async (
@@ -290,9 +290,9 @@ test('nonstable builds cannot claim the official Store package', async (): Promi
 test('store carries the Partner Center MSIX identity and no other variant does', async (): Promise<void> => {
   const store: ProductIdentity = await identityForVariant('store')
   assert.deepEqual(store.storeMsix, {
-    identityName: 'NousResearchInc.HermesAgent',
-    publisher: 'CN=EE6D86E4-606F-4E38-B940-AD7248C9D519',
-    publisherDisplayName: 'Nous Research Inc.'
+    identityName: 'NOEMETRA.AgentShell',
+    publisher: 'CN=NOEMETRA',
+    publisherDisplayName: 'NOEMETRA'
   })
 
   for (const v of [undefined, 'bundled', 'light'] as const) {
