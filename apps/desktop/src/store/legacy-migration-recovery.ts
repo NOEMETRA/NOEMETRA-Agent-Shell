@@ -22,10 +22,7 @@ export async function checkLegacyMigrationRecovery(): Promise<void> {
       action: {
         label: 'Restore Legacy Data',
         onClick: async () => {
-          const res = await window.hermesDesktop?.migration?.restoreLegacyDatabase(info.database)
-          if (res?.ok) {
-            window.location.reload()
-          }
+          await window.hermesDesktop?.migration?.restoreLegacyDatabase?.('all')
         }
       },
       secondaryAction: {
