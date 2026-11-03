@@ -765,20 +765,27 @@ if (!isPrimaryInstance) {
 
 // Migrate legacy desktop state (connections, window bounds, active profile) from historical
 // Hermes installation if upgrading to NOEMETRA Agent Shell and new userData has no meaningful state.
-// Strictly scoped to the primary lock holder of the default stable installation (never for isolated
-// USER_DATA_OVERRIDE / HERMES_DATA_DIR_SUFFIX or non-default variants like light, bundled or canary).
+// Scoped to the primary lock holder of supported desktop variants (standard, bundled, light).
+// Never runs for isolated environments (USER_DATA_OVERRIDE / HERMES_DATA_DIR_SUFFIX).
+function legacyDirectoryForVariant(): string | null {
+  if (PRODUCT_IDENTITY.light) return path.join(app.getPath('appData'), 'HermesLight')
+  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShellBundled') return path.join(app.getPath('appData'), 'HermesAgent')
+  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraAgentShell') return path.join(app.getPath('appData'), 'Hermes')
+  return null
+}
+
 function maybeMigrateLegacyDesktopState(): void {
   if (
     USER_DATA_OVERRIDE ||
-    process.env.HERMES_DATA_DIR_SUFFIX ||
-    PRODUCT_IDENTITY.light ||
-    PRODUCT_IDENTITY.store ||
-    PRODUCT_IDENTITY.appNamePascal !== 'NoemetraAgentShell'
+    process.env.HERMES_DATA_DIR_SUFFIX
   ) {
     return
   }
+  const legacyDir = legacyDirectoryForVariant()
+  if (!legacyDir) {
+    return
+  }
   try {
-    const legacyDir = path.join(app.getPath('appData'), 'Hermes')
     const currentDir = app.getPath('userData')
     if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
       // Ignore runtime lock files and crash reporter dirs created before this check runs
