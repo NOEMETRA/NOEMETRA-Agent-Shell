@@ -730,6 +730,12 @@ if (USER_DATA_OVERRIDE || process.env.HERMES_DATA_DIR_SUFFIX) {
   const resolvedUserData: string = resolveDesktopUserData(app.getPath('userData'))
   fs.mkdirSync(resolvedUserData, { recursive: true })
   app.setPath('userData', resolvedUserData)
+} else if (!IDENTITY_APP_NAME) {
+  // Pin stable userData path before migration and before any app.setName call so
+  // Electron's internal logic never redirects the directory to historical defaults.
+  const stableUserData: string = app.getPath('userData')
+  fs.mkdirSync(stableUserData, { recursive: true })
+  app.setPath('userData', stableUserData)
 }
 
 // Only the lock owner may persist launch recovery markers, adopt a workspace or start a
@@ -772,7 +778,7 @@ function legacyDirectoryForVariant(): string | null {
   // package.json's productName 'Hermes', storing user data in the 'Hermes' directory.
   // Check candidate variant-specific directory if it exists, falling back to canonical 'Hermes'.
   const appData = app.getPath('appData')
-  if (PRODUCT_IDENTITY.light) {
+  if (PRODUCT_IDENTITY.appNamePascal === 'NoemetraLight') {
     const lightDir = path.join(appData, 'HermesLight')
     return fs.existsSync(lightDir) ? lightDir : path.join(appData, 'Hermes')
   }
@@ -1452,7 +1458,7 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 
-const APP_NAME: string = IDENTITY_APP_NAME || process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+const APP_NAME: string = IDENTITY_APP_NAME || process.env.HERMES_DESKTOP_APP_NAME || PRODUCT_IDENTITY.displayName
 const HUD_WINDOW_TITLE = `${APP_NAME} HUD`
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
