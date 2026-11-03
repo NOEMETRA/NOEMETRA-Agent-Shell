@@ -927,10 +927,24 @@ function hasDatabaseContent(dbDir: string): boolean {
         const stat = fs.statSync(filePath)
         if (stat.isDirectory()) continue
         const basename = path.basename(filePath)
+        // LevelDB table files with size > 0 contain compacted data
         if (basename.endsWith('.ldb') && stat.size > 0) {
           return true
         }
-        if (basename.endsWith('.log') && stat.size > 1024) {
+        // Write-ahead log files in LevelDB (e.g. 000003.log) contain live uncompacted records.
+        // Even a single user write operation creates records in a numbered log file.
+        // Any numbered log file with size > 0 contains active user state.
+        if (/^\d+\.log$/i.test(basename) && stat.size > 0) {
+          return true
+        }
+        // Standard LevelDB metadata files present on empty initial creation
+        const isStandardEmptyMetadata =
+          basename === 'CURRENT' ||
+          basename === 'LOCK' ||
+          basename === 'LOG' ||
+          basename === 'LOG.old' ||
+          basename.startsWith('MANIFEST-')
+        if (!isStandardEmptyMetadata && stat.size > 0) {
           return true
         }
       } catch {}
@@ -1043,12 +1057,12 @@ function rollbackMigrationDestination(currentDir: string, backupDir: string, sta
 }
 
 function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): void {
+  if (!fs.existsSync(legacyFile)) return
+  if (!fs.existsSync(currentFile)) {
+    fs.copyFileSync(legacyFile, currentFile)
+    return
+  }
   try {
-    if (!fs.existsSync(legacyFile)) return
-    if (!fs.existsSync(currentFile)) {
-      fs.copyFileSync(legacyFile, currentFile)
-      return
-    }
     const currentRegistry = JSON.parse(fs.readFileSync(currentFile, 'utf8'))
     const legacyRegistry = JSON.parse(fs.readFileSync(legacyFile, 'utf8'))
 
@@ -1075,8 +1089,17 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
         fs.writeFileSync(currentFile, JSON.stringify(currentRegistry, null, 2), 'utf8')
       }
     }
-  } catch {
-    // If reconciliation fails, keep active currentFile untouched
+  } catch (err) {
+    // Preserve legacy registry copy as a recovery affordance before propagating write/parse failure
+    const dir = path.dirname(currentFile)
+    const recoveryCopy = path.join(dir, 'connections.legacy.json')
+    try {
+      if (!fs.existsSync(recoveryCopy)) {
+        fs.copyFileSync(legacyFile, recoveryCopy)
+      }
+    } catch {}
+    console.error('[noemetra] failed to reconcile connections registry; rolling back transaction to retry:', err)
+    throw err
   }
 }
 
@@ -1867,6 +1890,21 @@ ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, d
       return { ok: true }
     }
     return { ok: false, error: 'no intervening database snapshot found' }
+  } catch (err: any) {
+    return { ok: false, error: err?.message || String(err) }
+  }
+})
+
+ipcMain.handle('hermes:migration:dismiss-recovery-info', () => {
+  try {
+    const currentDir = app.getPath('userData')
+    for (const manifestName of ['legacy-migration-recovery.json', 'legacy-migration-available.json']) {
+      const manifestPath = path.join(currentDir, manifestName)
+      if (fs.existsSync(manifestPath)) {
+        fs.rmSync(manifestPath, { force: true })
+      }
+    }
+    return { ok: true }
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) }
   }
