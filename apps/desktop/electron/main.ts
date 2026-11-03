@@ -1056,6 +1056,18 @@ function rollbackMigrationDestination(currentDir: string, backupDir: string, sta
   }
 }
 
+function areConnectionsEquivalent(a: any, b: any): boolean {
+  if (!a || !b) return false
+  return (
+    String(a.type || '') === String(b.type || '') &&
+    String(a.url || '') === String(b.url || '') &&
+    String(a.host || '') === String(b.host || '') &&
+    String(a.port || '') === String(b.port || '') &&
+    String(a.username || '') === String(b.username || '') &&
+    String(a.profile || '') === String(b.profile || '')
+  )
+}
+
 function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): void {
   if (!fs.existsSync(legacyFile)) return
   if (!fs.existsSync(currentFile)) {
@@ -1083,6 +1095,25 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           existingIds.add(conn.id)
           existingLabels.add(label.trim().toLowerCase())
           modified = true
+        } else {
+          // If an ID collides, compare target endpoint configuration to avoid dropping distinct legacy connections
+          const existing = currentRegistry.connections.find((c: any) => c.id === conn.id)
+          if (!areConnectionsEquivalent(existing, conn)) {
+            let newId = `${conn.id}-legacy`
+            let counter = 1
+            while (existingIds.has(newId)) {
+              counter++
+              newId = `${conn.id}-legacy-${counter}`
+            }
+            let label = conn.label || conn.id
+            if (existingLabels.has(label.trim().toLowerCase())) {
+              label = `${label} (Legacy)`
+            }
+            currentRegistry.connections.push({ ...conn, id: newId, label })
+            existingIds.add(newId)
+            existingLabels.add(label.trim().toLowerCase())
+            modified = true
+          }
         }
       }
       if (modified) {
@@ -1124,7 +1155,7 @@ function applyPendingLegacyDatabaseRestore(): void {
         : []
 
     let allSucceeded = true
-    const interveningBackups: Array<{ activePath: string; interveningPath: string }> = []
+    const interveningBackups: Array<{ activePath: string; tempBackupPath: string; interveningPath: string }> = []
 
     for (const item of dbsToRestore) {
       const activePath = path.join(currentDir, item.name)
@@ -1137,13 +1168,20 @@ function applyPendingLegacyDatabaseRestore(): void {
         break
       }
 
+      // Safe temporary swap backup to isolate active database before replacement
+      const tempBackupPath = path.join(currentDir, `.${item.name}.swap-backup-${Date.now()}`)
       try {
         if (fs.existsSync(activePath)) {
-          if (fs.existsSync(interveningPath)) {
-            fs.rmSync(interveningPath, { recursive: true, force: true })
+          fs.cpSync(activePath, tempBackupPath, { recursive: true })
+          interveningBackups.push({ activePath, tempBackupPath, interveningPath })
+
+          // Only update interveningPath if the restore source is NOT the intervening snapshot itself
+          if (path.resolve(legacyPath) !== path.resolve(interveningPath)) {
+            if (fs.existsSync(interveningPath)) {
+              fs.rmSync(interveningPath, { recursive: true, force: true })
+            }
+            fs.cpSync(tempBackupPath, interveningPath, { recursive: true })
           }
-          fs.cpSync(activePath, interveningPath, { recursive: true })
-          interveningBackups.push({ activePath, interveningPath })
           fs.rmSync(activePath, { recursive: true, force: true })
         }
         fs.cpSync(legacyPath, activePath, { recursive: true })
@@ -1156,6 +1194,13 @@ function applyPendingLegacyDatabaseRestore(): void {
 
     if (allSucceeded) {
       fs.rmSync(pendingRestorePath, { force: true })
+      for (const backup of interveningBackups) {
+        try {
+          if (fs.existsSync(backup.tempBackupPath)) {
+            fs.rmSync(backup.tempBackupPath, { recursive: true, force: true })
+          }
+        } catch {}
+      }
       for (const manifestName of ['legacy-migration-recovery.json', 'legacy-migration-available.json']) {
         const manifestPath = path.join(currentDir, manifestName)
         try {
@@ -1164,14 +1209,15 @@ function applyPendingLegacyDatabaseRestore(): void {
       }
       console.log('[noemetra] successfully restored legacy database(s) before Chromium startup')
     } else {
-      // Roll back any swapped databases from intervening backups
+      // Roll back any swapped databases from temporary backups
       for (const backup of interveningBackups) {
         try {
           if (fs.existsSync(backup.activePath)) {
             fs.rmSync(backup.activePath, { recursive: true, force: true })
           }
-          if (fs.existsSync(backup.interveningPath)) {
-            fs.cpSync(backup.interveningPath, backup.activePath, { recursive: true })
+          if (fs.existsSync(backup.tempBackupPath)) {
+            fs.cpSync(backup.tempBackupPath, backup.activePath, { recursive: true })
+            fs.rmSync(backup.tempBackupPath, { recursive: true, force: true })
           }
         } catch {}
       }
@@ -1408,7 +1454,10 @@ function maybeMigrateLegacyDesktopState(): void {
               ),
               'utf8'
             )
-          } catch {}
+          } catch (manifestErr) {
+            console.error('[noemetra] failed to write legacy migration recovery manifest; rolling back:', manifestErr)
+            throw manifestErr
+          }
         }
 
         // Step 4: Record completion marker once meaningful state is confirmed in destination
