@@ -917,31 +917,13 @@ const MIGRATION_PENDING_MARKER = '.legacy-migration-pending'
 const MIGRATION_BACKUP_DIR = '.migration-backup'
 const DATABASE_DIR_NAMES = new Set(['Local Storage', 'Session Storage', 'IndexedDB'])
 
-function isDatabaseEmptyOrDefault(dbDir: string): boolean {
+function isDatabaseVerifiablyEmpty(dbDir: string): boolean {
   try {
     if (!fs.existsSync(dbDir)) return true
-    const levelDbDir = path.join(dbDir, 'leveldb')
-    const targetDir = fs.existsSync(levelDbDir) ? levelDbDir : dbDir
-    if (!fs.existsSync(targetDir)) return true
-    const files = fs.readdirSync(targetDir)
-
-    // In an empty/default database directory created on initial startup, there are no table files
-    // (.ldb/.blob) and log files are minimal (< 4KB). Active user databases contain table files or substantial logs.
-    let totalTableSize = 0
-    let maxLogSize = 0
-
-    for (const file of files) {
-      const fullPath = path.join(targetDir, file)
-      const stat = fs.statSync(fullPath)
-      if (file.endsWith('.ldb') || file.endsWith('.blob')) {
-        totalTableSize += stat.size
-      } else if (file.endsWith('.log')) {
-        if (stat.size > maxLogSize) maxLogSize = stat.size
-      }
-    }
-    return totalTableSize === 0 && maxLogSize < 4096
+    const files = fs.readdirSync(dbDir)
+    return files.length === 0
   } catch {
-    return false // If probe fails, conservatively treat as having active data to avoid clobbering
+    return false
   }
 }
 
@@ -1087,36 +1069,51 @@ function maybeMigrateLegacyDesktopState(): void {
       }
 
       // If a previous migration was interrupted after changes started:
-      // Only remove destination entries and roll back if backup-complete was confirmed
+      // Only remove destination entries and roll back if backup-complete was confirmed.
+      // Retain backup, staging and inProgressPath unless every restore succeeds completely.
       if (fs.existsSync(inProgressPath)) {
+        let recoverySucceeded = false
         try {
           if (fs.existsSync(backupCompletePath)) {
             if (fs.existsSync(stagingDir)) {
               const staged = fs.readdirSync(stagingDir)
               for (const item of staged) {
-                fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
+                try {
+                  fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
+                } catch {}
               }
             }
             const backedUp = fs.readdirSync(backupDir)
+            let allRestored = true
             for (const entry of backedUp) {
               if (entry === '.backup-complete') continue
               try {
                 fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
-              } catch {}
+              } catch (restoreErr) {
+                console.error(`[noemetra] recovery failed to restore ${entry}:`, restoreErr)
+                allRestored = false
+              }
             }
+            recoverySucceeded = allRestored
           }
-        } catch {
-          // ignore cleanup error
+        } catch (err) {
+          console.error('[noemetra] recovery error:', err)
+          recoverySucceeded = false
         }
-        try {
-          fs.rmSync(backupDir, { recursive: true, force: true })
-        } catch {}
-        try {
-          fs.rmSync(inProgressPath, { force: true })
-        } catch {}
-      }
-
-      if (fs.existsSync(stagingDir)) {
+        if (recoverySucceeded) {
+          try {
+            fs.rmSync(backupDir, { recursive: true, force: true })
+          } catch {}
+          try {
+            fs.rmSync(inProgressPath, { force: true })
+          } catch {}
+          try {
+            fs.rmSync(stagingDir, { recursive: true, force: true })
+          } catch {}
+        } else {
+          console.error('[noemetra] interrupted-migration recovery did not complete; retaining backup, staging and in-progress marker for next launch')
+        }
+      } else if (fs.existsSync(stagingDir)) {
         try {
           fs.rmSync(stagingDir, { recursive: true, force: true })
         } catch {
@@ -1167,12 +1164,13 @@ function maybeMigrateLegacyDesktopState(): void {
 
         // Only mark migration in progress after confirmed complete backup
         fs.writeFileSync(inProgressPath, '1\n', 'utf8')
+        let rollbackFailed = false
 
         try {
           // Step 3: Transfer staging into currentDir.
           // Restore legacy browser databases (Local Storage, Session Storage, IndexedDB) as cohesive atomic units.
-          // If destination database is empty/default boilerplate from a postponed boot, replace it with legacy.
-          // If destination already holds active user data, preserve intervening state aside before restoring legacy.
+          // If destination database is empty/unpopulated, replace it with legacy.
+          // If destination already holds active user data, leave active database intact and record recoverable manifest.
           for (const entry of stagedEntries) {
             const stagedPath = path.join(stagingDir, entry)
             const destPath = path.join(currentDir, entry)
@@ -1180,7 +1178,7 @@ function maybeMigrateLegacyDesktopState(): void {
             const isDatabaseDir = DATABASE_DIR_NAMES.has(entry) || fs.existsSync(path.join(stagedPath, 'leveldb'))
 
             if (isDatabaseDir) {
-              if (fs.existsSync(destPath) && !isDatabaseEmptyOrDefault(destPath)) {
+              if (fs.existsSync(destPath) && !isDatabaseVerifiablyEmpty(destPath)) {
                 // Active user data exists from intervening session: leave active database intact (merge, don't clobber).
                 // Store legacy database alongside under .legacy and record recoverable migration manifest.
                 const legacyPreservedPath = path.join(currentDir, `${entry}.legacy`)
@@ -1205,7 +1203,7 @@ function maybeMigrateLegacyDesktopState(): void {
                   )
                 } catch {}
               } else {
-                // Destination is empty/default boilerplate: safe to restore legacy database as active unit
+                // Destination is empty/unpopulated: safe to restore legacy database as active unit
                 if (fs.existsSync(destPath)) {
                   fs.rmSync(destPath, { recursive: true, force: true })
                 }
@@ -1268,15 +1266,20 @@ function maybeMigrateLegacyDesktopState(): void {
               fs.rmSync(backupDir, { recursive: true, force: true })
             } catch {}
           } else {
-            console.error('[noemetra] rollback did not complete; retaining backup and in-progress marker for recovery')
+            rollbackFailed = true
+            console.error('[noemetra] rollback did not complete; retaining backup, staging and in-progress marker for recovery')
           }
           throw copyErr
         } finally {
-          // Step 5: Clean up staging
-          try {
-            fs.rmSync(stagingDir, { recursive: true, force: true })
-          } catch {
-            // best-effort cleanup
+          // Step 5: Clean up staging only when rollback did not fail.
+          // If rollback failed, keep stagingDir intact so interrupted-migration recovery can identify
+          // and clean up partially copied destination entries.
+          if (!rollbackFailed) {
+            try {
+              fs.rmSync(stagingDir, { recursive: true, force: true })
+            } catch {
+              // best-effort cleanup
+            }
           }
         }
       }
