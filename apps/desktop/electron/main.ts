@@ -878,6 +878,50 @@ function isLegacyAppRunning(legacyDir: string): boolean {
 }
 
 const MIGRATION_PENDING_MARKER = '.legacy-migration-pending'
+const MIGRATION_BACKUP_DIR = '.migration-backup'
+const DATABASE_DIR_NAMES = new Set(['Local Storage', 'Session Storage', 'IndexedDB'])
+
+function backupPreMigrationDestination(currentDir: string, backupDir: string): void {
+  fs.mkdirSync(backupDir, { recursive: true })
+  if (!fs.existsSync(currentDir)) return
+  const entries = fs.readdirSync(currentDir)
+  for (const entry of entries) {
+    if (
+      entry.startsWith('Singleton') ||
+      entry === 'Crashpad' ||
+      entry === '.migration-stage' ||
+      entry === MIGRATION_BACKUP_DIR ||
+      entry === MIGRATION_IN_PROGRESS_MARKER ||
+      entry === MIGRATION_PENDING_MARKER ||
+      entry === MIGRATION_COMPLETE_MARKER
+    ) {
+      continue
+    }
+    const src = path.join(currentDir, entry)
+    const dst = path.join(backupDir, entry)
+    try {
+      fs.cpSync(src, dst, { recursive: true })
+    } catch {}
+  }
+}
+
+function rollbackMigrationDestination(currentDir: string, backupDir: string, stagedEntries: string[]): void {
+  // First remove any entries copied into currentDir
+  for (const entry of stagedEntries) {
+    try {
+      fs.rmSync(path.join(currentDir, entry), { recursive: true, force: true })
+    } catch {}
+  }
+  // Restore original pre-migration destination state from backupDir so no existing user data is deleted
+  if (fs.existsSync(backupDir)) {
+    const backedUp = fs.readdirSync(backupDir)
+    for (const entry of backedUp) {
+      try {
+        fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
+      } catch {}
+    }
+  }
+}
 
 function maybeMigrateLegacyDesktopState(): void {
   if (
@@ -901,6 +945,7 @@ function maybeMigrateLegacyDesktopState(): void {
       const inProgressPath = path.join(currentDir, MIGRATION_IN_PROGRESS_MARKER)
       const pendingMarkerPath = path.join(currentDir, MIGRATION_PENDING_MARKER)
       const stagingDir = path.join(currentDir, '.migration-stage')
+      const backupDir = path.join(currentDir, MIGRATION_BACKUP_DIR)
 
       // Coordinate with legacy app: require it to be closed before copying databases
       // to ensure consistent, quiescent LevelDB and Local Storage snapshots.
@@ -914,10 +959,18 @@ function maybeMigrateLegacyDesktopState(): void {
         return
       }
 
-      // If a previous migration was interrupted before completion, clean up partial state
+      // If a previous migration was interrupted before completion, restore pre-migration state
       if (fs.existsSync(inProgressPath)) {
         try {
-          if (fs.existsSync(stagingDir)) {
+          if (fs.existsSync(backupDir)) {
+            const backedUp = fs.readdirSync(backupDir)
+            for (const entry of backedUp) {
+              try {
+                fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
+              } catch {}
+            }
+            fs.rmSync(backupDir, { recursive: true, force: true })
+          } else if (fs.existsSync(stagingDir)) {
             const staged = fs.readdirSync(stagingDir)
             for (const item of staged) {
               fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
@@ -950,6 +1003,7 @@ function maybeMigrateLegacyDesktopState(): void {
             !name.startsWith('Singleton') &&
             name !== 'Crashpad' &&
             name !== '.migration-stage' &&
+            name !== MIGRATION_BACKUP_DIR &&
             name !== MIGRATION_IN_PROGRESS_MARKER &&
             name !== MIGRATION_PENDING_MARKER &&
             name !== MIGRATION_COMPLETE_MARKER
@@ -969,16 +1023,50 @@ function maybeMigrateLegacyDesktopState(): void {
         })
 
         const stagedEntries = fs.readdirSync(stagingDir)
-        // Step 2: Mark migration in progress before destination merge
+        // Step 2: Mark migration in progress and snapshot destination before applying changes
         fs.writeFileSync(inProgressPath, '1\n', 'utf8')
+        backupPreMigrationDestination(currentDir, backupDir)
 
         try {
-          // Step 3: Merge staging into currentDir (stagingDir is already filtered)
-          fs.cpSync(stagingDir, currentDir, {
-            recursive: true,
-            errorOnExist: false,
-            force: false
-          })
+          // Step 3: Transfer staging into currentDir.
+          // Database directories (LevelDB / IndexedDB) must be migrated as consistent atomic units;
+          // merging file-by-file retains colliding default files and risks LevelDB corruption.
+          for (const entry of stagedEntries) {
+            const stagedPath = path.join(stagingDir, entry)
+            const destPath = path.join(currentDir, entry)
+
+            const isDatabaseDir = DATABASE_DIR_NAMES.has(entry) || fs.existsSync(path.join(stagedPath, 'leveldb'))
+
+            if (isDatabaseDir) {
+              if (fs.existsSync(destPath)) {
+                // If destination already has a database directory (e.g. from an intervening postponed session),
+                // preserve it aside to guarantee intervening user state is never discarded.
+                const preservedPath = path.join(currentDir, `${entry}.postponed-backup`)
+                if (!fs.existsSync(preservedPath)) {
+                  try {
+                    fs.cpSync(destPath, preservedPath, { recursive: true })
+                  } catch {}
+                }
+                fs.rmSync(destPath, { recursive: true, force: true })
+              }
+              fs.cpSync(stagedPath, destPath, { recursive: true })
+            } else {
+              const stat = fs.statSync(stagedPath)
+              if (stat.isDirectory()) {
+                // Non-database directories: merge files without overwriting intervening user changes
+                fs.cpSync(stagedPath, destPath, {
+                  recursive: true,
+                  errorOnExist: false,
+                  force: false
+                })
+              } else {
+                // Individual files: if already existing in destination, preserve intervening user state
+                if (!fs.existsSync(destPath)) {
+                  fs.copyFileSync(stagedPath, destPath)
+                }
+              }
+            }
+          }
 
           // Step 4: Record completion marker once meaningful state is confirmed in destination
           const copiedSomething =
@@ -988,6 +1076,7 @@ function maybeMigrateLegacyDesktopState(): void {
                 !name.startsWith('Singleton') &&
                 name !== 'Crashpad' &&
                 name !== '.migration-stage' &&
+                name !== MIGRATION_BACKUP_DIR &&
                 name !== MIGRATION_IN_PROGRESS_MARKER &&
                 name !== MIGRATION_PENDING_MARKER &&
                 name !== MIGRATION_COMPLETE_MARKER
@@ -1001,15 +1090,18 @@ function maybeMigrateLegacyDesktopState(): void {
           try {
             fs.rmSync(inProgressPath, { force: true })
           } catch {}
+          try {
+            fs.rmSync(backupDir, { recursive: true, force: true })
+          } catch {}
         } catch (copyErr) {
-          // Roll back partial destination copy on failure (per AGENTS.md authoritative write failure policy)
-          for (const entry of stagedEntries) {
-            try {
-              fs.rmSync(path.join(currentDir, entry), { recursive: true, force: true })
-            } catch {}
-          }
+          // Roll back destination copy on failure (per AGENTS.md authoritative write failure policy):
+          // Restore pre-migration destination state from backupDir so no existing user state is lost.
+          rollbackMigrationDestination(currentDir, backupDir, stagedEntries)
           try {
             fs.rmSync(inProgressPath, { force: true })
+          } catch {}
+          try {
+            fs.rmSync(backupDir, { recursive: true, force: true })
           } catch {}
           throw copyErr
         } finally {
