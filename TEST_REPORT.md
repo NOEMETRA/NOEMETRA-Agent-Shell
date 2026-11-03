@@ -153,3 +153,6 @@ A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono
 8. **Distinzione Server Ollama Vuoto vs Non Raggiungibile (`hermes_cli/setup_quick.py`)**:
    - *Problema*: Se Ollama era attivo ma senza alcun modello scaricato (`/api/tags` restituisce `[]`), il wizard lo trattava come offline/non rilevato e proponeva un modello predefinito senza avvisare della necessità del download.
    - *Risoluzione*: Distinto esplicitamente il caso di server raggiungibile ma privo di modelli (`models is not None and len(models) == 0`), fornendo chiare istruzioni CLI (`ollama pull <modello>`) prima dell'inizio della sessione.
+9. **Inizializzazione Mappatura Modello in Setup Locale (`hermes_cli/setup_quick.py`)**:
+   - *Problema*: In configurazioni pulite `model` può essere presente come stringa vuota (`""`). `setdefault("model", {})` non rimpiazzava la stringa, generando `TypeError: 'str' object does not support item assignment`.
+   - *Risoluzione*: Sostituito con check esplicito `if not isinstance(config.get("model"), dict): config["model"] = {}`, permettendo il salvataggio immediato e senza errori di `provider`, `base_url` e `default`.

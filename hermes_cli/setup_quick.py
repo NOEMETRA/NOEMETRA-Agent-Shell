@@ -214,7 +214,8 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
     norm_url = local_url.strip().rstrip("/")
     base_v1 = norm_url if norm_url.endswith("/v1") else f"{norm_url}/v1"
 
-    config.setdefault("model", {})
+    if not isinstance(config.get("model"), dict):
+        config["model"] = {}
     config["model"]["provider"] = "ollama"
     config["model"]["base_url"] = base_v1
     config["model"]["default"] = selected_model
