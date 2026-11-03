@@ -777,6 +777,18 @@ declare global {
       // renderer can still open the FindBar when the OS compositor has
       // already grabbed the chord (#81727, e.g. Pop!_OS / GNOME).
       onOpenFindBarRequested?: (callback: () => void) => () => void
+      migration?: {
+        getRecoveryInfo: () => Promise<null | {
+          migratedAt: string
+          database: string
+          legacyPreserved: string
+          activeRetained: string
+          status: string
+        }>
+        restoreLegacyDatabase: (dbName: string) => Promise<{ ok: boolean; error?: string }>
+        restoreInterveningDatabase: (dbName: string) => Promise<{ ok: boolean; error?: string }>
+        dismissRecoveryInfo: () => Promise<{ ok: boolean; error?: string }>
+      }
     }
   }
 }

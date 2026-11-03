@@ -747,5 +747,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:open-find-bar', listener)
 
     return () => ipcRenderer.removeListener('hermes:open-find-bar', listener)
+  },
+  migration: {
+    getRecoveryInfo: () => ipcRenderer.invoke('hermes:migration:get-recovery-info'),
+    restoreLegacyDatabase: (dbName: string) => ipcRenderer.invoke('hermes:migration:restore-legacy-database', dbName),
+    restoreInterveningDatabase: (dbName: string) => ipcRenderer.invoke('hermes:migration:restore-intervening-database', dbName),
+    dismissRecoveryInfo: () => ipcRenderer.invoke('hermes:migration:dismiss-recovery-info')
   }
 })
