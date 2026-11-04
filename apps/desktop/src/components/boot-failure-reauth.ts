@@ -167,15 +167,19 @@ export function signInLabel(reauth: RemoteReauth | null, copy: SignInCopy = DEFA
 }
 
 function normalizeGatewayUrl(raw: unknown): string {
+  const s = String(raw || '').trim()
+  if (!s) return ''
   try {
-    const s = String(raw || '').trim()
-    if (!s) return ''
-    const parsed = new URL(s)
+    const urlString = /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`
+    const parsed = new URL(urlString)
     parsed.username = ''
     parsed.password = ''
-    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, '').toLowerCase()
+    parsed.search = ''
+    parsed.hash = ''
+    const cleanPath = parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/+$/, '')
+    return `${parsed.protocol}//${parsed.host}${cleanPath}`
   } catch {
-    return String(raw || '').trim().replace(/\/+$/, '').toLowerCase()
+    return s.replace(/\/+$/, '')
   }
 }
 

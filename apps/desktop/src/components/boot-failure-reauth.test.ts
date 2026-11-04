@@ -213,6 +213,23 @@ describe('resolveReauthConnectionId', () => {
     expect(resolveReauthConnectionId('https://shared.example.com', '', ambiguousRegistry)).toBeUndefined()
   })
 
+  it('preserves path case and does not confuse case-distinct endpoints on the same host', () => {
+    const caseSensitiveRegistry = {
+      primary: 'conn-team-upper',
+      connections: [
+        { id: 'conn-team-upper', url: 'https://example.com/Team' },
+        { id: 'conn-team-lower', url: 'https://example.com/team' }
+      ]
+    }
+    // Resolving for /Team should return conn-team-upper
+    expect(resolveReauthConnectionId('https://example.com/Team', '', caseSensitiveRegistry)).toBe('conn-team-upper')
+    // Resolving for /team should return conn-team-lower, NEVER primary (conn-team-upper)
+    expect(resolveReauthConnectionId('https://example.com/team', '', caseSensitiveRegistry)).toBe('conn-team-lower')
+    // Host case difference should still match (hosts are case-insensitive)
+    expect(resolveReauthConnectionId('https://EXAMPLE.COM/team', '', caseSensitiveRegistry)).toBe('conn-team-lower')
+    expect(resolveReauthConnectionId('https://EXAMPLE.COM/Team', '', caseSensitiveRegistry)).toBe('conn-team-upper')
+  })
+
   it('returns undefined for empty or invalid inputs', () => {
     expect(resolveReauthConnectionId('', '', registry)).toBeUndefined()
     expect(resolveReauthConnectionId(null, null, null)).toBeUndefined()
