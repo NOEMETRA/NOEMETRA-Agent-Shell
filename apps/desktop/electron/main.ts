@@ -2097,11 +2097,8 @@ function maybeMigrateLegacyDesktopState(): void {
                     fs.cpSync(stagedPart, partSidecar, { recursive: true })
                     console.log(`[noemetra] active partition preserved in Partitions/${partName}; legacy copy in Partitions/${partName}.legacy`)
                   }
-                  preservedDatabases.push({
-                    name: path.join('Partitions', partName),
-                    legacyPreserved: path.join('Partitions', `${partName}.legacy`),
-                    activeRetained: path.join('Partitions', partName)
-                  })
+                  // Exclude conflicting OAuth partitions from bulk database restore (AGENTS.md:47-48):
+                  // credentials must remain aligned with connection identity in connections.json.
                 } else if (!hasDatabaseContent(destPart) && hasDatabaseContent(stagedPart)) {
                   fs.rmSync(destPart, { recursive: true, force: true })
                   fs.cpSync(stagedPart, destPart, { recursive: true })
@@ -2686,24 +2683,42 @@ ipcMain.handle('hermes:migration:restore-legacy-database', async (_event, dbName
   try {
     const currentDir = app.getPath('userData')
     const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
-    let databasesToRestore: Array<{ name: string; legacyPreserved: string }> = []
+    const sanitizedDbName = typeof dbName === 'string' ? dbName.trim() : 'all'
+
+    // Restrict restore requests to manifest database names or fixed standard allowlist (AGENTS.md:what-this-app-is)
+    const allowedNames = new Set<string>(DATABASE_DIR_NAMES)
+    let manifestDatabases: Array<{ name: string; legacyPreserved: string }> = []
 
     if (fs.existsSync(manifestPath)) {
       try {
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
         if (Array.isArray(manifest.databases)) {
-          if (dbName && dbName !== 'all') {
-            const match = manifest.databases.find((d: any) => d.name === dbName)
-            if (match) databasesToRestore.push(match)
-          } else {
-            databasesToRestore = manifest.databases
+          for (const d of manifest.databases) {
+            if (d && typeof d.name === 'string') {
+              allowedNames.add(d.name)
+              manifestDatabases.push(d)
+            }
           }
         }
       } catch {}
     }
 
-    if (databasesToRestore.length === 0 && dbName && dbName !== 'all') {
-      databasesToRestore.push({ name: dbName, legacyPreserved: `${dbName}.legacy` })
+    if (sanitizedDbName !== 'all' && !allowedNames.has(sanitizedDbName)) {
+      return { ok: false, error: 'invalid database name' }
+    }
+
+    let databasesToRestore: Array<{ name: string; legacyPreserved: string }> = []
+    if (manifestDatabases.length > 0) {
+      if (sanitizedDbName !== 'all') {
+        const match = manifestDatabases.find((d: any) => d.name === sanitizedDbName)
+        if (match) databasesToRestore.push(match)
+      } else {
+        databasesToRestore = manifestDatabases
+      }
+    }
+
+    if (databasesToRestore.length === 0 && sanitizedDbName !== 'all' && allowedNames.has(sanitizedDbName)) {
+      databasesToRestore.push({ name: sanitizedDbName, legacyPreserved: `${sanitizedDbName}.legacy` })
     }
 
     if (databasesToRestore.length === 0) {
@@ -2711,7 +2726,7 @@ ipcMain.handle('hermes:migration:restore-legacy-database', async (_event, dbName
       for (const dName of DATABASE_DIR_NAMES) {
         const legacyName = `${dName}.legacy`
         if (fs.existsSync(path.join(currentDir, legacyName))) {
-          if (!dbName || dbName === 'all' || dbName === dName) {
+          if (sanitizedDbName === 'all' || sanitizedDbName === dName) {
             databasesToRestore.push({ name: dName, legacyPreserved: legacyName })
           }
         }
@@ -2738,10 +2753,10 @@ ipcMain.handle('hermes:migration:restore-legacy-database', async (_event, dbName
       'utf8'
     )
 
-    // Safely relaunch the application so the swap is performed before Chromium opens the database
+    // Safely relaunch the application with existing args (preserving the Chromium sandbox!)
     setImmediate(() => {
       try {
-        relaunchApp(relauncher, { args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
+        relaunchApp(relauncher, { args: process.argv.slice(1) })
         void exitAfterBackendShutdown(0)
       } catch (relaunchErr) {
         console.error('[noemetra] relaunch failed during legacy database restore:', relaunchErr)
@@ -2758,22 +2773,41 @@ ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, d
   try {
     const currentDir = app.getPath('userData')
     const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
-    let databasesToRestore: Array<{ name: string; legacyPreserved: string }> = []
+    const sanitizedDbName = typeof dbName === 'string' ? dbName.trim() : 'all'
+
+    // Restrict restore requests to manifest database names or fixed standard allowlist (AGENTS.md:what-this-app-is)
+    const allowedNames = new Set<string>(DATABASE_DIR_NAMES)
+    let manifestDatabases: Array<{ name: string; interveningPreserved?: string; legacyPreserved?: string }> = []
 
     if (fs.existsSync(manifestPath)) {
       try {
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
         if (Array.isArray(manifest.databases)) {
           for (const d of manifest.databases) {
-            const interveningName = d.interveningPreserved || `${d.name}.intervening`
-            if (fs.existsSync(path.join(currentDir, interveningName))) {
-              if (!dbName || dbName === 'all' || dbName === d.name) {
-                databasesToRestore.push({ name: d.name, legacyPreserved: interveningName })
-              }
+            if (d && typeof d.name === 'string') {
+              allowedNames.add(d.name)
+              manifestDatabases.push(d)
             }
           }
         }
       } catch {}
+    }
+
+    if (sanitizedDbName !== 'all' && !allowedNames.has(sanitizedDbName)) {
+      return { ok: false, error: 'invalid database name' }
+    }
+
+    let databasesToRestore: Array<{ name: string; legacyPreserved: string }> = []
+
+    if (manifestDatabases.length > 0) {
+      for (const d of manifestDatabases) {
+        const interveningName = d.interveningPreserved || `${d.name}.intervening`
+        if (fs.existsSync(path.join(currentDir, interveningName))) {
+          if (sanitizedDbName === 'all' || sanitizedDbName === d.name) {
+            databasesToRestore.push({ name: d.name, legacyPreserved: interveningName })
+          }
+        }
+      }
     }
 
     if (databasesToRestore.length === 0) {
@@ -2781,7 +2815,7 @@ ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, d
       for (const dName of DATABASE_DIR_NAMES) {
         const interveningName = `${dName}.intervening`
         if (fs.existsSync(path.join(currentDir, interveningName))) {
-          if (!dbName || dbName === 'all' || dbName === dName) {
+          if (sanitizedDbName === 'all' || sanitizedDbName === dName) {
             databasesToRestore.push({ name: dName, legacyPreserved: interveningName })
           }
         }
@@ -2808,7 +2842,7 @@ ipcMain.handle('hermes:migration:restore-intervening-database', async (_event, d
     )
     setImmediate(() => {
       try {
-        relaunchApp(relauncher, { args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
+        relaunchApp(relauncher, { args: process.argv.slice(1) })
         void exitAfterBackendShutdown(0)
       } catch (relaunchErr) {
         console.error('[noemetra] relaunch failed during intervening database restore:', relaunchErr)
