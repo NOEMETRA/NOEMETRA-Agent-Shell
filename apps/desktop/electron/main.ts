@@ -845,38 +845,12 @@ function isLegacyAppRunning(legacyDir: string): boolean {
         // ENOENT / EINVAL / unreadable
       }
     } else if (process.platform === 'win32') {
-      // Windows: check for running legacy Hermes executables (including all canary and variant builds)
-      try {
-        const out = execFileSync('tasklist.exe', ['/NH', '/FO', 'CSV'], {
-          encoding: 'utf8',
-          timeout: 3000,
-          windowsHide: true
-        })
-        const isHermesRunning = out.split('\n').some((line) => {
-          const lower = line.toLowerCase().trim()
-          return (
-            lower.startsWith('"hermes') ||
-            lower.includes('hermes.exe') ||
-            lower.includes('hermes agent.exe') ||
-            lower.includes('hermes light.exe') ||
-            lower.includes('hermes canary.exe') ||
-            lower.includes('hermescanary.exe') ||
-            lower.includes('hermes agent canary.exe') ||
-            lower.includes('hermesagentcanary.exe') ||
-            lower.includes('hermes light canary.exe') ||
-            lower.includes('hermeslightcanary.exe') ||
-            lower.includes('hermes bundled canary.exe') ||
-            lower.includes('hermesbundledcanary.exe')
-          )
-        })
-        if (isHermesRunning) return true
-      } catch {
-        // fallback to file handles
-      }
-
-      // Windows: Electron / Chromium holds exclusive lock on SingletonLock or database files while running
+      // Windows ladder rung 1: direct probe on candidate lock files within legacyDir.
+      // Electron / Chromium holds exclusive handles on SingletonLock, Cookies, and LevelDB LOCK while running.
+      // CLI and gateway background processes never touch legacyDir, so this probe isolates desktop instances.
       const candidateLockFiles = [
         lockFile,
+        path.join(legacyDir, 'Local Storage', 'leveldb', 'LOCK'),
         path.join(legacyDir, 'Cookies'),
         path.join(legacyDir, 'state.db'),
         path.join(legacyDir, 'SingletonCookie'),
@@ -891,6 +865,53 @@ function isLegacyAppRunning(legacyDir: string): boolean {
         } catch (err: any) {
           if (err.code === 'EBUSY' || err.code === 'EPERM') return true
         }
+      }
+
+      // Windows ladder rung 2: inspect running processes specifically associated with legacyDir.
+      // Distinguish the desktop process from unrelated CLI / gateway background services (e.g. `hermes.exe gateway`).
+      // An instance is identified as the legacy desktop if:
+      // (a) its command line explicitly points to legacyDir (e.g. --user-data-dir), OR
+      // (b) its executable is located in a desktop application directory (e.g. Programs\Hermes) or has
+      //     Electron runtime flags (--type=renderer, app.asar) and is NOT an unrelated CLI/gateway command.
+      try {
+        const normLegacyDir = path.resolve(legacyDir).toLowerCase()
+        const psScript = `
+$ErrorActionPreference = 'SilentlyContinue'
+$legacy = [regex]::Escape('${normLegacyDir.replace(/'/g, "''").replace(/\\/g, '\\\\')}')
+Get-CimInstance Win32_Process | ForEach-Object {
+  if ($_.ProcessId -eq $PID) { return }
+  $name = if ($_.Name) { $_.Name.ToLower() } else { '' }
+  if ($name -eq 'powershell.exe' -or $name -eq 'pwsh.exe' -or $name -eq 'cmd.exe' -or $name -eq 'node.exe') { return }
+
+  $cmd = if ($_.CommandLine) { $_.CommandLine.ToLower() } else { '' }
+  $exe = if ($_.ExecutablePath) { $_.ExecutablePath.ToLower() } else { '' }
+
+  if ($cmd -match $legacy) {
+    Write-Output "1"
+    exit 0
+  }
+  if ($name -like 'hermes*' -or $name -like '*hermes*') {
+    $isCliOrGateway = ($cmd -match '\\b(gateway|setup|status|profile|models|chat)\\b') -or
+                      ($exe -match '(\\\\python|\\\\scripts|\\\\\\.venv|\\\\\\.local\\\\bin)')
+    $isDesktopExe = ($exe -match '\\\\programs\\\\hermes') -or
+                    ($cmd -match '(--type=|app\\.asar|electron\\.asar)')
+    if ($isDesktopExe -and -not $isCliOrGateway) {
+      Write-Output "1"
+      exit 0
+    }
+  }
+}
+`.trim()
+
+        const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psScript], {
+          encoding: 'utf8',
+          timeout: 4000,
+          windowsHide: true
+        }).trim()
+
+        if (out.includes('1')) return true
+      } catch {
+        // non-blocking fallback
       }
     } else {
       // macOS / BSD: ProcessSingleton symlink <hostname>-<pid>
@@ -910,19 +931,6 @@ function isLegacyAppRunning(legacyDir: string): boolean {
         }
       } catch {
         // ENOENT / EINVAL / unreadable
-      }
-    }
-
-    // Windows / POSIX additional LevelDB lock probe
-    const levelDbLock = path.join(legacyDir, 'Local Storage', 'leveldb', 'LOCK')
-    if (fs.existsSync(levelDbLock) && process.platform === 'win32') {
-      try {
-        const fd = fs.openSync(levelDbLock, 'r+')
-        fs.closeSync(fd)
-      } catch (err: any) {
-        if (err.code === 'EBUSY' || err.code === 'EPERM') {
-          return true
-        }
       }
     }
   } catch {
