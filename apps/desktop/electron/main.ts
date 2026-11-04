@@ -1120,7 +1120,60 @@ function areConnectionsEquivalent(a: any, b: any): boolean {
   const nameA = String(a.name || '')
   const nameB = String(b.name || '')
 
-  return urlA === urlB && authModeA === authModeB && orgA === orgB && nameA === nameB
+  // Compare authentication credentials: token and gateway headers.
+  // Distinct tokens or gateway headers represent different accounts or access scopes and must not be deduplicated away.
+  const tokenA = JSON.stringify(a.token ?? null)
+  const tokenB = JSON.stringify(b.token ?? null)
+  const headersA = JSON.stringify(a.headers ?? null)
+  const headersB = JSON.stringify(b.headers ?? null)
+
+  return (
+    urlA === urlB &&
+    authModeA === authModeB &&
+    orgA === orgB &&
+    nameA === nameB &&
+    tokenA === tokenB &&
+    headersA === headersB
+  )
+}
+
+function sanitizePartitionComponent(id: string): string {
+  return encodeURIComponent(id).replace(/%/g, '_')
+}
+
+function migrateConnectionOauthPartition(
+  legacyUserDataDir: string,
+  currentUserDataDir: string,
+  oldId: string,
+  newId: string,
+  wasLegacyPrimary: boolean
+): void {
+  const oldPartName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(oldId)}`
+  const newPartName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(newId)}`
+
+  const srcPart = path.join(legacyUserDataDir, 'Partitions', oldPartName)
+  const legacySharedPart = path.join(legacyUserDataDir, 'Partitions', 'hermes-remote-oauth')
+  const dstPart = path.join(currentUserDataDir, 'Partitions', newPartName)
+  const stagingPart = path.join(legacyUserDataDir, 'Partitions', newPartName)
+
+  const candidateSrc = fs.existsSync(srcPart)
+    ? srcPart
+    : wasLegacyPrimary && fs.existsSync(legacySharedPart)
+      ? legacySharedPart
+      : null
+
+  if (candidateSrc) {
+    try {
+      fs.mkdirSync(path.join(currentUserDataDir, 'Partitions'), { recursive: true })
+      fs.cpSync(candidateSrc, dstPart, { recursive: true })
+      if (!fs.existsSync(stagingPart)) {
+        fs.cpSync(candidateSrc, stagingPart, { recursive: true })
+      }
+      console.log(`[noemetra] migrated OAuth partition for connection ${oldId} -> ${newId}`)
+    } catch (partErr) {
+      console.warn(`[noemetra] failed to migrate OAuth partition from ${oldId} to ${newId}:`, partErr)
+    }
+  }
 }
 
 function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): void {
@@ -1129,6 +1182,9 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
     fs.copyFileSync(legacyFile, currentFile)
     return
   }
+  const currentDir = path.dirname(currentFile)
+  const legacyDir = path.dirname(legacyFile)
+
   try {
     const currentRegistry = JSON.parse(fs.readFileSync(currentFile, 'utf8'))
     const legacyRegistry = JSON.parse(fs.readFileSync(legacyFile, 'utf8'))
@@ -1150,8 +1206,13 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           existingIds.add(conn.id)
           existingLabels.add(label.trim().toLowerCase())
           modified = true
+
+          // If legacy primary remote is migrating into destination as non-primary, seed its dedicated partition from shared jar if needed
+          if (conn.kind === 'remote' && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
+            migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
+          }
         } else {
-          // If an ID collides, compare target endpoint configuration to avoid dropping distinct legacy connections
+          // If an ID collides, compare target endpoint configuration and credentials to avoid dropping distinct legacy connections
           const existing = currentRegistry.connections.find((c: any) => c.id === conn.id)
           if (!areConnectionsEquivalent(existing, conn)) {
             let newId = `${conn.id}-legacy`
@@ -1168,6 +1229,17 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
             existingIds.add(newId)
             existingLabels.add(label.trim().toLowerCase())
             modified = true
+
+            // Preserve OAuth partition identity for renamed connection
+            if (conn.kind === 'remote' && conn.authMode === 'oauth') {
+              migrateConnectionOauthPartition(
+                legacyDir,
+                currentDir,
+                conn.id,
+                newId,
+                legacyRegistry.primary === conn.id
+              )
+            }
           }
         }
       }
