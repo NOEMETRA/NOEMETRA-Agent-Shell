@@ -38,6 +38,8 @@ export interface MediaRemoteScope {
 export interface MediaRemoteConnection {
   authMode?: 'oauth' | 'token'
   baseUrl: string
+  connectionId?: string
+  partition?: string
   headers?: Record<string, string>
   mode?: 'local' | 'remote'
   token?: null | string
@@ -47,10 +49,15 @@ export interface MediaRemoteConnection {
 type MediaRequestMethod = 'GET' | 'HEAD'
 
 export interface MediaProtocolDependencies {
-  ensureRemoteBearer: (baseUrl: string) => Promise<null | string>
+  ensureRemoteBearer: (baseUrl: string, connectionId?: string, options?: any) => Promise<null | string>
   fetchLocal: (resolvedPath: string, headers: Headers, method: MediaRequestMethod) => Promise<Response>
   fetchRemote: (url: string, headers: Headers, method: MediaRequestMethod) => Promise<Response>
-  fetchRemoteWithCookies: (url: string, headers: Headers, method: MediaRequestMethod) => Promise<Response>
+  fetchRemoteWithCookies: (
+    url: string,
+    headers: Headers,
+    method: MediaRequestMethod,
+    options?: { connectionId?: string; partition?: string }
+  ) => Promise<Response>
   resolveLocalFile: (filePath: string) => Promise<string>
   resolveRemoteConnection: (scope: MediaRemoteScope) => Promise<MediaRemoteConnection>
 }
@@ -229,15 +236,19 @@ export function createMediaProtocolHandler(dependencies: MediaProtocolDependenci
       }
 
       if (connection.authMode === 'oauth') {
+        const mediaConnId = connection.connectionId || target.connectionId
         return await requestWithOauthFallback(connection.baseUrl, {
-          ensureNativeAccessToken: dependencies.ensureRemoteBearer,
+          ensureNativeAccessToken: u => dependencies.ensureRemoteBearer(u, mediaConnId),
           requestWithBearer: bearer => {
             headers.set('authorization', `Bearer ${bearer}`)
 
             return dependencies.fetchRemote(endpoint, headers, method)
           },
           requestWithCookie: async () => {
-            const response = await dependencies.fetchRemoteWithCookies(endpoint, headers, method)
+            const response = await dependencies.fetchRemoteWithCookies(endpoint, headers, method, {
+              connectionId: mediaConnId,
+              partition: connection.partition
+            })
 
             // Fetch resolves HTTP errors; translate only the auth verdict so
             // the shared fallback can preserve a failed native refresh.

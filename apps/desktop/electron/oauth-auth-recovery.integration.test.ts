@@ -247,7 +247,7 @@ test('HTTP outage, dead-refresh and cookie coexistence reach the correct ticket/
     }
 
     const media = createMediaProtocolHandler({
-      ensureRemoteBearer: f.coordinator.ensure,
+      ensureRemoteBearer: (url: string) => f.coordinator.ensure(url),
       resolveRemoteConnection: async () => ({ baseUrl: f.baseUrl, mode: 'remote', authMode: 'oauth' }),
       resolveLocalFile: async path => path,
       fetchLocal: async () => {
