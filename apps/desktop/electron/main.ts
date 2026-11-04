@@ -1081,6 +1081,86 @@ function hasActiveCookieData(dir: string): boolean {
   return false
 }
 
+function hasSavedProtectedSecrets(dir: string): boolean {
+  // 1. Check native-oauth-tokens.json for saved native tokens
+  try {
+    const tokensPath = path.join(dir, 'native-oauth-tokens.json')
+    if (fs.existsSync(tokensPath)) {
+      const raw = fs.readFileSync(tokensPath, 'utf8')
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length > 0) {
+        for (const val of Object.values(parsed)) {
+          if (val && typeof val === 'object' && ((val as any).encoding === 'safeStorage' || ('value' in (val as any) && 'encoding' in (val as any)))) {
+            return true
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // 2. Check connections.json for keychain/safeStorage-encrypted connection tokens or headers
+  try {
+    const connPath = path.join(dir, 'connections.json')
+    if (fs.existsSync(connPath)) {
+      const raw = fs.readFileSync(connPath, 'utf8')
+      const parsed = JSON.parse(raw)
+      if (parsed && Array.isArray(parsed.connections)) {
+        for (const conn of parsed.connections) {
+          if (conn?.token && typeof conn.token === 'object' && (conn.token as any).encoding === 'safeStorage') {
+            return true
+          }
+          if (conn?.headers && typeof conn.headers === 'object') {
+            for (const h of Object.values(conn.headers)) {
+              if (h && typeof h === 'object' && (h as any).encoding === 'safeStorage') {
+                return true
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // 3. Check connection.json for safeStorage-encrypted credentials
+  try {
+    const v1Path = path.join(dir, 'connection.json')
+    if (fs.existsSync(v1Path)) {
+      const raw = fs.readFileSync(v1Path, 'utf8')
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.remote?.token && typeof parsed.remote.token === 'object' && parsed.remote.token.encoding === 'safeStorage') {
+          return true
+        }
+        if (parsed.remote?.headers && typeof parsed.remote.headers === 'object') {
+          for (const h of Object.values(parsed.remote.headers)) {
+            if (h && typeof h === 'object' && (h as any).encoding === 'safeStorage') {
+              return true
+            }
+          }
+        }
+        if (parsed.profiles && typeof parsed.profiles === 'object') {
+          for (const prof of Object.values(parsed.profiles)) {
+            if (prof && typeof prof === 'object') {
+              if ((prof as any).token && typeof (prof as any).token === 'object' && (prof as any).token.encoding === 'safeStorage') {
+                return true
+              }
+              if ((prof as any).headers && typeof (prof as any).headers === 'object') {
+                for (const h of Object.values((prof as any).headers)) {
+                  if (h && typeof h === 'object' && (h as any).encoding === 'safeStorage') {
+                    return true
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+
+  return false
+}
+
 function readLocalStateOsCryptKey(filePath: string): string | null {
   try {
     if (!fs.existsSync(filePath)) return null
@@ -2588,10 +2668,12 @@ function maybeMigrateLegacyDesktopState(): void {
         // and preserve legacy database to sidecar (.legacy) with an authoritative recovery manifest.
         // If destination has only empty boot boilerplate, restore legacy database directly into destPath.
         const preservedDatabases: Array<{ name: string; legacyPreserved: string; activeRetained: string }> = []
-        // Determine whether destination had active cookies and shared OAuth session prior to any transfer in Step 3.
+        // Determine whether destination had active cookies, protected secrets, and shared OAuth session prior to any transfer in Step 3.
         // We must probe this BEFORE connections.json or Partitions/ are reconciled into currentDir,
-        // otherwise imported legacy partitions would be mistaken for pre-existing destination sessions (AGENTS.md:68).
+        // otherwise imported legacy partitions or reconciled secrets would be mistaken for pre-existing destination state (AGENTS.md:68).
         const destHadActiveCookiesInitially = hasActiveCookieData(currentDir)
+        const destHadProtectedSecretsInitially = hasSavedProtectedSecrets(currentDir)
+        const destHadProtectedDataInitially = destHadActiveCookiesInitially || destHadProtectedSecretsInitially
         const currentSharedPart = path.join(currentDir, 'Partitions', 'hermes-remote-oauth')
         const destHadSharedSessionInitially = fs.existsSync(currentSharedPart) && hasDatabaseContent(currentSharedPart)
 
@@ -2709,20 +2791,23 @@ function maybeMigrateLegacyDesktopState(): void {
             }
           } else if (entry === 'Local State') {
             // Chromium OS Crypt encryption key (Local State):
-            // On Windows, cookies in Partitions/ and Network/ are encrypted with the key in Local State.
+            // On Windows, cookies in Partitions/ and Network/ and safeStorage-encrypted secrets (native OAuth tokens,
+            // connection tokens/headers) are encrypted with the key in Local State.
             // If migration was postponed after an initial boot, destination has a boilerplate Local State.
-            // If destination had NO active user cookies initially, migrate legacy Local State to match the migrated cookies.
-            // If destination DID have active user cookies initially and keys differ, preserve active Local State and require reauth.
+            // If destination had NO protected data (no active cookies and no encrypted secrets) initially,
+            // migrate legacy Local State to match the migrated cookies and secrets.
+            // If destination DID have protected data initially and keys differ, preserve active Local State
+            // so destination cookies, native tokens, and connection secrets remain decryptable.
             const destExists = fs.existsSync(destPath)
-            const destHasActiveCookies = destExists && destHadActiveCookiesInitially
-            if (!destExists || !destHasActiveCookies) {
+            const destHasProtectedData = destExists && destHadProtectedDataInitially
+            if (!destExists || !destHasProtectedData) {
               if (destExists) {
                 try {
                   fs.copyFileSync(destPath, path.join(currentDir, 'Local State.intervening'))
                 } catch {}
               }
               fs.copyFileSync(stagedPath, destPath)
-              console.log('[noemetra] migrated legacy Local State encryption key matching migrated cookie databases')
+              console.log('[noemetra] migrated legacy Local State encryption key matching migrated cookie databases and secrets')
             } else {
               const destKey = readLocalStateOsCryptKey(destPath)
               const stagedKey = readLocalStateOsCryptKey(stagedPath)
@@ -2730,7 +2815,7 @@ function maybeMigrateLegacyDesktopState(): void {
                 try {
                   fs.copyFileSync(stagedPath, path.join(currentDir, 'Local State.legacy'))
                 } catch {}
-                console.warn('[noemetra] active destination cookies use different Local State key than legacy; legacy sessions will require reauthentication')
+                console.warn('[noemetra] active destination secrets/cookies use different Local State key than legacy; legacy sessions will require reauthentication')
                 // Note: Local State is intentionally excluded from bulk UI recovery (preservedDatabases)
                 // because bulk recovery restores LevelDB/IndexedDB data, whereas swapping Local State would
                 // decouple the destination encryption key from active destination OAuth partitions (AGENTS.md:46-48).
