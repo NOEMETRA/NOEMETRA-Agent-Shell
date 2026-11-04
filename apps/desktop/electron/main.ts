@@ -17579,8 +17579,6 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
   //   - a failed native login reports the error rather than auto-falling back
   //     to the embedded flow — one sign-in action opens at most one window.
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
-  // Order login attempts without interrupting rotation of the existing session.
-  const authIsCurrent: () => boolean = nativeAccessTokenCoordinator.beginLogin(baseUrl)
 
   // A registry-editor sign-in can run BEFORE the draft connection is saved:
   // settle the id the save will reuse (returned so the renderer pins it into
@@ -17600,6 +17598,14 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
   } catch {
     loginConnectionId = ''
   }
+
+  // Use the connection-scoped key for login ordering and fencing so concurrent
+  // operations on different connections do not interfere, and logout cancels
+  // any pending attempt for the scoped connection (#P1).
+  const authFenceKey = loginConnectionId
+    ? scopedNativeTokenKey(baseUrl, loginConnectionId)
+    : resolveNativeTokenLookupKey(baseUrl)
+  const authIsCurrent: () => boolean = nativeAccessTokenCoordinator.beginLogin(authFenceKey)
 
   // The draft's intended entry shape (kind/authMode the save will persist).
   // The identity branch in oauth-partition.ts gates the pre-save private jar
@@ -17702,11 +17708,19 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
 
   if (connected) {
     // A confirmed cookie login supersedes any older native identity.
+    const targetKey = resolveNativeTokenLookupKey(baseUrl, loginConnectionId)
+    nativeAccessTokenCoordinator.clearTokens(targetKey)
     if (loginConnectionId) {
       nativeAccessTokenCoordinator.clearTokens(scopedNativeTokenKey(baseUrl, loginConnectionId))
     }
     if (isPrimaryOrUnscopedConnection(loginConnectionId)) {
       nativeAccessTokenCoordinator.clearTokens(baseUrl)
+      try {
+        const reg = readDesktopConnectionsRegistry()
+        if (reg?.primary) {
+          nativeAccessTokenCoordinator.clearTokens(scopedNativeTokenKey(baseUrl, reg.primary))
+        }
+      } catch {}
     }
     remoteReauthFailure = null
   }
@@ -17723,11 +17737,22 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl, r
   // logout clears BOTH auth shapes.
   // Clear before awaiting cookie I/O: a pending login/refresh cannot restore
   // logout, and a later login must not be erased when cookie clearing settles.
+  // Resolve and clear the exact key used for lookup, ensuring that an unscoped
+  // logout on a primary connection clears its connection-scoped token (#P1).
+  const targetKey = resolveNativeTokenLookupKey(baseUrl, connectionId)
+  nativeAccessTokenCoordinator.clearTokens(targetKey)
+
   if (connectionId) {
     nativeAccessTokenCoordinator.clearTokens(scopedNativeTokenKey(baseUrl, connectionId))
   }
   if (isPrimaryOrUnscopedConnection(connectionId)) {
     nativeAccessTokenCoordinator.clearTokens(baseUrl)
+    try {
+      const reg = readDesktopConnectionsRegistry()
+      if (reg?.primary) {
+        nativeAccessTokenCoordinator.clearTokens(scopedNativeTokenKey(baseUrl, reg.primary))
+      }
+    } catch {}
   }
   await clearOauthSession(baseUrl, { connectionId })
 
