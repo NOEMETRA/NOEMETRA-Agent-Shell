@@ -1257,6 +1257,8 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           // If legacy primary remote connection is migrating into destination as non-primary, seed its dedicated partition from shared jar
           if (conn.kind === 'remote' && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
             migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
+          } else if (conn.kind === 'cloud' && destHasSharedSession && legacyHasSharedSession) {
+            migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
           }
         } else {
           // If an ID collides, compare target endpoint configuration and credentials to avoid dropping distinct legacy connections
@@ -1310,6 +1312,14 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
                 conn.id,
                 newId,
                 legacyRegistry.primary === conn.id
+              )
+            } else if (conn.kind === 'cloud' && destHasSharedSession && legacyHasSharedSession) {
+              migrateConnectionOauthPartition(
+                legacyDir,
+                currentDir,
+                conn.id,
+                newId,
+                true
               )
             }
           } else if (isRemoteOauth && legacyHasSession && !currentHasSession) {
@@ -7800,7 +7810,10 @@ async function waitForRemoteHermes(remote) {
       throw error
     }
 
-    if (!(await hasLivePortalSession())) {
+    const part = resolveOauthPartitionForUrl(remote.baseUrl, { connectionId: remote.connectionId })
+    const portalPartition = part !== OAUTH_SESSION_PARTITION ? part : undefined
+
+    if (!(await hasLivePortalSession(portalPartition))) {
       throw error
     }
 
@@ -7809,7 +7822,7 @@ async function waitForRemoteHermes(remote) {
     try {
       // Boot re-runs on wake and renderer retries, not only on a click: keep
       // the cascade hidden and let the overlay's Sign in button own any prompt.
-      await cloudAgentSilentSignIn(remote.baseUrl, { background: true })
+      await cloudAgentSilentSignIn(remote.baseUrl, { background: true, connectionId: remote.connectionId })
     } catch (cascadeError) {
       rememberLog(`[cloud] boot: silent sign-in did not complete: ${cascadeError?.message || cascadeError}`)
 
@@ -8693,9 +8706,27 @@ function safeFrameOrigin(frame: { origin?: string } | null | undefined): string 
 
 const OAUTH_SESSION_PARTITION = LEGACY_OAUTH_PARTITION
 
+const oauthSessionsByPartition = new Map()
+
 let oauthSession = null
 
-function getOauthSession() {
+function getOauthSession(partition?: string) {
+  if (partition && partition !== OAUTH_SESSION_PARTITION) {
+    if (!app.isReady()) {
+      return null
+    }
+
+    let sess = oauthSessionsByPartition.get(partition)
+
+    if (!sess) {
+      sess = session.fromPartition(partition)
+      oauthSessionsByPartition.set(partition, sess)
+      installRemoteHeaderRulesOnSession(sess)
+    }
+
+    return sess
+  }
+
   if (oauthSession || !app.isReady()) {
     return oauthSession
   }
@@ -8705,14 +8736,6 @@ function getOauthSession() {
 
   return oauthSession
 }
-
-// Per-connection cookie jars (#92183). A NON-primary v2 registry remote with
-// cookie auth rides its own partition so two registered gateways can never
-// evict — or be handed — each other's session cookies (Chromium jars ignore
-// the port, so two dashboards on one VPN host used to collide in the shared
-// jar above). The primary / v1 remote / cloud / portal flows keep the legacy
-// shared partition; see oauth-partition.ts for the full rules.
-const oauthSessionsByPartition = new Map()
 
 function resolveOauthPartitionForUrl(url, { connectionId = '', pendingAuthMode = '', pendingKind = '' } = {}) {
   try {
@@ -8729,26 +8752,10 @@ function resolveOauthPartitionForUrl(url, { connectionId = '', pendingAuthMode =
   }
 }
 
-function getOauthSessionForUrl(url, { connectionId = '', pendingAuthMode = '', pendingKind = '' } = {}) {
-  const partition = resolveOauthPartitionForUrl(url, { connectionId, pendingAuthMode, pendingKind })
+function getOauthSessionForUrl(url, { connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}) {
+  const partition = explicitPartition || resolveOauthPartitionForUrl(url, { connectionId, pendingAuthMode, pendingKind })
 
-  if (partition === OAUTH_SESSION_PARTITION) {
-    return getOauthSession()
-  }
-
-  if (!app.isReady()) {
-    return null
-  }
-
-  let sess = oauthSessionsByPartition.get(partition)
-
-  if (!sess) {
-    sess = session.fromPartition(partition)
-    oauthSessionsByPartition.set(partition, sess)
-    installRemoteHeaderRulesOnSession(sess)
-  }
-
-  return sess
+  return getOauthSession(partition)
 }
 
 // Cold-start cookie-jar warm-up. A `persist:` partition materialized via
@@ -8767,8 +8774,8 @@ function getOauthSessionForUrl(url, { connectionId = '', pendingAuthMode = '', p
 // Memoized per PARTITION: per-connection jars (#92183) hydrate independently.
 const oauthCookieWarmups = new Map()
 
-function warmOauthCookieStore(url?) {
-  const partition = resolveOauthPartitionForUrl(url)
+function warmOauthCookieStore(url?, { connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}) {
+  const partition = explicitPartition || resolveOauthPartitionForUrl(url, { connectionId, pendingAuthMode, pendingKind })
   const pending = oauthCookieWarmups.get(partition)
 
   if (pending) {
@@ -8776,7 +8783,7 @@ function warmOauthCookieStore(url?) {
   }
 
   const warmup = (async () => {
-    const sess = getOauthSessionForUrl(url)
+    const sess = getOauthSession(partition)
 
     if (!sess) {
       // App not ready yet — don't memoize a no-op; let a later call retry.
@@ -8854,8 +8861,8 @@ async function hasOauthSessionCookie(baseUrl, { connectionId = '', pendingAuthMo
 // the next authenticated request. Gating on the AT alone forces a needless full
 // re-login every ~15 min. Used for the Settings "connected" indicator and as a
 // cheap early-out before attempting a network round-trip in resolveRemoteBackend.
-async function hasLiveOauthSession(baseUrl) {
-  const sess = getOauthSessionForUrl(baseUrl)
+async function hasLiveOauthSession(baseUrl, { connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}) {
+  const sess = getOauthSessionForUrl(baseUrl, { connectionId, pendingAuthMode, pendingKind, partition: explicitPartition })
 
   if (!sess) {
     return false
@@ -8891,7 +8898,7 @@ async function hasLiveOauthSession(baseUrl) {
   // trusting a negative, force the store to hydrate and re-read a couple of
   // times with a short backoff. A genuinely signed-out user still resolves
   // false quickly (≤ ~180ms); a signed-in user racing the load now wins.
-  await warmOauthCookieStore(baseUrl)
+  await warmOauthCookieStore(baseUrl, { connectionId, pendingAuthMode, pendingKind, partition: explicitPartition })
 
   for (const delayMs of [30, 60, 90]) {
     if (await readLive()) {
@@ -8904,8 +8911,8 @@ async function hasLiveOauthSession(baseUrl) {
   return readLive()
 }
 
-async function clearOauthSession(baseUrl) {
-  const sess = getOauthSessionForUrl(baseUrl)
+async function clearOauthSession(baseUrl, { connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}) {
+  const sess = getOauthSessionForUrl(baseUrl, { connectionId, pendingAuthMode, pendingKind, partition: explicitPartition })
 
   if (!sess) {
     return
@@ -9372,11 +9379,14 @@ const recoverCloudCookieSession = createCloudSessionRecovery({
   restoreCookieSession: async baseUrl => {
     // The saved portal identity is the authority for cookie agent sessions.
     // Roster polling must never reveal an interactive sign-in window.
-    if (!(await hasLivePortalSession())) {
+    const part = resolveOauthPartitionForUrl(baseUrl)
+    const partition = part !== OAUTH_SESSION_PARTITION ? part : undefined
+
+    if (!(await hasLivePortalSession(partition))) {
       return false
     }
 
-    if (!(await hasPortalAccessToken()) && !(await renewPortalAccessSilently())) {
+    if (!(await hasPortalAccessToken(partition)) && !(await renewPortalAccessSilently({ partition }))) {
       return false
     }
 
@@ -9466,9 +9476,9 @@ async function freshGatewayWsUrl(profile, webContentsId) {
 const { hasLivePortalSession, hasPortalAccessToken, renewPortalAccessSilently, openPortalLoginWindow } =
   createPortalSession({
     isReady: () => app.isReady(),
-    getOauthSession,
+    getOauthSession: (partition?: string) => getOauthSession(partition),
     resolvePortalBaseUrl,
-    warmOauthCookieStore,
+    warmOauthCookieStore: (partition?: string) => warmOauthCookieStore(undefined, { partition }),
     createWindow: options => new BrowserWindow(options),
     rememberLog
   })
@@ -9625,13 +9635,15 @@ function trimCloudAgents(body) {
 // if the portal session were absent it would fall through to an interactive
 // login, which the discovery gate already prevents). Returns once the agent's
 // gateway session cookie is present.
-async function cloudAgentSilentSignIn(dashboardUrl, { background = false } = {}) {
+async function cloudAgentSilentSignIn(dashboardUrl, { background = false, connectionId = '' } = {}) {
   const baseUrl = normalizeRemoteBaseUrl(dashboardUrl)
+  const partition = resolveOauthPartitionForUrl(baseUrl, { connectionId })
+  const portalPartition = partition !== OAUTH_SESSION_PARTITION ? partition : undefined
 
   // Pre-req: a live portal session must exist, or this would surface an
   // interactive prompt rather than a silent cascade. Discovery already gates on
   // this, but a selection can arrive after the session lapsed.
-  if (!(await hasLivePortalSession())) {
+  if (!(await hasLivePortalSession(portalPartition))) {
     const err = new Error('Your Hermes Cloud session has expired. Sign in to Hermes Cloud again.') as any
     err.needsCloudLogin = true
     throw err
@@ -9641,13 +9653,13 @@ async function cloudAgentSilentSignIn(dashboardUrl, { background = false } = {})
   // access state just like discovery. If only renewal material survived the
   // restart, mint a fresh access token first so the hidden cascade window
   // auto-SSOs instead of stalling on an interactive chooser (#73495).
-  if (!(await hasPortalAccessToken())) {
-    await renewPortalAccessSilently()
+  if (!(await hasPortalAccessToken(portalPartition))) {
+    await renewPortalAccessSilently({ partition: portalPartition })
   }
 
-  await openOauthLoginWindow(baseUrl, { silent: true, background })
+  await openOauthLoginWindow(baseUrl, { silent: true, background, connectionId })
 
-  return { baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
+  return { baseUrl, connected: await hasOauthSessionCookie(baseUrl, { connectionId }) }
 }
 
 // ---------------------------------------------------------------------------
@@ -10682,7 +10694,10 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
       // RFC 8252 flow) counts as connected too — otherwise a completed native
       // sign-in shows "not connected" in Settings. The authoritative liveness
       // check is the ws-ticket mint in resolveRemoteBackend at actual connect time.
-      remoteOauthConnected = oauthSessionIsLive(hasNativeSession(remoteUrl), await hasLiveOauthSession(remoteUrl))
+      remoteOauthConnected = oauthSessionIsLive(
+        hasNativeSession(remoteUrl),
+        await hasLiveOauthSession(remoteUrl, { connectionId: block.connectionId || block.id })
+      )
     } catch {
       remoteOauthConnected = false
     }
@@ -17229,20 +17244,23 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
 
   return { ok: true, baseUrl, connected, connectionId: loginConnectionId || undefined }
 })
-ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
-  const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl, rawOpts?: any) => {
+  const urlArg = typeof rawUrl === 'string' ? rawUrl : rawUrl?.url || rawUrl?.baseUrl || ''
+  const connectionId =
+    (typeof rawUrl === 'object' && rawUrl?.connectionId) ? rawUrl.connectionId : rawOpts?.connectionId || ''
+  const baseUrl = normalizeRemoteBaseUrl(urlArg)
 
   // Also drop any native (RFC 8252) bearer tokens for this gateway so a
   // logout clears BOTH auth shapes.
   // Clear before awaiting cookie I/O: a pending login/refresh cannot restore
   // logout, and a later login must not be erased when cookie clearing settles.
   nativeAccessTokenCoordinator.clearTokens(baseUrl)
-  await clearOauthSession(baseUrl)
+  await clearOauthSession(baseUrl, { connectionId })
 
   // Report against the SAME liveness notion the Settings indicator uses
   // (AT-or-RT cookie, or a native token) so a logout that left any session
   // behind is reflected as still-connected rather than silently signed-out.
-  const connected = (await hasLiveOauthSession(baseUrl)) || hasNativeSession(baseUrl)
+  const connected = (await hasLiveOauthSession(baseUrl, { connectionId })) || hasNativeSession(baseUrl)
 
   return { ok: true, connected }
 })
@@ -17250,30 +17268,49 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) =
 // --- Hermes Cloud (cloud-auto-discovery Phase 3) ---
 // One portal login in the OAuth partition powers both discovery and the silent
 // per-agent cascade. See the discovery/cascade helpers above.
-ipcMain.handle('hermes:cloud:status', async () => ({
-  portalBaseUrl: resolvePortalBaseUrl(),
-  signedIn: await hasLivePortalSession()
-}))
-ipcMain.handle('hermes:cloud:login', async () => {
-  await openPortalLoginWindow()
-
-  return { ok: true, signedIn: await hasLivePortalSession() }
+ipcMain.handle('hermes:cloud:status', async (_event, opts?: { connectionId?: string; partition?: string }) => {
+  let partition = opts?.partition
+  if (!partition && opts?.connectionId) {
+    const p = resolveOauthPartitionForUrl(resolvePortalBaseUrl(), { connectionId: opts.connectionId })
+    if (p !== OAUTH_SESSION_PARTITION) partition = p
+  }
+  return {
+    portalBaseUrl: resolvePortalBaseUrl(),
+    signedIn: await hasLivePortalSession(partition)
+  }
 })
-ipcMain.handle('hermes:cloud:logout', async () => {
-  await clearOauthSession(resolvePortalBaseUrl())
+ipcMain.handle('hermes:cloud:login', async (_event, opts?: { connectionId?: string; partition?: string }) => {
+  let partition = opts?.partition
+  if (!partition && opts?.connectionId) {
+    const p = resolveOauthPartitionForUrl(resolvePortalBaseUrl(), { connectionId: opts.connectionId })
+    if (p !== OAUTH_SESSION_PARTITION) partition = p
+  }
+  await openPortalLoginWindow({ partition })
 
-  return { ok: true, signedIn: await hasLivePortalSession() }
+  return { ok: true, signedIn: await hasLivePortalSession(partition) }
+})
+ipcMain.handle('hermes:cloud:logout', async (_event, opts?: { connectionId?: string; partition?: string }) => {
+  let partition = opts?.partition
+  if (!partition && opts?.connectionId) {
+    const p = resolveOauthPartitionForUrl(resolvePortalBaseUrl(), { connectionId: opts.connectionId })
+    if (p !== OAUTH_SESSION_PARTITION) partition = p
+  }
+  await clearOauthSession(resolvePortalBaseUrl(), { partition })
+
+  return { ok: true, signedIn: await hasLivePortalSession(partition) }
 })
 ipcMain.handle('hermes:cloud:discover', async (_event, org) => {
   // Returns { agents } or { needsOrgSelection: true, orgs }. `org` (optional)
   // scopes discovery to a chosen org for multi-org users.
   return discoverCloudAgents(typeof org === 'string' && org ? org : undefined)
 })
-ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl) => {
-  // Silent per-agent sign-in via the shared portal session. Returns the agent's
+ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl, opts?: { connectionId?: string }) => {
+  // Silent per-agent sign-in via the shared or dedicated portal session. Returns the agent's
   // gateway baseUrl + whether its session cookie landed; the renderer then
   // saves a cloud-mode connection pointed at this dashboardUrl.
-  return cloudAgentSilentSignIn(dashboardUrl)
+  const connId = typeof dashboardUrl === 'object' ? dashboardUrl?.connectionId : opts?.connectionId
+  const url = typeof dashboardUrl === 'string' ? dashboardUrl : dashboardUrl?.dashboardUrl || dashboardUrl?.url
+  return cloudAgentSilentSignIn(url, { connectionId: connId })
 })
 ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
   assertCanMutateManagedPrimaryRouting()
