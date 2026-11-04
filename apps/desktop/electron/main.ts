@@ -1363,11 +1363,37 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
     : (fs.existsSync(currentSharedPart) && hasDatabaseContent(currentSharedPart))
   const legacyHasSharedSession = fs.existsSync(legacySharedPart) && hasDatabaseContent(legacySharedPart)
 
+  const isV1File = path.basename(legacyFile) === 'connection.json'
+  let legacyRegistry: any
+  try {
+    const rawLegacy = fs.readFileSync(legacyFile, 'utf8')
+    const parsedLegacy = JSON.parse(rawLegacy)
+    if (isV1File) {
+      legacyRegistry = migrateV1ToRegistry(parsedLegacy)
+    } else {
+      legacyRegistry = parsedLegacy
+    }
+  } catch (err) {
+    console.error(`[noemetra] failed to read/parse legacy registry from ${legacyFile}:`, err)
+    throw err
+  }
+
   if (!fs.existsSync(currentFile)) {
     // If destination has no connections.json and no active shared OAuth session,
-    // copying the legacy registry directly is completely safe.
+    // initializing the registry directly is safe.
     if (!destHasSharedSession) {
-      fs.copyFileSync(legacyFile, currentFile)
+      if (isV1File) {
+        fs.writeFileSync(currentFile, JSON.stringify(legacyRegistry, null, 2), { encoding: 'utf8', mode: 0o600 })
+        tightenSecretFileMode(currentFile)
+      } else {
+        fs.copyFileSync(legacyFile, currentFile)
+        tightenSecretFileMode(currentFile)
+      }
+      if (Array.isArray(legacyRegistry.connections)) {
+        for (const conn of legacyRegistry.connections) {
+          if (conn?.id) idRemap.set(conn.id, conn.id)
+        }
+      }
       return idRemap
     }
     // Destination has an active shared OAuth session on disk even though connections.json
@@ -1380,7 +1406,6 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
     const currentRegistry = fs.existsSync(currentFile)
       ? JSON.parse(fs.readFileSync(currentFile, 'utf8'))
       : { primary: 'local', connections: [{ id: 'local', kind: 'local', label: 'Local' }] }
-    const legacyRegistry = JSON.parse(fs.readFileSync(legacyFile, 'utf8'))
 
     let legacyV1RemoteUrl: string | null = null
     try {
@@ -1612,14 +1637,16 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
       }
 
       if (modified) {
-        fs.writeFileSync(currentFile, JSON.stringify(currentRegistry, null, 2), 'utf8')
+        fs.writeFileSync(currentFile, JSON.stringify(currentRegistry, null, 2), { encoding: 'utf8', mode: 0o600 })
+        tightenSecretFileMode(currentFile)
       }
     }
     return idRemap
   } catch (err) {
     // Preserve legacy registry copy as a recovery affordance before propagating write/parse failure
     const dir = path.dirname(currentFile)
-    const recoveryCopy = path.join(dir, 'connections.legacy.json')
+    const recoveryFileName = path.basename(legacyFile) === 'connection.json' ? 'connection.legacy.json' : 'connections.legacy.json'
+    const recoveryCopy = path.join(dir, recoveryFileName)
     try {
       if (!fs.existsSync(recoveryCopy)) {
         fs.copyFileSync(legacyFile, recoveryCopy)
@@ -1675,12 +1702,21 @@ function mergeNativeOAuthTokenStores(
 
     let legacyUrlToConnId = new Map<string, string>()
     const legacyConnFile = path.join(legacyDir, 'connections.json')
+    const legacyV1File = path.join(legacyDir, 'connection.json')
     if (fs.existsSync(legacyConnFile)) {
       try {
         const legacyReg = JSON.parse(fs.readFileSync(legacyConnFile, 'utf8'))
         legacyUrlToConnId = buildLegacyUrlToConnectionMap(legacyReg)
       } catch (err) {
         console.warn('[noemetra] warning: failed to parse legacy connections.json for token mapping:', err)
+      }
+    } else if (fs.existsSync(legacyV1File)) {
+      try {
+        const v1Raw = JSON.parse(fs.readFileSync(legacyV1File, 'utf8'))
+        const convertedReg = migrateV1ToRegistry(v1Raw)
+        legacyUrlToConnId = buildLegacyUrlToConnectionMap(convertedReg)
+      } catch (err) {
+        console.warn('[noemetra] warning: failed to parse legacy connection.json for token mapping:', err)
       }
     }
 
@@ -2515,12 +2551,14 @@ function maybeMigrateLegacyDesktopState(): void {
         throw stageCopyErr
       }
 
-      // Sort staged entries so that connections.json is reconciled BEFORE Partitions/ directories
+      // Sort staged entries so that connections.json and connection.json are reconciled BEFORE Partitions/ directories
       // are transferred into currentDir, preventing imported partition databases from being
       // mistaken for pre-existing destination sessions (AGENTS.md:68).
       const stagedEntries = fs.readdirSync(stagingDir).sort((a, b) => {
         if (a === 'connections.json') return -1
         if (b === 'connections.json') return 1
+        if (a === 'connection.json') return -1
+        if (b === 'connection.json') return 1
         if (a === 'Partitions') return 1
         if (b === 'Partitions') return -1
         return a.localeCompare(b)
@@ -2559,9 +2597,15 @@ function maybeMigrateLegacyDesktopState(): void {
 
         // Pre-reconcile connections.json so any connection ID remappings (idRemap)
         // are known before processing credentials and databases (AGENTS.md:46-48).
+        // If legacy has connections.json, reconcile it directly; if legacy only has
+        // v1 connection.json, reconcile its converted registry into destination connections.json.
         let connectionIdRemap = new Map<string, string>()
         if (stagedEntries.includes('connections.json')) {
           const stagedConnPath = path.join(stagingDir, 'connections.json')
+          const destConnPath = path.join(currentDir, 'connections.json')
+          connectionIdRemap = reconcileConnectionsRegistry(destConnPath, stagedConnPath, destHadSharedSessionInitially)
+        } else if (stagedEntries.includes('connection.json')) {
+          const stagedConnPath = path.join(stagingDir, 'connection.json')
           const destConnPath = path.join(currentDir, 'connections.json')
           connectionIdRemap = reconcileConnectionsRegistry(destConnPath, stagedConnPath, destHadSharedSessionInitially)
         }
@@ -2571,6 +2615,14 @@ function maybeMigrateLegacyDesktopState(): void {
           const destPath = path.join(currentDir, entry)
 
           if (entry === 'connections.json') {
+            continue
+          } else if (entry === 'connection.json') {
+            // connection.json: already reconciled into connections.json above.
+            // If destination does not have connection.json, copy it for backwards compatibility;
+            // if destination already has one, preserve destination's file.
+            if (!fs.existsSync(destPath)) {
+              fs.copyFileSync(stagedPath, destPath)
+            }
             continue
           } else if (entry === 'native-oauth-tokens.json') {
             mergeNativeOAuthTokenStores(stagingDir, currentDir, connectionIdRemap)
