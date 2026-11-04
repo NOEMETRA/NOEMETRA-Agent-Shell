@@ -213,6 +213,17 @@ describe('resolveReauthConnectionId', () => {
     expect(resolveReauthConnectionId('https://shared.example.com', '', ambiguousRegistry)).toBeUndefined()
   })
 
+  it('returns undefined when remoteUrl is shared by primary and another connection (never infer primary on shared URL)', () => {
+    const sharedWithPrimaryRegistry = {
+      primary: 'primary-conn',
+      connections: [
+        { id: 'primary-conn', url: 'https://shared.example.com' },
+        { id: 'secondary-conn', url: 'https://shared.example.com' }
+      ]
+    }
+    expect(resolveReauthConnectionId('https://shared.example.com', '', sharedWithPrimaryRegistry)).toBeUndefined()
+  })
+
   it('preserves path case and does not confuse case-distinct endpoints on the same host', () => {
     const caseSensitiveRegistry = {
       primary: 'conn-team-upper',
