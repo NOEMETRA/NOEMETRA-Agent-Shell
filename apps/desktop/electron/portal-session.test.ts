@@ -73,3 +73,32 @@ test('a real portal load failure still ends sign-in', async () => {
   await expect(portal.openPortalLoginWindow()).rejects.toThrow(error.message)
   expect(win.isDestroyed()).toBe(true)
 })
+
+test('partition parameter is forwarded to getOauthSession and warmOauthCookieStore', async () => {
+  const requestedPartitions: (string | undefined)[] = []
+  const warmedPartitions: (string | undefined)[] = []
+  const cookies: { name: string; value: string }[] = [{ name: 'nas-session', value: 'existing-access' }]
+  const session = { cookies: { get: async () => cookies } } as unknown as Session
+
+  const portal = createPortalSession({
+    isReady: () => true,
+    getOauthSession: (part?: string) => {
+      requestedPartitions.push(part)
+      return session
+    },
+    resolvePortalBaseUrl: () => 'https://portal.example.test',
+    warmOauthCookieStore: async (part?: string) => {
+      warmedPartitions.push(part)
+    },
+    createWindow: () => ({} as unknown as BrowserWindow),
+    rememberLog: () => {}
+  })
+
+  const live = await portal.hasLivePortalSession('persist:custom-part')
+  expect(live).toBe(true)
+  expect(requestedPartitions).toContain('persist:custom-part')
+
+  const hasAccess = await portal.hasPortalAccessToken('persist:custom-part')
+  expect(hasAccess).toBe(true)
+  expect(requestedPartitions).toContain('persist:custom-part')
+})

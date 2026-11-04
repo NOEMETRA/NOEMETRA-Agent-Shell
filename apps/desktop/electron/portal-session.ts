@@ -6,9 +6,9 @@ import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 
 interface PortalSessionDependencies {
   isReady: () => boolean
-  getOauthSession: () => Session | null
+  getOauthSession: (partition?: string) => Session | null
   resolvePortalBaseUrl: () => string
-  warmOauthCookieStore: () => Promise<unknown>
+  warmOauthCookieStore: (partition?: string) => Promise<unknown>
   createWindow: (options: BrowserWindowConstructorOptions) => BrowserWindow
   rememberLog: (message: string) => void
 }
@@ -47,8 +47,8 @@ export function createPortalSession({
   // One reader for every portal-cookie question so the failure rungs cannot
   // drift between callers: URL-scoped first, host-scoped when Chromium rejects
   // the URL form, empty when the jar is unreadable.
-  async function readPortalCookies() {
-    const sess = getOauthSession()
+  async function readPortalCookies(partition?: string) {
+    const sess = getOauthSession(partition)
 
     if (!sess) {
       return []
@@ -69,18 +69,18 @@ export function createPortalSession({
 
   // A persisted Chromium jar hydrates lazily; warm and retry before reporting
   // signed-out on a cold start. Both access and refresh credentials count here.
-  async function hasLivePortalSession() {
-    if (!getOauthSession()) {
+  async function hasLivePortalSession(partition?: string) {
+    if (!getOauthSession(partition)) {
       return false
     }
 
-    const readPortal = async () => cookiesHavePortalSession(await readPortalCookies())
+    const readPortal = async () => cookiesHavePortalSession(await readPortalCookies(partition))
 
     if (await readPortal()) {
       return true
     }
 
-    await warmOauthCookieStore()
+    await warmOauthCookieStore(partition)
 
     for (const delayMs of [30, 60, 90]) {
       if (await readPortal()) {
@@ -93,12 +93,12 @@ export function createPortalSession({
     return readPortal()
   }
 
-  async function readAccessCookies() {
-    return portalAccessCookies(await readPortalCookies())
+  async function readAccessCookies(partition?: string) {
+    return portalAccessCookies(await readPortalCookies(partition))
   }
 
-  async function hasPortalAccessToken() {
-    return (await readAccessCookies()).length > 0
+  async function hasPortalAccessToken(partition?: string) {
+    return (await readAccessCookies(partition)).length > 0
   }
 
   // A portal window has done its job only when the jar holds an access cookie
@@ -106,15 +106,15 @@ export function createPortalSession({
   // token the server already rejected can sit unexpired in Chromium's jar, and
   // trusting it would close the login window before the user signs in, or
   // report a renewal that never happened.
-  async function hasNewAccessCookie(previous: PortalCookie[]) {
-    const access = await readAccessCookies()
+  async function hasNewAccessCookie(previous: PortalCookie[], partition?: string) {
+    const access = await readAccessCookies(partition)
 
     return access.some(cookie => !previous.some(old => old.name === cookie.name && old.value === cookie.value))
   }
 
   // The portal owns provider selection, provisioning and refresh redirects;
   // Desktop only watches the jar for a new access cookie.
-  function driveCookieWindow(sess: Session, previous: PortalCookie[], options: CookieWindowOptions) {
+  function driveCookieWindow(sess: Session, previous: PortalCookie[], options: CookieWindowOptions, partition?: string) {
     const portalBaseUrl = resolvePortalBaseUrl()
 
     return new Promise<CookieWindowOutcome>(resolve => {
@@ -147,7 +147,7 @@ export function createPortalSession({
       }
 
       const checkCookie = async () => {
-        if (!settled && (await hasNewAccessCookie(previous))) {
+        if (!settled && (await hasNewAccessCookie(previous, partition))) {
           finish('landed')
         }
       }
@@ -208,8 +208,8 @@ export function createPortalSession({
   // cookie) is never satisfied by a short-circuit, only by a real renewal.
   let portalAccessRenewal: Promise<boolean> | null = null
 
-  async function renewPortalAccessSilently({ force = false }: { force?: boolean } = {}) {
-    const sess = getOauthSession()
+  async function renewPortalAccessSilently({ force = false, partition }: { force?: boolean; partition?: string } = {}) {
+    const sess = getOauthSession(partition)
 
     if (!isReady() || !sess) {
       return false
@@ -217,16 +217,16 @@ export function createPortalSession({
 
     // No renewal material at all → nothing to renew; interactive login is
     // genuinely required.
-    if (!(await hasLivePortalSession())) {
+    if (!(await hasLivePortalSession(partition))) {
       return false
     }
 
-    if (!force && (await hasPortalAccessToken())) {
+    if (!force && (await hasPortalAccessToken(partition))) {
       return true
     }
 
     portalAccessRenewal ??= (async () => {
-      const previous = await readAccessCookies()
+      const previous = await readAccessCookies(partition)
 
       // Hard deadline: this window is never revealed, so an unrenewable session
       // (revoked refresh token, portal down) must resolve false rather than
@@ -237,7 +237,7 @@ export function createPortalSession({
         show: false,
         pollMs: 500,
         deadlineMs: 12_000
-      })
+      }, partition)
 
       const ok = outcome === 'landed'
 
@@ -257,23 +257,23 @@ export function createPortalSession({
   // that authenticates discovery AND is reused for every silent per-agent
   // cascade. Resolves once a new access cookie appears; refresh material alone
   // must not close the window before the portal can replace it.
-  async function openPortalLoginWindow(): Promise<void> {
+  async function openPortalLoginWindow({ partition }: { partition?: string } = {}): Promise<void> {
     if (!isReady()) {
       throw new Error('Desktop is not ready to start a Hermes Cloud sign-in.')
     }
 
-    const sess = getOauthSession()
+    const sess = getOauthSession(partition)
 
     if (!sess) {
       throw new Error('OAuth session partition is unavailable.')
     }
 
-    const outcome = await driveCookieWindow(sess, await readAccessCookies(), {
+    const outcome = await driveCookieWindow(sess, await readAccessCookies(partition), {
       kind: 'portal',
       title: 'Sign in to Hermes Cloud',
       show: true,
       pollMs: 750
-    })
+    }, partition)
 
     if (outcome !== 'landed') {
       throw outcome instanceof Error ? outcome : new Error('Sign-in window closed before authentication completed.')
