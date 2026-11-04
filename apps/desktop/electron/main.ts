@@ -9680,9 +9680,10 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
         if (isPrimary || isSoleMatch) {
           const legacyTokens = _loadNativeTokens(normUrl)
           if (legacyTokens) {
-            _storeNativeTokens(scopedKey, legacyTokens)
-            _clearNativeTokens(normUrl)
-            return scopedKey
+            if (_storeNativeTokens(scopedKey, legacyTokens)) {
+              _clearNativeTokens(normUrl)
+              return scopedKey
+            }
           }
           return normUrl
         }
@@ -9718,9 +9719,10 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
         if (_loadNativeTokens(normUrl) !== null) {
           const legacyTokens = _loadNativeTokens(normUrl)
           if (legacyTokens) {
-            _storeNativeTokens(primaryScopedKey, legacyTokens)
-            _clearNativeTokens(normUrl)
-            return primaryScopedKey
+            if (_storeNativeTokens(primaryScopedKey, legacyTokens)) {
+              _clearNativeTokens(normUrl)
+              return primaryScopedKey
+            }
           }
         }
       }
@@ -9743,9 +9745,10 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
       if (_loadNativeTokens(normUrl) !== null) {
         const legacyTokens = _loadNativeTokens(normUrl)
         if (legacyTokens) {
-          _storeNativeTokens(soleScopedKey, legacyTokens)
-          _clearNativeTokens(normUrl)
-          return soleScopedKey
+          if (_storeNativeTokens(soleScopedKey, legacyTokens)) {
+            _clearNativeTokens(normUrl)
+            return soleScopedKey
+          }
         }
       }
     }
@@ -9773,12 +9776,18 @@ function _loadNativeTokens(key: string): NativeTokenSet | null {
   return tokens
 }
 
-function _storeNativeTokens(key: string, tokens: NativeTokenSet) {
+function _storeNativeTokens(key: string, tokens: NativeTokenSet): boolean {
   const normKey = key.includes('#conn=')
     ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
     : normalizeRemoteBaseUrl(key)
   _persistNativeTokens(normKey, tokens)
-  _nativeTokens.set(normKey, tokens)
+  // Verify persistence actually succeeded on disk before caching in-memory
+  const readBack = loadNativeTokenSet(normKey, _nativeTokenStoreIo())
+  if (readBack !== null) {
+    _nativeTokens.set(normKey, tokens)
+    return true
+  }
+  return false
 }
 
 function _clearNativeTokens(key: string) {
