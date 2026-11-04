@@ -1198,11 +1198,70 @@ function applyPendingLegacyDatabaseRestore(): void {
     // STEP 0: Check for an interrupted swap transaction from a prior crash (per AGENTS.md:73-78)
     if (fs.existsSync(swapTxPath)) {
       console.warn('[noemetra] found interrupted swap transaction in .legacy-restore-tx.json; recovering')
-      let allRollbacksSucceeded = true
       try {
         const tx = JSON.parse(fs.readFileSync(swapTxPath, 'utf8'))
+
+        // If the prior transaction reached 'committed', all swaps were successful.
+        // Publish recovery manifest, clean up backups, and remove markers without rolling back (preventing mixed states).
+        if (tx && tx.phase === 'committed') {
+          console.log('[noemetra] prior swap transaction was committed; completing publication and cleanup')
+          const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+          if (tx.action === 'restore-intervening') {
+            try {
+              if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
+            } catch {}
+          } else {
+            const interveningDatabases: Array<{ name: string; interveningPreserved: string; activeRetained: string }> = []
+            for (const db of tx.databases || []) {
+              const interveningName = `${db.name}.intervening`
+              if (fs.existsSync(path.join(currentDir, interveningName))) {
+                interveningDatabases.push({
+                  name: db.name,
+                  interveningPreserved: interveningName,
+                  activeRetained: db.name
+                })
+              }
+            }
+            if (interveningDatabases.length > 0) {
+              try {
+                fs.writeFileSync(
+                  manifestPath,
+                  JSON.stringify(
+                    {
+                      migratedAt: new Date().toISOString(),
+                      status: 'intervening-preserved-legacy-active',
+                      databases: interveningDatabases
+                    },
+                    null,
+                    2
+                  ),
+                  'utf8'
+                )
+              } catch (manifestErr) {
+                console.error('[noemetra] failed to write recovery manifest during committed recovery:', manifestErr)
+              }
+            }
+          }
+          // Clean up backups and markers now that manifest is published
+          for (const db of tx.databases || []) {
+            if (db.backupPath && fs.existsSync(db.backupPath)) {
+              try {
+                fs.rmSync(db.backupPath, { recursive: true, force: true })
+              } catch {}
+            }
+          }
+          try {
+            fs.rmSync(pendingRestorePath, { force: true })
+          } catch {}
+          try {
+            fs.rmSync(swapTxPath, { force: true })
+          } catch {}
+          return
+        }
+
+        // Transaction was in 'swapping' phase (uncommitted): roll back any touched database from its backup
+        let allRollbacksSucceeded = true
         if (tx && tx.phase === 'swapping' && Array.isArray(tx.databases)) {
-          // Transaction was interrupted mid-flight. Roll back any database that started swapping or was swapped!
           for (const db of tx.databases) {
             const wasTouched = db.state === 'in_progress' || db.state === 'swapped' || db.swapped === true
             if (wasTouched && db.backupPath && fs.existsSync(db.backupPath)) {
@@ -1230,21 +1289,36 @@ function applyPendingLegacyDatabaseRestore(): void {
             }
           }
         }
-      } catch (txParseErr) {
-        console.error('[noemetra] failed to parse swap transaction:', txParseErr)
-        allRollbacksSucceeded = false
-      }
 
-      // Preserve the backup and transaction marker until every rollback succeeds (per AGENTS.md:73-78)
-      if (allRollbacksSucceeded) {
+        // Preserve the backup and transaction marker until every rollback succeeds (per AGENTS.md:73-78)
+        if (allRollbacksSucceeded) {
+          try {
+            fs.rmSync(swapTxPath, { force: true })
+          } catch {}
+          try {
+            fs.rmSync(pendingRestorePath, { force: true })
+          } catch {}
+        } else {
+          console.error('[noemetra] not all rollbacks succeeded; stopping startup to prevent Chromium database corruption')
+          try {
+            dialog.showErrorBox(
+              'Database Recovery Interrupted',
+              'A database restore operation could not be cleanly completed or rolled back. To protect your data, NOEMETRA Agent Shell cannot start until disk locks are resolved.'
+            )
+          } catch {}
+          app.exit(1)
+          return
+        }
+      } catch (txParseErr) {
+        console.error('[noemetra] failed to parse swap transaction; stopping startup to protect data:', txParseErr)
         try {
-          fs.rmSync(swapTxPath, { force: true })
+          dialog.showErrorBox(
+            'Database Recovery Interrupted',
+            'A database restore transaction record was corrupted. To protect your data, NOEMETRA Agent Shell cannot start.'
+          )
         } catch {}
-        try {
-          fs.rmSync(pendingRestorePath, { force: true })
-        } catch {}
-      } else {
-        console.error('[noemetra] not all rollbacks succeeded; retaining swapTxPath and backups for next launch retry')
+        app.exit(1)
+        return
       }
       return
     }
@@ -1436,23 +1510,35 @@ function applyPendingLegacyDatabaseRestore(): void {
           fs.rmSync(pendingRestorePath, { force: true })
         } catch {}
       } else {
-        console.error('[noemetra] swap rollback had errors; retaining transaction record for recovery on next launch')
+        console.error('[noemetra] swap rollback had errors; stopping startup to protect data')
+        try {
+          dialog.showErrorBox(
+            'Database Recovery Interrupted',
+            'A database restore operation could not be cleanly completed or rolled back. To protect your data, NOEMETRA Agent Shell cannot start until disk locks are resolved.'
+          )
+        } catch {}
+        app.exit(1)
       }
       return
     }
 
-    // Step 4: Transaction committed successfully. Clean up backups and transaction record.
-    for (const db of txDatabases) {
-      if (fs.existsSync(db.backupPath)) {
-        try {
-          fs.rmSync(db.backupPath, { recursive: true, force: true })
-        } catch {}
-      }
-    }
-    fs.rmSync(swapTxPath, { force: true })
-    fs.rmSync(pendingRestorePath, { force: true })
+    // Step 4: Mark transaction committed BEFORE publishing manifest and cleaning up backups (per AGENTS.md:73-78)
+    fs.writeFileSync(
+      swapTxPath,
+      JSON.stringify(
+        {
+          id: txId,
+          action: request.action || 'restore-legacy',
+          phase: 'committed',
+          databases: txDatabases
+        },
+        null,
+        2
+      ),
+      'utf8'
+    )
 
-    // Step 5: Update recovery manifest according to the action taken
+    // Step 5: Publish recovery manifest BEFORE deleting backups
     const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
     if (request.action === 'restore-intervening') {
       // User restored their intervening setup: clean up manifest as reverse recovery cycle is complete
@@ -1493,6 +1579,25 @@ function applyPendingLegacyDatabaseRestore(): void {
         }
       }
     }
+
+    // Step 6: Now that manifest is published, remove pending request, backups and transaction record
+    try {
+      fs.rmSync(pendingRestorePath, { force: true })
+    } catch {}
+
+    for (const db of txDatabases) {
+      if (fs.existsSync(db.backupPath)) {
+        try {
+          fs.rmSync(db.backupPath, { recursive: true, force: true })
+        } catch {}
+      }
+    }
+
+    try {
+      fs.rmSync(swapTxPath, { force: true })
+    } catch {}
+
+    console.log('[noemetra] successfully restored database(s) before Chromium startup')
     console.log('[noemetra] successfully restored database(s) before Chromium startup')
   } catch (err) {
     console.error('[noemetra] unexpected error in applyPendingLegacyDatabaseRestore:', err)
