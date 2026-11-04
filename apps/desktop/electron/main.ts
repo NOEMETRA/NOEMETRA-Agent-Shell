@@ -1193,7 +1193,8 @@ function migrateConnectionOauthPartition(
       }
       console.log(`[noemetra] migrated OAuth partition for connection ${oldId} -> ${newId}`)
     } catch (partErr) {
-      console.warn(`[noemetra] failed to migrate OAuth partition from ${oldId} to ${newId}:`, partErr)
+      console.error(`[noemetra] failed to migrate OAuth partition from ${oldId} to ${newId}; aborting for rollback:`, partErr)
+      throw partErr
     }
   }
 }
@@ -1217,7 +1218,8 @@ function ensureSharedOauthPartitionPreserved(legacyUserDataDir: string, currentU
         }
       }
     } catch (partErr) {
-      console.warn('[noemetra] failed to preserve shared OAuth partition for legacy cloud connection:', partErr)
+      console.error('[noemetra] failed to preserve shared OAuth partition for legacy cloud connection; aborting for rollback:', partErr)
+      throw partErr
     }
   }
 }
@@ -9450,7 +9452,8 @@ const recoverCloudCookieSession = createCloudSessionRecovery({
 async function mintGatewayWsTicket(
   baseUrl: string,
   headers: Record<string, string> = {},
-  connectionId?: string
+  connectionId?: string,
+  partition?: string
 ): Promise<string> {
   return recoverCloudCookieSession(
     baseUrl,
@@ -9463,7 +9466,11 @@ async function mintGatewayWsTicket(
               ensureNativeAccessToken,
               fetchJson,
               fetchJsonViaOauthSession: (url, opts: any = {}) =>
-                fetchJsonViaOauthSession(url, { ...opts, connectionId: opts?.connectionId ?? connectionId })
+                fetchJsonViaOauthSession(url, {
+                  ...opts,
+                  connectionId: opts?.connectionId ?? connectionId,
+                  partition: opts?.partition ?? partition
+                })
             },
             headers
           ),
@@ -9497,7 +9504,7 @@ async function freshGatewayWsUrl(profile, webContentsId) {
   }
 
   if (connection.authMode === 'oauth') {
-    const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers, connection.connectionId)
+    const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers, connection.connectionId, connection.partition)
     const wsUrl = buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
 
     rememberRemoteWsHeaders(wsUrl, connection.headers)
@@ -12221,7 +12228,11 @@ async function testDesktopConnectionConfig(input: any = {}) {
   }
 
   const connectionId = block?.connectionId || block?.id || ''
-  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders, connectionId)) as any
+  const partition =
+    (typeof block?.partition === 'string' && block.partition.trim()) ||
+    (typeof input.partition === 'string' && input.partition.trim()) ||
+    ''
+  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders, connectionId, partition)) as any
 
   // The HTTP status check above proves the backend is reachable, but the chat
   // surface only works once the renderer's live WebSocket to ``/api/ws``
@@ -12231,7 +12242,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // connect to Hermes gateway". Mirror the renderer's connect here so the test
   // reflects the full path the app actually uses.
   const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
-    mintTicket: url => mintGatewayWsTicket(url, testHeaders, connectionId)
+    mintTicket: url => mintGatewayWsTicket(url, testHeaders, connectionId, partition)
   })
 
   // Skip the WS leg only when the runtime genuinely lacks a WebSocket (so an
@@ -12255,10 +12266,10 @@ async function testDesktopConnectionConfig(input: any = {}) {
   }
 }
 
-async function fetchConnectionStatus(baseUrl, authMode, token, headers = {}, connectionId?: string) {
+async function fetchConnectionStatus(baseUrl, authMode, token, headers = {}, connectionId?: string, partition?: string) {
   // Native PKCE bearer first, OAuth session cookies second — the same two
   // credentials real traffic uses, in the same order (fetchJsonForBackend).
-  return fetchJsonForBackend({ baseUrl, authMode, token, headers, connectionId }, '/api/status', { timeoutMs: 8_000 })
+  return fetchJsonForBackend({ baseUrl, authMode, token, headers, connectionId, partition }, '/api/status', { timeoutMs: 8_000 })
 }
 
 function resetBootProgressForReconnect() {
@@ -16639,7 +16650,7 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     }
   }
 
-  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders, entry.id)) as any
+  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders, entry.id, entry.partition)) as any
 
   // The Test button is the cheapest moment to (re)learn this backend's stable
   // identity for the same-backend roster collapse + Settings hint.
@@ -16648,7 +16659,7 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
   // Same HTTP+WS two-leg check as testDesktopConnectionConfig: HTTP alone is
   // a false positive when the WebSocket leg is blocked.
   const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
-    mintTicket: url => mintGatewayWsTicket(url, testHeaders, entry.id)
+    mintTicket: url => mintGatewayWsTicket(url, testHeaders, entry.id, entry.partition)
   })
 
   if (wsUrl && typeof globalThis.WebSocket === 'function') {
@@ -17163,7 +17174,8 @@ async function fetchJsonForBackend(
       body: opts.body,
       timeoutMs: opts.timeoutMs,
       headers: descriptor.headers,
-      connectionId: descriptor.connectionId || descriptor.id
+      connectionId: descriptor.connectionId || descriptor.id,
+      partition: descriptor.partition
     }
 
     return requestWithOauthFallback(descriptor.baseUrl, {
