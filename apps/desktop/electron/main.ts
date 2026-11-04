@@ -12220,13 +12220,13 @@ async function resolveRemoteBackend(
     )
   }
 
-  return route.connectionId
-    ? {
-        ...connection,
-        connectionId: route.connectionId,
-        ...((route as any)?.partition ? { partition: (route as any).partition } : {})
-      }
-    : connection
+  const resolvedPartition = (route as any)?.partition || connection.partition
+
+  return {
+    ...connection,
+    ...(route.connectionId ? { connectionId: route.connectionId } : {}),
+    ...(resolvedPartition ? { partition: resolvedPartition } : {})
+  }
 }
 
 // A remote profile's sessions live on its remote host's state.db, not on a local
