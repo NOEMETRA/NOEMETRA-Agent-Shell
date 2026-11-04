@@ -880,7 +880,7 @@ function isLegacyAppRunning(legacyDir: string): boolean {
         const normLegacyDir = path.resolve(legacyDir).toLowerCase()
         const psScript = `
 $ErrorActionPreference = 'SilentlyContinue'
-$legacy = [regex]::Escape('${normLegacyDir.replace(/'/g, "''").replace(/\\/g, '\\\\')}')
+$legacy = [regex]::Escape('${normLegacyDir.replace(/'/g, "''")}')
 Get-CimInstance Win32_Process | ForEach-Object {
   if ($_.ProcessId -eq $PID) { return }
   $name = if ($_.Name) { $_.Name.ToLower() } else { '' }
@@ -9893,6 +9893,12 @@ function isPrimaryOrUnscopedConnection(connectionId?: string): boolean {
   }
 }
 
+const AMBIGUOUS_TOKEN_LOOKUP_SENTINEL = '\0noemetra:ambiguous-token-lookup'
+
+function isAmbiguousTokenKey(key: string): boolean {
+  return !key || key.startsWith('\0') || key.includes('\0')
+}
+
 function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): string {
   const normUrl = normalizeRemoteBaseUrl(baseUrl)
   const cid = typeof connectionId === 'string' ? connectionId.trim() : ''
@@ -9951,28 +9957,14 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
         normalizeRemoteBaseUrl(c.url) === normUrl
     )
 
-    const primaryId = registry?.primary
-    if (primaryId) {
-      const primaryConn = connectionsForUrl.find((c: any) => c && c.id === primaryId)
-      if (primaryConn) {
-        const primaryScopedKey = `${normUrl}#conn=${primaryId}`
-        if (_loadNativeTokens(primaryScopedKey) !== null) {
-          return primaryScopedKey
-        }
-        // Only migrate legacy unscoped token if primary is the unambiguous sole connection for this URL
-        if (connectionsForUrl.length === 1 && _loadNativeTokens(normUrl) !== null) {
-          const legacyTokens = _loadNativeTokens(normUrl)
-          if (legacyTokens) {
-            if (_storeNativeTokens(primaryScopedKey, legacyTokens)) {
-              _clearNativeTokens(normUrl)
-              return primaryScopedKey
-            }
-          }
-        }
-      }
+    // Per desktop scope invariant (AGENTS.md:46-48), if multiple connections share the same
+    // gateway URL, an unscoped caller cannot unambiguously determine which account was intended.
+    // Never attribute credentials to the primary (or any connection) when the endpoint is shared.
+    // Return a sentinel that cannot collide with any valid connection ID so no account is selected (#P1).
+    if (connectionsForUrl.length > 1) {
+      return AMBIGUOUS_TOKEN_LOOKUP_SENTINEL
     }
 
-    // If primary does not match baseUrl, check if there is an unambiguous sole connection for this baseUrl
     if (connectionsForUrl.length === 1 && connectionsForUrl[0]?.id) {
       const soleId = connectionsForUrl[0].id
       const soleScopedKey = `${normUrl}#conn=${soleId}`
@@ -9988,13 +9980,7 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
           }
         }
       }
-    }
-
-    // When multiple connections share this URL, an unscoped token cannot be deterministically
-    // attributed to any single connection. Return an unassigned scoped key so an unscoped caller
-    // cannot accidentally select an ambiguous credential (#P2).
-    if (connectionsForUrl.length > 1) {
-      return `${normUrl}#conn=ambiguous`
+      return soleScopedKey
     }
   } catch {}
 
@@ -10002,6 +9988,9 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
 }
 
 function _loadNativeTokens(key: string): NativeTokenSet | null {
+  if (isAmbiguousTokenKey(key)) {
+    return null
+  }
   const normKey = key.includes('#conn=')
     ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
     : normalizeRemoteBaseUrl(key)
@@ -10021,6 +10010,9 @@ function _loadNativeTokens(key: string): NativeTokenSet | null {
 }
 
 function _storeNativeTokens(key: string, tokens: NativeTokenSet): boolean {
+  if (isAmbiguousTokenKey(key)) {
+    return false
+  }
   const normKey = key.includes('#conn=')
     ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
     : normalizeRemoteBaseUrl(key)
@@ -10044,6 +10036,9 @@ function _storeNativeTokens(key: string, tokens: NativeTokenSet): boolean {
 }
 
 function _clearNativeTokens(key: string) {
+  if (isAmbiguousTokenKey(key)) {
+    return
+  }
   const normKey = key.includes('#conn=')
     ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
     : normalizeRemoteBaseUrl(key)
@@ -10083,6 +10078,9 @@ const nativeAccessTokenCoordinator: ReturnType<typeof createNativeAccessTokenCoo
     isRefreshAuthRejection: (error: unknown): boolean => readStatusCode(error) === 401,
     loadTokens: _loadNativeTokens,
     normalizeBaseUrl: (urlOrKey: string) => {
+      if (isAmbiguousTokenKey(urlOrKey)) {
+        return urlOrKey
+      }
       if (urlOrKey.includes('#conn=')) {
         const [url, connPart] = urlOrKey.split('#conn=')
         return `${normalizeRemoteBaseUrl(url)}#conn=${connPart}`
@@ -10115,6 +10113,7 @@ function ensureNativeAccessTokenScoped(
   options?: NativeAccessTokenOptions
 ): Promise<string | null> {
   const key = resolveNativeTokenLookupKey(baseUrl, connectionId)
+  if (isAmbiguousTokenKey(key)) return Promise.resolve(null)
   return nativeAccessTokenCoordinator.ensure(key, options)
 }
 
@@ -18147,7 +18146,7 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
         throw new NativeAuthChangedError()
       }
 
-      const tokenKey = authFenceKey
+      const tokenKey = isAmbiguousTokenKey(authFenceKey) ? baseUrl : authFenceKey
       nativeAccessTokenCoordinator.storeTokens(tokenKey, tokens)
       // When saving a scoped token for the primary or unscoped connection, clear any legacy unscoped
       // token so only one canonical refresh-token authority exists (#P1).
