@@ -1225,8 +1225,8 @@ function areConnectionsEquivalent(a: any, b: any): boolean {
   if (kindA === 'ssh') {
     const hostA = String(a.host || '').trim().toLowerCase()
     const hostB = String(b.host || '').trim().toLowerCase()
-    const userA = String(a.user || a.username || '').trim().toLowerCase()
-    const userB = String(b.user || b.username || '').trim().toLowerCase()
+    const userA = String(a.user || a.username || '').trim()
+    const userB = String(b.user || b.username || '').trim()
     const portA = Number(a.port) || 22
     const portB = Number(b.port) || 22
     const keyPathA = String(a.keyPath || '')
@@ -1247,8 +1247,14 @@ function areConnectionsEquivalent(a: any, b: any): boolean {
   }
 
   // remote or cloud
-  const urlA = String(a.url || '').trim().toLowerCase()
-  const urlB = String(b.url || '').trim().toLowerCase()
+  let urlA = String(a.url || '').trim()
+  let urlB = String(b.url || '').trim()
+  try {
+    urlA = normalizeRemoteBaseUrl(urlA)
+  } catch {}
+  try {
+    urlB = normalizeRemoteBaseUrl(urlB)
+  } catch {}
   const authModeA = String(a.authMode || '')
   const authModeB = String(b.authMode || '')
   const orgA = String(a.org || '')
