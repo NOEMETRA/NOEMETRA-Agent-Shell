@@ -145,10 +145,31 @@ describe('registry gateway WebSocket headers', () => {
 
     expect(result).toBe(expectedUrl)
     expect(mintTicket).toHaveBeenCalledOnce()
-    expect(mintTicket).toHaveBeenCalledWith('https://gateway.example', accessHeaders)
+    expect(mintTicket).toHaveBeenCalledWith('https://gateway.example', accessHeaders, 'cloud-one', undefined)
     expect(store.headersFor(result)).toEqual(accessHeaders)
     expectRequestHeaders(store, result, accessHeaders)
     expectNoHeadersForNearbyUrls(store, result)
+  })
+
+  it('OAuth path preserves connection ID and partition when minting tickets', async () => {
+    const { handler, mintTicket } = createHarness({
+      authMode: 'oauth',
+      baseUrl: 'https://gateway.example',
+      wsUrl: 'wss://gateway.example/api/ws?ticket=stale',
+      connectionId: 'conn-alpha',
+      partition: 'persist:hermes-remote-oauth-conn-alpha',
+      headers: accessHeaders,
+      profile: 'default',
+      sharedRemote: true
+    })
+
+    const result = await handler({ connectionId: 'conn-alpha', profile: 'default' })
+    expect(mintTicket).toHaveBeenCalledWith(
+      'https://gateway.example',
+      accessHeaders,
+      'conn-alpha',
+      'persist:hermes-remote-oauth-conn-alpha'
+    )
   })
 
   it('sharedRemote false preserves the original URL and exact header behavior', async () => {
