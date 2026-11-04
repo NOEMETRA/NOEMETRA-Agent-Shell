@@ -2387,6 +2387,10 @@ function maybeMigrateLegacyDesktopState(): void {
         // and preserve legacy database to sidecar (.legacy) with an authoritative recovery manifest.
         // If destination has only empty boot boilerplate, restore legacy database directly into destPath.
         const preservedDatabases: Array<{ name: string; legacyPreserved: string; activeRetained: string }> = []
+        // Determine whether destination had active cookies prior to any transfer in Step 3.
+        // We must probe this BEFORE connections.json or Partitions/ are reconciled into currentDir,
+        // otherwise imported legacy partitions would be mistaken for pre-existing destination cookies.
+        const destHadActiveCookiesInitially = hasActiveCookieData(currentDir)
 
         for (const entry of stagedEntries) {
           const stagedPath = path.join(stagingDir, entry)
@@ -2476,10 +2480,10 @@ function maybeMigrateLegacyDesktopState(): void {
             // Chromium OS Crypt encryption key (Local State):
             // On Windows, cookies in Partitions/ and Network/ are encrypted with the key in Local State.
             // If migration was postponed after an initial boot, destination has a boilerplate Local State.
-            // If destination has NO active user cookies, migrate legacy Local State to match the migrated cookies.
-            // If destination DOES have active user cookies and keys differ, preserve active Local State and require reauth.
+            // If destination had NO active user cookies initially, migrate legacy Local State to match the migrated cookies.
+            // If destination DID have active user cookies initially and keys differ, preserve active Local State and require reauth.
             const destExists = fs.existsSync(destPath)
-            const destHasActiveCookies = destExists && hasActiveCookieData(currentDir)
+            const destHasActiveCookies = destExists && destHadActiveCookiesInitially
             if (!destExists || !destHasActiveCookies) {
               if (destExists) {
                 try {
