@@ -2183,17 +2183,34 @@ function maybeMigrateLegacyDesktopState(): void {
         fs.writeFileSync(pendingMarkerPath, '1\n', 'utf8')
       } catch {}
 
-      fs.mkdirSync(stagingDir, { recursive: true })
-      // Step 1: Copy to staging directory first (transactional isolation)
-      fs.cpSync(legacyDir, stagingDir, {
-        recursive: true,
-        errorOnExist: false,
-        force: false,
-        filter: (src) => {
-          const basename = path.basename(src)
-          return !basename.startsWith('Singleton') && basename !== 'Crashpad' && basename !== '.migration-stage'
+      // Ensure stagingDir is cleanly rebuilt from scratch for every migration attempt
+      try {
+        if (fs.existsSync(stagingDir)) {
+          fs.rmSync(stagingDir, { recursive: true, force: true })
         }
-      })
+      } catch (rmStageErr) {
+        console.warn('[noemetra] failed to clear stale migration staging directory:', rmStageErr)
+      }
+      fs.mkdirSync(stagingDir, { recursive: true })
+
+      try {
+        // Step 1: Copy to staging directory first (transactional isolation)
+        fs.cpSync(legacyDir, stagingDir, {
+          recursive: true,
+          errorOnExist: false,
+          force: true,
+          filter: (src) => {
+            const basename = path.basename(src)
+            return !basename.startsWith('Singleton') && basename !== 'Crashpad' && basename !== '.migration-stage'
+          }
+        })
+      } catch (stageCopyErr) {
+        console.error('[noemetra] failed to populate migration staging directory; cleaning up staging:', stageCopyErr)
+        try {
+          fs.rmSync(stagingDir, { recursive: true, force: true })
+        } catch {}
+        throw stageCopyErr
+      }
 
       const stagedEntries = fs.readdirSync(stagingDir)
 
@@ -2203,6 +2220,9 @@ function maybeMigrateLegacyDesktopState(): void {
       const backupOk = backupPreMigrationDestination(currentDir, backupDir)
       if (!backupOk) {
         console.warn('[noemetra] failed to complete destination backup snapshot; aborting migration to protect existing state')
+        try {
+          fs.rmSync(stagingDir, { recursive: true, force: true })
+        } catch {}
         return
       }
 
