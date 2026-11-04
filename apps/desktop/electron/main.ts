@@ -1043,6 +1043,10 @@ function rollbackMigrationDestination(currentDir: string, backupDir: string, sta
     try {
       if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
     } catch {}
+    const markerPath = path.join(currentDir, MIGRATION_COMPLETE_MARKER)
+    try {
+      if (fs.existsSync(markerPath)) fs.rmSync(markerPath, { force: true })
+    } catch {}
 
     // Clean up any staging sidecars
     if (fs.existsSync(currentDir)) {
@@ -1243,6 +1247,31 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           }
         }
       }
+
+      // Reconcile quarantined entries so corrupted or malformed connections from legacy are not lost
+      if (Array.isArray(legacyRegistry.quarantined) && legacyRegistry.quarantined.length > 0) {
+        if (!Array.isArray(currentRegistry.quarantined)) {
+          currentRegistry.quarantined = []
+        }
+        const seenQuarantined = new Set(
+          currentRegistry.quarantined.map((q: any) => JSON.stringify(q))
+        )
+        for (const item of legacyRegistry.quarantined) {
+          if (currentRegistry.quarantined.length >= 20) break
+          if (item && typeof item === 'object') {
+            const serialized = JSON.stringify(item)
+            if (!seenQuarantined.has(serialized)) {
+              currentRegistry.quarantined.push(item)
+              seenQuarantined.add(serialized)
+              modified = true
+            }
+          }
+        }
+        if (currentRegistry.quarantined.length === 0) {
+          delete currentRegistry.quarantined
+        }
+      }
+
       if (modified) {
         fs.writeFileSync(currentFile, JSON.stringify(currentRegistry, null, 2), 'utf8')
       }
@@ -1338,24 +1367,40 @@ function applyPendingLegacyDatabaseRestore(): void {
           return
         }
 
-        // Transaction was in 'swapping' phase (uncommitted): roll back any touched database from its backup
+        // Transaction was in 'swapping' phase (uncommitted): roll back any touched database
         let allRollbacksSucceeded = true
         if (tx && tx.phase === 'swapping' && Array.isArray(tx.databases)) {
           for (const db of tx.databases) {
             const wasTouched = db.state === 'in_progress' || db.state === 'swapped' || db.swapped === true
-            if (wasTouched && db.backupPath && fs.existsSync(db.backupPath)) {
-              console.log(`[noemetra] rolling back touched database ${db.name} from backup`)
+            if (wasTouched) {
+              console.log(`[noemetra] rolling back touched database ${db.name}`)
               try {
                 if (fs.existsSync(db.activePath)) {
                   fs.rmSync(db.activePath, { recursive: true, force: true })
                 }
-                fs.cpSync(db.backupPath, db.activePath, { recursive: true })
-                // Only clean up backup after confirmed successful restore!
-                try {
-                  fs.rmSync(db.backupPath, { recursive: true, force: true })
-                } catch {}
-                db.state = 'pending'
-                db.swapped = false
+                if (db.activeExistedInitially) {
+                  if (db.backupPath && fs.existsSync(db.backupPath)) {
+                    fs.cpSync(db.backupPath, db.activePath, { recursive: true })
+                    // Only clean up backup after confirmed successful restore!
+                    try {
+                      fs.rmSync(db.backupPath, { recursive: true, force: true })
+                    } catch {}
+                  } else {
+                    console.error(`[noemetra] backup missing for pre-existing database ${db.name}`)
+                    allRollbacksSucceeded = false
+                  }
+                } else {
+                  // Non-pre-existing database: removing db.activePath (done above) restored initial state
+                  if (db.backupPath && fs.existsSync(db.backupPath)) {
+                    try {
+                      fs.rmSync(db.backupPath, { recursive: true, force: true })
+                    } catch {}
+                  }
+                }
+                if (allRollbacksSucceeded) {
+                  db.state = 'pending'
+                  db.swapped = false
+                }
               } catch (rollbackDbErr) {
                 console.error(`[noemetra] failed to roll back database ${db.name}:`, rollbackDbErr)
                 allRollbacksSucceeded = false
@@ -1441,6 +1486,7 @@ function applyPendingLegacyDatabaseRestore(): void {
       activePath: string
       backupPath: string
       interveningPath: string
+      activeExistedInitially: boolean
       state: 'pending' | 'in_progress' | 'swapped'
       swapped: boolean
     }> = []
@@ -1452,7 +1498,8 @@ function applyPendingLegacyDatabaseRestore(): void {
       const backupPath = path.join(currentDir, `.${item.name}.swap-backup-${txId}`)
 
       // Create pre-swap backup of active database if it exists
-      if (fs.existsSync(activePath)) {
+      const activeExistedInitially = fs.existsSync(activePath)
+      if (activeExistedInitially) {
         fs.cpSync(activePath, backupPath, { recursive: true })
       }
 
@@ -1462,6 +1509,7 @@ function applyPendingLegacyDatabaseRestore(): void {
         activePath,
         backupPath,
         interveningPath,
+        activeExistedInitially,
         state: 'pending',
         swapped: false
       })
@@ -1552,23 +1600,39 @@ function applyPendingLegacyDatabaseRestore(): void {
     }
 
     if (!allSucceeded) {
-      // Roll back touched databases (in_progress or swapped) to their pre-swap backups
+      // Roll back touched databases (in_progress or swapped) to their pre-swap state
       console.warn('[noemetra] swap failed mid-flight; rolling back to pre-swap backups')
       let allRollbacksSucceeded = true
       for (const db of txDatabases) {
         const wasTouched = db.state === 'in_progress' || db.state === 'swapped'
-        if (wasTouched && fs.existsSync(db.backupPath)) {
+        if (wasTouched) {
           try {
             if (fs.existsSync(db.activePath)) {
               fs.rmSync(db.activePath, { recursive: true, force: true })
             }
-            fs.cpSync(db.backupPath, db.activePath, { recursive: true })
-            db.state = 'pending'
-            db.swapped = false
-            // Only clean up backup after confirmed successful restore!
-            try {
-              fs.rmSync(db.backupPath, { recursive: true, force: true })
-            } catch {}
+            if (db.activeExistedInitially) {
+              if (fs.existsSync(db.backupPath)) {
+                fs.cpSync(db.backupPath, db.activePath, { recursive: true })
+                // Only clean up backup after confirmed successful restore!
+                try {
+                  fs.rmSync(db.backupPath, { recursive: true, force: true })
+                } catch {}
+              } else {
+                console.error(`[noemetra] backup missing for pre-existing database ${db.name}`)
+                allRollbacksSucceeded = false
+              }
+            } else {
+              // Non-pre-existing database: removing db.activePath (done above) restored initial state
+              if (fs.existsSync(db.backupPath)) {
+                try {
+                  fs.rmSync(db.backupPath, { recursive: true, force: true })
+                } catch {}
+              }
+            }
+            if (allRollbacksSucceeded) {
+              db.state = 'pending'
+              db.swapped = false
+            }
           } catch (rbErr) {
             console.error(`[noemetra] rollback failed for ${db.name}:`, rbErr)
             allRollbacksSucceeded = false
@@ -1774,6 +1838,9 @@ function maybeMigrateLegacyDesktopState(): void {
         } catch {}
         try {
           fs.rmSync(stagingDir, { recursive: true, force: true })
+        } catch {}
+        try {
+          fs.rmSync(path.join(currentDir, MIGRATION_COMPLETE_MARKER), { force: true })
         } catch {}
       } else {
         console.error('[noemetra] interrupted-migration recovery did not complete; stopping startup to preserve snapshot for later retry')
