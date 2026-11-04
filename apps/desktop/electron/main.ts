@@ -1229,26 +1229,6 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
       let modified = false
 
       for (const conn of legacyRegistry.connections) {
-        // Preserve account boundary (AGENTS.md:45-47): if destination already has an active cloud OAuth session,
-        // a legacy cloud OAuth connection cannot ride destination's account. Quarantine it to require explicit reauth.
-        if (conn.kind === 'cloud' && (conn.authMode === 'oauth' || !conn.token) && destHasSharedSession && legacyHasSharedSession) {
-          ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
-          if (!Array.isArray(currentRegistry.quarantined)) {
-            currentRegistry.quarantined = []
-          }
-          if (currentRegistry.quarantined.length < 20) {
-            const alreadyQuarantined = currentRegistry.quarantined.some((q: any) => q && q.entry && q.entry.id === conn.id)
-            if (!alreadyQuarantined) {
-              currentRegistry.quarantined.push({
-                reason: 'cloud-oauth-account-boundary-reauth-required',
-                entry: conn
-              })
-              modified = true
-            }
-          }
-          continue
-        }
-
         if (!existingIds.has(conn.id)) {
           let label = conn.label || conn.id
           if (existingLabels.has(label.trim().toLowerCase())) {
@@ -1258,6 +1238,16 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           if (conn.kind === 'remote' && conn.authMode === 'oauth') {
             const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`
             connectionToSave.partition = `persist:${partName}`
+          } else if (conn.kind === 'cloud') {
+            ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
+            if (destHasSharedSession && legacyHasSharedSession) {
+              // Preserve account boundary (AGENTS.md:46-48, 86-91): if destination already has an active
+              // cloud OAuth session, a legacy cloud OAuth connection cannot ride destination's account.
+              // Assign an isolated partition to require explicit reauth, while keeping the connection
+              // actionable in the user's workspace.
+              const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`
+              connectionToSave.partition = `persist:${partName}`
+            }
           }
           currentRegistry.connections.push(connectionToSave)
           existingIds.add(conn.id)
@@ -1267,13 +1257,12 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           // If legacy primary remote connection is migrating into destination as non-primary, seed its dedicated partition from shared jar
           if (conn.kind === 'remote' && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
             migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
-          } else if (conn.kind === 'cloud') {
-            ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
           }
         } else {
           // If an ID collides, compare target endpoint configuration and credentials to avoid dropping distinct legacy connections
           const existing = currentRegistry.connections.find((c: any) => c.id === conn.id)
           const isRemoteOauth = conn.kind === 'remote' && conn.authMode === 'oauth'
+          const isCloudOauth = conn.kind === 'cloud' && (conn.authMode === 'oauth' || !conn.token)
           const legacyHasSession = isRemoteOauth && (
             fs.existsSync(path.join(legacyDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`)) ||
             (legacyRegistry.primary === conn.id && fs.existsSync(path.join(legacyDir, 'Partitions', 'hermes-remote-oauth')))
@@ -1282,7 +1271,9 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
             fs.existsSync(path.join(currentDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`)) ||
             (currentRegistry.primary === conn.id && fs.existsSync(path.join(currentDir, 'Partitions', 'hermes-remote-oauth')))
           )
-          const hasPotentialOauthAccountCollision = legacyHasSession && currentHasSession
+          const hasPotentialOauthAccountCollision =
+            (legacyHasSession && currentHasSession) ||
+            (isCloudOauth && destHasSharedSession && legacyHasSharedSession)
 
           if (!areConnectionsEquivalent(existing, conn) || hasPotentialOauthAccountCollision) {
             let newId = `${conn.id}-legacy`
@@ -1299,6 +1290,12 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
             if (conn.kind === 'remote' && conn.authMode === 'oauth') {
               const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(newId)}`
               connectionToSave.partition = `persist:${partName}`
+            } else if (conn.kind === 'cloud') {
+              ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
+              if (destHasSharedSession && legacyHasSharedSession) {
+                const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(newId)}`
+                connectionToSave.partition = `persist:${partName}`
+              }
             }
             currentRegistry.connections.push(connectionToSave)
             existingIds.add(newId)
@@ -1314,8 +1311,6 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
                 newId,
                 legacyRegistry.primary === conn.id
               )
-            } else if (conn.kind === 'cloud') {
-              ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
             }
           } else if (isRemoteOauth && legacyHasSession && !currentHasSession) {
             // Endpoints match and destination has no session yet: seed destination partition from legacy session
