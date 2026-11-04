@@ -1268,7 +1268,18 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
         } else {
           // If an ID collides, compare target endpoint configuration and credentials to avoid dropping distinct legacy connections
           const existing = currentRegistry.connections.find((c: any) => c.id === conn.id)
-          if (!areConnectionsEquivalent(existing, conn)) {
+          const isRemoteOauth = conn.kind === 'remote' && conn.authMode === 'oauth'
+          const legacyHasSession = isRemoteOauth && (
+            fs.existsSync(path.join(legacyDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`)) ||
+            (legacyRegistry.primary === conn.id && fs.existsSync(path.join(legacyDir, 'Partitions', 'hermes-remote-oauth')))
+          )
+          const currentHasSession = isRemoteOauth && (
+            fs.existsSync(path.join(currentDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`)) ||
+            (currentRegistry.primary === conn.id && fs.existsSync(path.join(currentDir, 'Partitions', 'hermes-remote-oauth')))
+          )
+          const hasPotentialOauthAccountCollision = legacyHasSession && currentHasSession
+
+          if (!areConnectionsEquivalent(existing, conn) || hasPotentialOauthAccountCollision) {
             let newId = `${conn.id}-legacy`
             let counter = 1
             while (existingIds.has(newId)) {
@@ -1296,6 +1307,15 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
             } else if (conn.kind === 'cloud') {
               ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
             }
+          } else if (isRemoteOauth && legacyHasSession && !currentHasSession) {
+            // Endpoints match and destination has no session yet: seed destination partition from legacy session
+            migrateConnectionOauthPartition(
+              legacyDir,
+              currentDir,
+              conn.id,
+              conn.id,
+              legacyRegistry.primary === conn.id
+            )
           }
         }
       }
@@ -1427,6 +1447,7 @@ function applyPendingLegacyDatabaseRestore(): void {
             if (wasTouched) {
               console.log(`[noemetra] rolling back touched database ${db.name}`)
               try {
+                let dbRestored = true
                 if (fs.existsSync(db.activePath)) {
                   fs.rmSync(db.activePath, { recursive: true, force: true })
                 }
@@ -1436,14 +1457,18 @@ function applyPendingLegacyDatabaseRestore(): void {
                   } else {
                     console.error(`[noemetra] backup missing for pre-existing database ${db.name}`)
                     allRollbacksSucceeded = false
+                    dbRestored = false
                   }
                 }
-                // Durably record completed rollback for this database before proceeding
-                db.state = 'pending'
-                db.swapped = false
-                try {
-                  fs.writeFileSync(swapTxPath, JSON.stringify(tx, null, 2), 'utf8')
-                } catch {}
+                // Record completed rollback ONLY if the database was actually restored!
+                // If restore failed or backup was missing, keep db.state marked as incomplete (AGENTS.md:75-78).
+                if (dbRestored) {
+                  db.state = 'pending'
+                  db.swapped = false
+                  try {
+                    fs.writeFileSync(swapTxPath, JSON.stringify(tx, null, 2), 'utf8')
+                  } catch {}
+                }
               } catch (rollbackDbErr) {
                 console.error(`[noemetra] failed to roll back database ${db.name}:`, rollbackDbErr)
                 allRollbacksSucceeded = false
@@ -1654,6 +1679,7 @@ function applyPendingLegacyDatabaseRestore(): void {
         const wasTouched = db.state === 'in_progress' || db.state === 'swapped'
         if (wasTouched) {
           try {
+            let dbRestored = true
             if (fs.existsSync(db.activePath)) {
               fs.rmSync(db.activePath, { recursive: true, force: true })
             }
@@ -1663,27 +1689,31 @@ function applyPendingLegacyDatabaseRestore(): void {
               } else {
                 console.error(`[noemetra] backup missing for pre-existing database ${db.name}`)
                 allRollbacksSucceeded = false
+                dbRestored = false
               }
             }
-            // Durably record completed rollback for this database before proceeding
-            db.state = 'pending'
-            db.swapped = false
-            try {
-              fs.writeFileSync(
-                swapTxPath,
-                JSON.stringify(
-                  {
-                    id: txId,
-                    action: request.action || 'restore-legacy',
-                    phase: 'swapping',
-                    databases: txDatabases
-                  },
-                  null,
-                  2
-                ),
-                'utf8'
-              )
-            } catch {}
+            // Record completed rollback ONLY if the database was actually restored!
+            // If restore failed or backup was missing, keep db.state marked as incomplete (AGENTS.md:75-78).
+            if (dbRestored) {
+              db.state = 'pending'
+              db.swapped = false
+              try {
+                fs.writeFileSync(
+                  swapTxPath,
+                  JSON.stringify(
+                    {
+                      id: txId,
+                      action: request.action || 'restore-legacy',
+                      phase: 'swapping',
+                      databases: txDatabases
+                    },
+                    null,
+                    2
+                  ),
+                  'utf8'
+                )
+              } catch {}
+            }
           } catch (rbErr) {
             console.error(`[noemetra] rollback failed for ${db.name}:`, rbErr)
             allRollbacksSucceeded = false
