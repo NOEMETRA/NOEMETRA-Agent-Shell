@@ -32,17 +32,23 @@ async function cascadeCloudAgentSession(
   url: string,
   connectionId?: string
 ): Promise<boolean> {
-  const result = await desktop.cloud!.agentSignIn(url, { connectionId })
+  const result = connectionId
+    ? await desktop.cloud!.agentSignIn(url, { connectionId })
+    : await desktop.cloud!.agentSignIn(url)
 
   return result.connected === true
 }
 
 /** True when the portal session is live, signing in (a login window) when it is not. */
 async function ensureCloudPortalSession(desktop: CloudAgentSessionBridge, connectionId?: string): Promise<boolean> {
-  const status = await desktop.cloud!.status({ connectionId })
+  const status = connectionId
+    ? await desktop.cloud!.status({ connectionId })
+    : await desktop.cloud!.status()
 
   if (!status.signedIn) {
-    const login = await desktop.cloud!.login({ connectionId })
+    const login = connectionId
+      ? await desktop.cloud!.login({ connectionId })
+      : await desktop.cloud!.login()
 
     if (!login.signedIn) {
       return false
@@ -66,7 +72,11 @@ export async function reestablishCloudAgentSession(
 ): Promise<'connected' | 'portal-incomplete'> {
   // Drop this gateway's lapsed cookies first — a dead AT/RT pair must not be
   // mistaken for a live session by the cascade or any liveness probe.
-  await desktop.oauthLogoutConnectionConfig?.(url, { connectionId })
+  if (connectionId) {
+    await desktop.oauthLogoutConnectionConfig?.(url, { connectionId })
+  } else {
+    await desktop.oauthLogoutConnectionConfig?.(url)
+  }
 
   if (!(await ensureCloudPortalSession(desktop, connectionId))) {
     return 'portal-incomplete'

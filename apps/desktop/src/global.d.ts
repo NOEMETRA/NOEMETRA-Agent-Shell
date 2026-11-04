@@ -1191,6 +1191,7 @@ export interface DesktopActiveProfile {
 }
 
 export interface DesktopConnectionConfig {
+  connectionId?: string
   envOverride: boolean
   // The saved connection mode. 'cloud' is a Hermes Cloud connection: it carries
   // a remote-shaped block (remoteUrl = the selected agent's dashboardUrl,

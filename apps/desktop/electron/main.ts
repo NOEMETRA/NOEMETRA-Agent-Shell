@@ -405,7 +405,7 @@ import { loginFlightKey, OauthLoginFlights } from './oauth-login-flights'
 import { startOauthLoginWindow } from './oauth-login-window'
 import { isExpectedOauthNavigationAbort } from './oauth-navigation'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
-import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
+import { LEGACY_OAUTH_PARTITION, normalizeForMatch, resolveOauthPartition } from './oauth-partition'
 import {
   canShowInteractiveOauthLogin,
   mintGatewayWsTicket as mintOauthGatewayWsTicket,
@@ -1239,6 +1239,24 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
     const currentRegistry = JSON.parse(fs.readFileSync(currentFile, 'utf8'))
     const legacyRegistry = JSON.parse(fs.readFileSync(legacyFile, 'utf8'))
 
+    let legacyV1RemoteUrl: string | null = null
+    try {
+      const legacyConfigPath = path.join(legacyDir, 'connection.json')
+      if (fs.existsSync(legacyConfigPath)) {
+        const legacyConfig = JSON.parse(fs.readFileSync(legacyConfigPath, 'utf8'))
+        legacyV1RemoteUrl = legacyConfig?.remote?.url || null
+      }
+    } catch {
+      // ignore
+    }
+
+    const isLegacyV1RemoteMatch = (c: any) => {
+      if (!legacyV1RemoteUrl || c.kind !== 'remote' || c.authMode !== 'oauth') return false
+      const normConn = normalizeForMatch(c.url)
+      const normV1 = normalizeForMatch(legacyV1RemoteUrl)
+      return Boolean(normConn && normV1 && normConn === normV1)
+    }
+
     if (Array.isArray(currentRegistry.connections) && Array.isArray(legacyRegistry.connections)) {
       const existingIds = new Set(currentRegistry.connections.map((c: any) => c.id))
       const existingLabels = new Set(
@@ -1272,8 +1290,12 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           existingLabels.add(label.trim().toLowerCase())
           modified = true
 
-          // If legacy primary remote connection is migrating into destination as non-primary, seed its dedicated partition from shared jar
-          if (conn.kind === 'remote' && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
+          // If legacy remote connection used the shared jar (primary or v1-matching remote), seed its dedicated partition from shared jar
+          const wasSharedRemote =
+            conn.kind === 'remote' &&
+            conn.authMode === 'oauth' &&
+            (legacyRegistry.primary === conn.id || isLegacyV1RemoteMatch(conn))
+          if (wasSharedRemote) {
             migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
           } else if (conn.kind === 'cloud' && destHasSharedSession && legacyHasSharedSession) {
             migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
@@ -1285,7 +1307,7 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           const isCloudOauth = conn.kind === 'cloud' && (conn.authMode === 'oauth' || !conn.token)
           const legacyHasSession = isRemoteOauth && (
             fs.existsSync(path.join(legacyDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`)) ||
-            (legacyRegistry.primary === conn.id && fs.existsSync(path.join(legacyDir, 'Partitions', 'hermes-remote-oauth')))
+            ((legacyRegistry.primary === conn.id || isLegacyV1RemoteMatch(conn)) && fs.existsSync(path.join(legacyDir, 'Partitions', 'hermes-remote-oauth')))
           )
           const currentHasSession = isRemoteOauth && (
             fs.existsSync(path.join(currentDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`)) ||
@@ -1329,7 +1351,7 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
                 currentDir,
                 conn.id,
                 newId,
-                legacyRegistry.primary === conn.id
+                legacyRegistry.primary === conn.id || isLegacyV1RemoteMatch(conn)
               )
             } else if (conn.kind === 'cloud' && destHasSharedSession && legacyHasSharedSession) {
               migrateConnectionOauthPartition(
@@ -10725,6 +10747,7 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
   }
 
   return {
+    connectionId: String(block.connectionId || block.id || ''),
     mode,
     // Echo the scope back so the UI knows which profile (if any) this reflects.
     profile: key,
