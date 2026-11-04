@@ -11,10 +11,13 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import tls from 'node:tls'
 import { pathToFileURL } from 'node:url'
+
+const nodeRequire = typeof require === 'function' ? require : createRequire(import.meta.url)
 
 import {
   app,
@@ -947,42 +950,44 @@ function hasActiveCookieRecords(filePath: string): boolean {
   try {
     if (!fs.existsSync(filePath)) return false
     const stat = fs.statSync(filePath)
+    if (stat.size === 0) return false
+
+    // An active write-ahead log or rollback journal with content indicates live uncommitted records
+    const walPath = `${filePath}-wal`
+    if (fs.existsSync(walPath)) {
+      try {
+        if (fs.statSync(walPath).size > 0) return true
+      } catch {}
+    }
+    const journalPath = `${filePath}-journal`
+    if (fs.existsSync(journalPath)) {
+      try {
+        if (fs.statSync(journalPath).size > 0) return true
+      } catch {}
+    }
+
     if (stat.size < 512) return false
 
-    // Method 1: Query table row count with node:sqlite
+    // Query table row count with node:sqlite
+    let db: any = null
     try {
-      const { DatabaseSync } = require('node:sqlite')
-      const db = new DatabaseSync(filePath, { readOnly: true })
-      try {
-        const row = db.prepare('SELECT COUNT(*) as count FROM cookies').get() as any
-        return Boolean(row && Number(row.count) > 0)
-      } finally {
-        db.close()
-      }
+      const { DatabaseSync } = nodeRequire('node:sqlite')
+      db = new DatabaseSync(filePath, { readOnly: true })
+      const row = db.prepare('SELECT COUNT(*) as count FROM cookies').get() as any
+      return Boolean(row && Number(row.count) > 0)
     } catch {
-      // Fallback: parse SQLite B-tree pages to count data cells
-      const buf = fs.readFileSync(filePath)
-      if (buf.length < 100 || buf.subarray(0, 16).toString('utf8') !== 'SQLite format 3\0') {
-        return false
-      }
-      let pageSize = buf.readUInt16BE(16)
-      if (pageSize === 1) pageSize = 65536
-      let leafTableCells = 0
-      for (let offset = 0; offset < buf.length; offset += pageSize) {
-        const headerOffset = offset === 0 ? 100 : offset
-        if (headerOffset + 5 <= buf.length) {
-          const pageType = buf.readUInt8(headerOffset)
-          if (pageType === 0x0d) {
-            leafTableCells += buf.readUInt16BE(headerOffset + 3)
-          }
-        }
-      }
-      // Schema metadata in sqlite_schema accounts for ~2-4 cells on empty databases.
-      // Additional cells indicate actual cookie records stored in the cookies table.
-      return leafTableCells > 4
+      // Fail closed when cookie contents cannot be verified reliably (AGENTS.md:73-77)
+      // to avoid replacing the destination's encryption key and making existing sessions unreadable.
+      return true
+    } finally {
+      try {
+        db?.close()
+      } catch {}
     }
-  } catch {}
-  return false
+  } catch {
+    // Fail closed on unexpected inspection error for an existing non-zero file
+    return true
+  }
 }
 
 function hasDatabaseContent(dbDir: string): boolean {
@@ -997,17 +1002,18 @@ function hasDatabaseContent(dbDir: string): boolean {
       }
       // SQLite state.db or other single file: probe actual table cell count or size
       if (basename.endsWith('.db')) {
+        let db: any = null
         try {
-          const { DatabaseSync } = require('node:sqlite')
-          const db = new DatabaseSync(dbDir, { readOnly: true })
-          try {
-            const row = db.prepare("SELECT COUNT(*) as count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get() as any
-            return Boolean(row && Number(row.count) > 0)
-          } finally {
-            db.close()
-          }
+          const { DatabaseSync } = nodeRequire('node:sqlite')
+          db = new DatabaseSync(dbDir, { readOnly: true })
+          const row = db.prepare("SELECT COUNT(*) as count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get() as any
+          return Boolean(row && Number(row.count) > 0)
         } catch {
-          return rootStat.size > 8192
+          return true // fail closed
+        } finally {
+          try {
+            db?.close()
+          } catch {}
         }
       }
       return rootStat.size > 4096
