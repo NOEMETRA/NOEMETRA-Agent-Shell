@@ -2079,6 +2079,35 @@ function maybeMigrateLegacyDesktopState(): void {
             }
           } else if (entry === 'connections.json') {
             reconcileConnectionsRegistry(destPath, stagedPath)
+          } else if (entry === 'Partitions') {
+            const partitionsDestDir = destPath
+            fs.mkdirSync(partitionsDestDir, { recursive: true })
+            const stagedPartitions = fs.existsSync(stagedPath) ? fs.readdirSync(stagedPath) : []
+            for (const partName of stagedPartitions) {
+              const stagedPart = path.join(stagedPath, partName)
+              const destPart = path.join(partitionsDestDir, partName)
+              if (!fs.existsSync(destPart)) {
+                fs.cpSync(stagedPart, destPart, { recursive: true })
+              } else {
+                // Both installations contain this partition: treat each partition as a cohesive database unit.
+                // Never merge internal LevelDB / SQLite files (AGENTS.md:47-48)! Preserve conflicting legacy copy separately.
+                if (hasDatabaseContent(destPart) && hasDatabaseContent(stagedPart)) {
+                  const partSidecar = path.join(partitionsDestDir, `${partName}.legacy`)
+                  if (!fs.existsSync(partSidecar)) {
+                    fs.cpSync(stagedPart, partSidecar, { recursive: true })
+                    console.log(`[noemetra] active partition preserved in Partitions/${partName}; legacy copy in Partitions/${partName}.legacy`)
+                  }
+                  preservedDatabases.push({
+                    name: path.join('Partitions', partName),
+                    legacyPreserved: path.join('Partitions', `${partName}.legacy`),
+                    activeRetained: path.join('Partitions', partName)
+                  })
+                } else if (!hasDatabaseContent(destPart) && hasDatabaseContent(stagedPart)) {
+                  fs.rmSync(destPart, { recursive: true, force: true })
+                  fs.cpSync(stagedPart, destPart, { recursive: true })
+                }
+              }
+            }
           } else {
             const stat = fs.statSync(stagedPath)
             if (stat.isDirectory()) {
@@ -2678,6 +2707,18 @@ ipcMain.handle('hermes:migration:restore-legacy-database', async (_event, dbName
     }
 
     if (databasesToRestore.length === 0) {
+      // Fallback: check standard database names for .legacy snapshots
+      for (const dName of DATABASE_DIR_NAMES) {
+        const legacyName = `${dName}.legacy`
+        if (fs.existsSync(path.join(currentDir, legacyName))) {
+          if (!dbName || dbName === 'all' || dbName === dName) {
+            databasesToRestore.push({ name: dName, legacyPreserved: legacyName })
+          }
+        }
+      }
+    }
+
+    if (databasesToRestore.length === 0) {
       return { ok: false, error: 'no legacy databases found to restore' }
     }
 
@@ -2785,7 +2826,12 @@ ipcMain.handle('hermes:migration:dismiss-recovery-info', () => {
     for (const manifestName of ['legacy-migration-recovery.json', 'legacy-migration-available.json']) {
       const manifestPath = path.join(currentDir, manifestName)
       if (fs.existsSync(manifestPath)) {
-        fs.rmSync(manifestPath, { force: true })
+        try {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+          manifest.dismissed = true
+          manifest.dismissedAt = new Date().toISOString()
+          fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8')
+        } catch {}
       }
     }
     return { ok: true }

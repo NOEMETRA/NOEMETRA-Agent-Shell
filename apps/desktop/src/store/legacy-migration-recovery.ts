@@ -10,7 +10,7 @@ export async function checkLegacyMigrationRecovery(): Promise<void> {
   }
   try {
     const info = await window.hermesDesktop.migration.getRecoveryInfo()
-    if (!info) return
+    if (!info || info.dismissed) return
 
     if (info.status === 'active-preserved-legacy-available') {
       notify({

@@ -781,6 +781,8 @@ declare global {
         getRecoveryInfo: () => Promise<null | {
           migratedAt: string
           status: string
+          dismissed?: boolean
+          dismissedAt?: string
           databases: Array<{
             name: string
             legacyPreserved: string
