@@ -1180,6 +1180,22 @@ function migrateConnectionOauthPartition(
   }
 }
 
+function ensureSharedOauthPartitionPreserved(legacyUserDataDir: string, currentUserDataDir: string): void {
+  const legacySharedPart = path.join(legacyUserDataDir, 'Partitions', 'hermes-remote-oauth')
+  const currentSharedPart = path.join(currentUserDataDir, 'Partitions', 'hermes-remote-oauth')
+  if (fs.existsSync(legacySharedPart)) {
+    try {
+      fs.mkdirSync(path.join(currentUserDataDir, 'Partitions'), { recursive: true })
+      if (!fs.existsSync(currentSharedPart)) {
+        fs.cpSync(legacySharedPart, currentSharedPart, { recursive: true })
+        console.log('[noemetra] preserved shared OAuth partition for legacy cloud connection')
+      }
+    } catch (partErr) {
+      console.warn('[noemetra] failed to preserve shared OAuth partition for legacy cloud connection:', partErr)
+    }
+  }
+}
+
 function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): void {
   if (!fs.existsSync(legacyFile)) return
   if (!fs.existsSync(currentFile)) {
@@ -1211,9 +1227,11 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           existingLabels.add(label.trim().toLowerCase())
           modified = true
 
-          // If legacy primary remote or cloud connection is migrating into destination as non-primary, seed its dedicated partition from shared jar if needed
-          if ((conn.kind === 'remote' || conn.kind === 'cloud') && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
+          // If legacy primary remote connection is migrating into destination as non-primary, seed its dedicated partition from shared jar
+          if (conn.kind === 'remote' && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
             migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
+          } else if (conn.kind === 'cloud') {
+            ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
           }
         } else {
           // If an ID collides, compare target endpoint configuration and credentials to avoid dropping distinct legacy connections
@@ -1234,8 +1252,8 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
             existingLabels.add(label.trim().toLowerCase())
             modified = true
 
-            // Preserve OAuth partition identity for renamed remote or cloud connection
-            if ((conn.kind === 'remote' || conn.kind === 'cloud') && conn.authMode === 'oauth') {
+            // Preserve OAuth partition identity for renamed remote connection, or shared jar for cloud connection
+            if (conn.kind === 'remote' && conn.authMode === 'oauth') {
               migrateConnectionOauthPartition(
                 legacyDir,
                 currentDir,
@@ -1243,6 +1261,8 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
                 newId,
                 legacyRegistry.primary === conn.id
               )
+            } else if (conn.kind === 'cloud') {
+              ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
             }
           }
         }
@@ -1381,41 +1401,36 @@ function applyPendingLegacyDatabaseRestore(): void {
                 if (db.activeExistedInitially) {
                   if (db.backupPath && fs.existsSync(db.backupPath)) {
                     fs.cpSync(db.backupPath, db.activePath, { recursive: true })
-                    // Only clean up backup after confirmed successful restore!
-                    try {
-                      fs.rmSync(db.backupPath, { recursive: true, force: true })
-                    } catch {}
                   } else {
                     console.error(`[noemetra] backup missing for pre-existing database ${db.name}`)
                     allRollbacksSucceeded = false
                   }
-                } else {
-                  // Non-pre-existing database: removing db.activePath (done above) restored initial state
-                  if (db.backupPath && fs.existsSync(db.backupPath)) {
-                    try {
-                      fs.rmSync(db.backupPath, { recursive: true, force: true })
-                    } catch {}
-                  }
                 }
-                if (allRollbacksSucceeded) {
-                  db.state = 'pending'
-                  db.swapped = false
-                }
+                // Durably record completed rollback for this database before proceeding
+                db.state = 'pending'
+                db.swapped = false
+                try {
+                  fs.writeFileSync(swapTxPath, JSON.stringify(tx, null, 2), 'utf8')
+                } catch {}
               } catch (rollbackDbErr) {
                 console.error(`[noemetra] failed to roll back database ${db.name}:`, rollbackDbErr)
                 allRollbacksSucceeded = false
               }
-            } else if (!wasTouched && db.backupPath && fs.existsSync(db.backupPath)) {
-              // Untouched database: safe to clean up its backup
-              try {
-                fs.rmSync(db.backupPath, { recursive: true, force: true })
-              } catch {}
             }
           }
         }
 
-        // Preserve the backup and transaction marker until every rollback succeeds (per AGENTS.md:73-78)
+        // Clean up backups and transaction marker ONLY after every rollback succeeds (per AGENTS.md:73-78)
         if (allRollbacksSucceeded) {
+          if (tx && Array.isArray(tx.databases)) {
+            for (const db of tx.databases) {
+              if (db.backupPath && fs.existsSync(db.backupPath)) {
+                try {
+                  fs.rmSync(db.backupPath, { recursive: true, force: true })
+                } catch {}
+              }
+            }
+          }
           try {
             fs.rmSync(swapTxPath, { force: true })
           } catch {}
@@ -1613,39 +1628,46 @@ function applyPendingLegacyDatabaseRestore(): void {
             if (db.activeExistedInitially) {
               if (fs.existsSync(db.backupPath)) {
                 fs.cpSync(db.backupPath, db.activePath, { recursive: true })
-                // Only clean up backup after confirmed successful restore!
-                try {
-                  fs.rmSync(db.backupPath, { recursive: true, force: true })
-                } catch {}
               } else {
                 console.error(`[noemetra] backup missing for pre-existing database ${db.name}`)
                 allRollbacksSucceeded = false
               }
-            } else {
-              // Non-pre-existing database: removing db.activePath (done above) restored initial state
-              if (fs.existsSync(db.backupPath)) {
-                try {
-                  fs.rmSync(db.backupPath, { recursive: true, force: true })
-                } catch {}
-              }
             }
-            if (allRollbacksSucceeded) {
-              db.state = 'pending'
-              db.swapped = false
-            }
+            // Durably record completed rollback for this database before proceeding
+            db.state = 'pending'
+            db.swapped = false
+            try {
+              fs.writeFileSync(
+                swapTxPath,
+                JSON.stringify(
+                  {
+                    id: txId,
+                    action: request.action || 'restore-legacy',
+                    phase: 'swapping',
+                    databases: txDatabases
+                  },
+                  null,
+                  2
+                ),
+                'utf8'
+              )
+            } catch {}
           } catch (rbErr) {
             console.error(`[noemetra] rollback failed for ${db.name}:`, rbErr)
             allRollbacksSucceeded = false
           }
-        } else if (!wasTouched && fs.existsSync(db.backupPath)) {
-          try {
-            fs.rmSync(db.backupPath, { recursive: true, force: true })
-          } catch {}
         }
       }
 
-      // Retain transaction record and backups if rollback encountered errors
+      // Retain transaction record and backups until every rollback succeeds (per AGENTS.md:73-78)
       if (allRollbacksSucceeded) {
+        for (const db of txDatabases) {
+          if (db.backupPath && fs.existsSync(db.backupPath)) {
+            try {
+              fs.rmSync(db.backupPath, { recursive: true, force: true })
+            } catch {}
+          }
+        }
         try {
           fs.rmSync(swapTxPath, { force: true })
         } catch {}
