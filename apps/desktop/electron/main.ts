@@ -1207,8 +1207,8 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           existingLabels.add(label.trim().toLowerCase())
           modified = true
 
-          // If legacy primary remote is migrating into destination as non-primary, seed its dedicated partition from shared jar if needed
-          if (conn.kind === 'remote' && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
+          // If legacy primary remote or cloud connection is migrating into destination as non-primary, seed its dedicated partition from shared jar if needed
+          if ((conn.kind === 'remote' || conn.kind === 'cloud') && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
             migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
           }
         } else {
@@ -1230,8 +1230,8 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
             existingLabels.add(label.trim().toLowerCase())
             modified = true
 
-            // Preserve OAuth partition identity for renamed connection
-            if (conn.kind === 'remote' && conn.authMode === 'oauth') {
+            // Preserve OAuth partition identity for renamed remote or cloud connection
+            if ((conn.kind === 'remote' || conn.kind === 'cloud') && conn.authMode === 'oauth') {
               migrateConnectionOauthPartition(
                 legacyDir,
                 currentDir,
@@ -1706,111 +1706,113 @@ function maybeMigrateLegacyDesktopState(): void {
   ) {
     return
   }
-  const legacyDir = legacyDirectoryForVariant()
-  if (!legacyDir) {
-    return
-  }
   try {
     const currentDir = app.getPath('userData')
+    const inProgressPath = path.join(currentDir, MIGRATION_IN_PROGRESS_MARKER)
+    const stagingDir = path.join(currentDir, '.migration-stage')
+    const backupDir = path.join(currentDir, MIGRATION_BACKUP_DIR)
+    const backupCompletePath = path.join(backupDir, '.backup-complete')
+
+    // Step 0: Recover interrupted migrations BEFORE anything else (per AGENTS.md:73-78).
+    // If a previous migration was interrupted after destination writes began,
+    // destination must be cleanly restored from backup regardless of whether legacyDir still exists!
+    if (fs.existsSync(inProgressPath)) {
+      let recoverySucceeded = false
+      try {
+        if (fs.existsSync(backupCompletePath)) {
+          let allStagedRemoved = true
+          if (fs.existsSync(stagingDir)) {
+            const staged = fs.readdirSync(stagingDir)
+            for (const item of staged) {
+              const target = path.join(currentDir, item)
+              const legacySidecar = path.join(currentDir, `${item}.legacy`)
+              try {
+                if (fs.existsSync(target)) {
+                  fs.rmSync(target, { recursive: true, force: true })
+                }
+                if (fs.existsSync(legacySidecar)) {
+                  fs.rmSync(legacySidecar, { recursive: true, force: true })
+                }
+              } catch (rmErr) {
+                console.error(`[noemetra] recovery failed to remove staged entry ${item} or sidecar:`, rmErr)
+                allStagedRemoved = false
+              }
+            }
+            const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+            try {
+              if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
+            } catch {}
+          }
+          if (!allStagedRemoved) {
+            console.error('[noemetra] recovery could not remove all staged destination remnants; retaining backup snapshot for retry')
+            recoverySucceeded = false
+          } else {
+            const backedUp = fs.readdirSync(backupDir)
+            let allRestored = true
+            for (const entry of backedUp) {
+              if (entry === '.backup-complete') continue
+              try {
+                fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
+              } catch (restoreErr) {
+                console.error(`[noemetra] recovery failed to restore ${entry}:`, restoreErr)
+                allRestored = false
+              }
+            }
+            recoverySucceeded = allRestored
+          }
+        }
+      } catch (err) {
+        console.error('[noemetra] recovery error:', err)
+        recoverySucceeded = false
+      }
+      if (recoverySucceeded) {
+        try {
+          fs.rmSync(backupDir, { recursive: true, force: true })
+        } catch {}
+        try {
+          fs.rmSync(inProgressPath, { force: true })
+        } catch {}
+        try {
+          fs.rmSync(stagingDir, { recursive: true, force: true })
+        } catch {}
+      } else {
+        console.error('[noemetra] interrupted-migration recovery did not complete; stopping startup to preserve snapshot for later retry')
+        try {
+          dialog.showErrorBox(
+            'Migration Recovery Interrupted',
+            'A previous migration could not be cleanly recovered. To protect your data, NOEMETRA Agent Shell cannot start until disk permissions or locks are resolved.'
+          )
+        } catch {}
+        app.exit(1)
+        return
+      }
+    } else if (fs.existsSync(stagingDir)) {
+      try {
+        fs.rmSync(stagingDir, { recursive: true, force: true })
+      } catch {
+        // ignore cleanup error
+      }
+    }
+
+    // If an incomplete backup was left behind without migration in progress, clean it up safely
+    if (fs.existsSync(backupDir) && !fs.existsSync(inProgressPath)) {
+      try {
+        fs.rmSync(backupDir, { recursive: true, force: true })
+      } catch {}
+    }
+
+    const legacyDir = legacyDirectoryForVariant()
+    if (!legacyDir) {
+      return
+    }
+
     if (path.resolve(legacyDir) !== path.resolve(currentDir) && fs.existsSync(legacyDir)) {
       const markerPath = path.join(currentDir, MIGRATION_COMPLETE_MARKER)
       if (fs.existsSync(markerPath)) {
         return
       }
 
-      const inProgressPath = path.join(currentDir, MIGRATION_IN_PROGRESS_MARKER)
       const pendingMarkerPath = path.join(currentDir, MIGRATION_PENDING_MARKER)
-      const stagingDir = path.join(currentDir, '.migration-stage')
-      const backupDir = path.join(currentDir, MIGRATION_BACKUP_DIR)
-      const backupCompletePath = path.join(backupDir, '.backup-complete')
-
-      // Step 0: Recover interrupted migrations BEFORE checking the legacy app or continuing (per AGENTS.md:73-78).
-      // If a previous migration was interrupted after destination writes began,
-      // destination must be cleanly restored from backup before checking the legacy app or proceeding.
-      if (fs.existsSync(inProgressPath)) {
-        let recoverySucceeded = false
-        try {
-          if (fs.existsSync(backupCompletePath)) {
-            let allStagedRemoved = true
-            if (fs.existsSync(stagingDir)) {
-              const staged = fs.readdirSync(stagingDir)
-              for (const item of staged) {
-                const target = path.join(currentDir, item)
-                const legacySidecar = path.join(currentDir, `${item}.legacy`)
-                try {
-                  if (fs.existsSync(target)) {
-                    fs.rmSync(target, { recursive: true, force: true })
-                  }
-                  if (fs.existsSync(legacySidecar)) {
-                    fs.rmSync(legacySidecar, { recursive: true, force: true })
-                  }
-                } catch (rmErr) {
-                  console.error(`[noemetra] recovery failed to remove staged entry ${item} or sidecar:`, rmErr)
-                  allStagedRemoved = false
-                }
-              }
-              const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
-              try {
-                if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
-              } catch {}
-            }
-            if (!allStagedRemoved) {
-              console.error('[noemetra] recovery could not remove all staged destination remnants; retaining backup snapshot for retry')
-              recoverySucceeded = false
-            } else {
-              const backedUp = fs.readdirSync(backupDir)
-              let allRestored = true
-              for (const entry of backedUp) {
-                if (entry === '.backup-complete') continue
-                try {
-                  fs.cpSync(path.join(backupDir, entry), path.join(currentDir, entry), { recursive: true })
-                } catch (restoreErr) {
-                  console.error(`[noemetra] recovery failed to restore ${entry}:`, restoreErr)
-                  allRestored = false
-                }
-              }
-              recoverySucceeded = allRestored
-            }
-          }
-        } catch (err) {
-          console.error('[noemetra] recovery error:', err)
-          recoverySucceeded = false
-        }
-        if (recoverySucceeded) {
-          try {
-            fs.rmSync(backupDir, { recursive: true, force: true })
-          } catch {}
-          try {
-            fs.rmSync(inProgressPath, { force: true })
-          } catch {}
-          try {
-            fs.rmSync(stagingDir, { recursive: true, force: true })
-          } catch {}
-        } else {
-          console.error('[noemetra] interrupted-migration recovery did not complete; stopping startup to preserve snapshot for later retry')
-          try {
-            dialog.showErrorBox(
-              'Migration Recovery Interrupted',
-              'A previous migration could not be cleanly recovered. To protect your data, NOEMETRA Agent Shell cannot start until disk permissions or locks are resolved.'
-            )
-          } catch {}
-          app.exit(1)
-          return
-        }
-      } else if (fs.existsSync(stagingDir)) {
-        try {
-          fs.rmSync(stagingDir, { recursive: true, force: true })
-        } catch {
-          // ignore cleanup error
-        }
-      }
-
-      // If an incomplete backup was left behind without migration in progress, clean it up safely
-      if (fs.existsSync(backupDir) && !fs.existsSync(inProgressPath)) {
-        try {
-          fs.rmSync(backupDir, { recursive: true, force: true })
-        } catch {}
-      }
 
       // Coordinate with legacy app: require it to be closed before copying databases
       // to ensure consistent, quiescent LevelDB and Local Storage snapshots.
