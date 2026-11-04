@@ -224,14 +224,17 @@ export function buildLegacyUrlToConnectionMap(legacyRegistry: any): Map<string, 
  * Active destination entries take precedence over legacy entries on key collisions.
  * Unscoped legacy tokens are scoped to their original connection from the legacy registry
  * so they cannot collide with or be appropriated by destination connections.
+ * Legacy unscoped tokens whose owning connection cannot be unambiguously identified are
+ * quarantined to prevent cross-account credential leakage (apps/desktop/AGENTS.md:46-48).
  */
 export function mergeNativeTokenStoreObjects(
   legacyStore: Record<string, any>,
   currentStore: Record<string, any>,
   idRemap: Map<string, string> = new Map(),
   legacyUrlToConnId: Map<string, string> = new Map()
-): { merged: Record<string, any>; modified: boolean } {
+): { merged: Record<string, any>; quarantined: Record<string, any>; modified: boolean } {
   const merged: Record<string, any> = { ...currentStore }
+  const quarantined: Record<string, any> = {}
   let modified = false
 
   for (const [key, value] of Object.entries(legacyStore)) {
@@ -241,12 +244,18 @@ export function mergeNativeTokenStoreObjects(
       const mappedId = idRemap.get(connId) || connId
       targetKey = `${urlPart}#conn=${mappedId}`
     } else {
-      // Unscoped legacy key (bare URL): check if legacy registry had an owning connection for this URL
+      // Unscoped legacy key (bare URL): check if legacy registry had an unambiguous owning connection for this URL
       const normKey = safeNormalizeUrl(key)
-      const legacyConnId = legacyUrlToConnId.get(normKey) || legacyUrlToConnId.get(key)
+      const legacyConnId = (normKey && legacyUrlToConnId.get(normKey)) || legacyUrlToConnId.get(key)
       if (legacyConnId) {
         const mappedId = idRemap.get(legacyConnId) || legacyConnId
-        targetKey = `${normKey}#conn=${mappedId}`
+        targetKey = `${normKey || key}#conn=${mappedId}`
+      } else {
+        // Ambiguous ownership: multiple legacy connections share this URL (or none matched).
+        // Per AGENTS.md:46-48, never import ambiguous credentials into the active unscoped store
+        // where another connection could claim them. Quarantine them for recovery instead.
+        quarantined[key] = value
+        continue
       }
     }
     if (!merged[targetKey]) {
@@ -255,5 +264,5 @@ export function mergeNativeTokenStoreObjects(
     }
   }
 
-  return { merged, modified }
+  return { merged, quarantined, modified }
 }
