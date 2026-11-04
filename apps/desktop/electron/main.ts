@@ -9674,10 +9674,9 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
             c.url &&
             normalizeRemoteBaseUrl(c.url) === normUrl
         )
-        const isPrimary = registry?.primary === cid
-        const isSoleMatch = connectionsForUrl.length === 1 && connectionsForUrl[0]?.id === cid
+        const isUnambiguousOwner = connectionsForUrl.length === 1 && connectionsForUrl[0]?.id === cid
 
-        if (isPrimary || isSoleMatch) {
+        if (isUnambiguousOwner) {
           const legacyTokens = _loadNativeTokens(normUrl)
           if (legacyTokens) {
             if (_storeNativeTokens(scopedKey, legacyTokens)) {
@@ -9701,22 +9700,24 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
   // or to the unambiguous sole connection for this baseUrl (#P2).
   try {
     const registry = readDesktopConnectionsRegistry()
+    const connectionsForUrl = (registry?.connections || []).filter(
+      (c: any) =>
+        c &&
+        (c.kind === 'remote' || c.kind === 'cloud') &&
+        c.url &&
+        normalizeRemoteBaseUrl(c.url) === normUrl
+    )
+
     const primaryId = registry?.primary
     if (primaryId) {
-      const primaryConn = (registry?.connections || []).find((c: any) => c && c.id === primaryId)
-      const primaryMatchesUrl =
-        primaryConn &&
-        (primaryConn.kind === 'remote' || primaryConn.kind === 'cloud') &&
-        primaryConn.url &&
-        normalizeRemoteBaseUrl(primaryConn.url) === normUrl
-
-      if (primaryMatchesUrl) {
+      const primaryConn = connectionsForUrl.find((c: any) => c && c.id === primaryId)
+      if (primaryConn) {
         const primaryScopedKey = `${normUrl}#conn=${primaryId}`
         if (_loadNativeTokens(primaryScopedKey) !== null) {
           return primaryScopedKey
         }
-        // Migrate unambiguous legacy token on baseUrl to the primary connection
-        if (_loadNativeTokens(normUrl) !== null) {
+        // Only migrate legacy unscoped token if primary is the unambiguous sole connection for this URL
+        if (connectionsForUrl.length === 1 && _loadNativeTokens(normUrl) !== null) {
           const legacyTokens = _loadNativeTokens(normUrl)
           if (legacyTokens) {
             if (_storeNativeTokens(primaryScopedKey, legacyTokens)) {
@@ -9729,13 +9730,6 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
     }
 
     // If primary does not match baseUrl, check if there is an unambiguous sole connection for this baseUrl
-    const connectionsForUrl = (registry?.connections || []).filter(
-      (c: any) =>
-        c &&
-        (c.kind === 'remote' || c.kind === 'cloud') &&
-        c.url &&
-        normalizeRemoteBaseUrl(c.url) === normUrl
-    )
     if (connectionsForUrl.length === 1 && connectionsForUrl[0]?.id) {
       const soleId = connectionsForUrl[0].id
       const soleScopedKey = `${normUrl}#conn=${soleId}`
