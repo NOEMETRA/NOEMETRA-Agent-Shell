@@ -280,7 +280,10 @@ declare global {
         status: (opts?: { connectionId?: string; partition?: string }) => Promise<DesktopCloudStatus>
         login: (opts?: { connectionId?: string; partition?: string }) => Promise<DesktopCloudStatus & { ok: boolean }>
         logout: (opts?: { connectionId?: string; partition?: string }) => Promise<DesktopCloudStatus & { ok: boolean }>
-        discover: (org?: string) => Promise<DesktopCloudDiscoverResult>
+        discover: (
+          org?: string,
+          opts?: { connectionId?: string; partition?: string }
+        ) => Promise<DesktopCloudDiscoverResult>
         agentSignIn: (
           dashboardUrl: string,
           opts?: { connectionId?: string }

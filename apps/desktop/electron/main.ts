@@ -9534,10 +9534,18 @@ const { hasLivePortalSession, hasPortalAccessToken, renewPortalAccessSilently, o
 // org_selection_required). Pass `org` (a slug/id from a prior org list) to
 // scope discovery to that org. Throws a needsCloudLogin-tagged error when no
 // portal session is present.
-async function discoverCloudAgents(org?: string) {
+async function discoverCloudAgents(org?: string, opts?: { connectionId?: string; partition?: string }) {
   const portalBaseUrl = resolvePortalBaseUrl()
+  const connectionId = typeof opts?.connectionId === 'string' ? opts.connectionId : ''
+  let portalPartition = typeof opts?.partition === 'string' && opts.partition ? opts.partition : undefined
+  if (!portalPartition && connectionId) {
+    const resolved = resolveOauthPartitionForUrl(portalBaseUrl, { connectionId })
+    if (resolved !== OAUTH_SESSION_PARTITION) {
+      portalPartition = resolved
+    }
+  }
 
-  if (!(await hasLivePortalSession())) {
+  if (!(await hasLivePortalSession(portalPartition))) {
     const err = new Error(
       'You are not signed in to Hermes Cloud. Open Settings → Gateway, choose Hermes Cloud, and sign in.'
     ) as any
@@ -9548,8 +9556,8 @@ async function discoverCloudAgents(org?: string) {
 
   // Access cookies expire before refresh credentials. Let the portal renew
   // whichever session this browser currently holds before discovery.
-  if (!(await hasPortalAccessToken())) {
-    await renewPortalAccessSilently()
+  if (!(await hasPortalAccessToken(portalPartition))) {
+    await renewPortalAccessSilently({ partition: portalPartition })
   }
 
   let body
@@ -9561,7 +9569,8 @@ async function discoverCloudAgents(org?: string) {
           `${portalBaseUrl}/api/agents${selectedOrg ? `?org=${encodeURIComponent(selectedOrg)}` : ''}`,
           {
             method: 'GET',
-            timeoutMs: 15_000
+            timeoutMs: 15_000,
+            connectionId: connectionId || undefined
           }
         ),
       org
@@ -9577,7 +9586,7 @@ async function discoverCloudAgents(org?: string) {
     // interactive re-login while a 30-day refresh session sits unused. Only a
     // rejected/failed renewal (or a second 401 on genuinely fresh access)
     // falls through to needsCloudLogin.
-    if (error && error.statusCode === 401 && (await renewPortalAccessSilently({ force: true }))) {
+    if (error && error.statusCode === 401 && (await renewPortalAccessSilently({ force: true, partition: portalPartition }))) {
       try {
         body = (await fetchAgents()) as any
       } catch (retryError) {
@@ -17344,10 +17353,17 @@ ipcMain.handle('hermes:cloud:logout', async (_event, opts?: { connectionId?: str
 
   return { ok: true, signedIn: await hasLivePortalSession(partition) }
 })
-ipcMain.handle('hermes:cloud:discover', async (_event, org) => {
+ipcMain.handle('hermes:cloud:discover', async (_event, org, opts?: { connectionId?: string; partition?: string }) => {
   // Returns { agents } or { needsOrgSelection: true, orgs }. `org` (optional)
   // scopes discovery to a chosen org for multi-org users.
-  return discoverCloudAgents(typeof org === 'string' && org ? org : undefined)
+  let selectedOrg: string | undefined = undefined
+  let options = opts
+  if (typeof org === 'string' && org) {
+    selectedOrg = org
+  } else if (typeof org === 'object' && org !== null) {
+    options = org
+  }
+  return discoverCloudAgents(selectedOrg, options)
 })
 ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl, opts?: { connectionId?: string }) => {
   // Silent per-agent sign-in via the shared or dedicated portal session. Returns the agent's

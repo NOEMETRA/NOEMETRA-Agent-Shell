@@ -333,7 +333,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     status: opts => ipcRenderer.invoke('hermes:cloud:status', opts),
     login: opts => ipcRenderer.invoke('hermes:cloud:login', opts),
     logout: opts => ipcRenderer.invoke('hermes:cloud:logout', opts),
-    discover: org => ipcRenderer.invoke('hermes:cloud:discover', org),
+    discover: (org, opts) => ipcRenderer.invoke('hermes:cloud:discover', org, opts),
     agentSignIn: (dashboardUrl, opts) => ipcRenderer.invoke('hermes:cloud:agent-sign-in', dashboardUrl, opts)
   },
   profile: {

@@ -4,13 +4,18 @@
  */
 import { notify } from '@/store/notifications'
 
-export async function checkLegacyMigrationRecovery(): Promise<void> {
+export interface LegacyMigrationRecoveryOptions {
+  force?: boolean
+}
+
+export async function checkLegacyMigrationRecovery(options?: LegacyMigrationRecoveryOptions): Promise<void> {
   if (typeof window === 'undefined' || !window.hermesDesktop?.migration?.getRecoveryInfo) {
     return
   }
   try {
     const info = await window.hermesDesktop.migration.getRecoveryInfo()
-    if (!info || info.dismissed) return
+    if (!info) return
+    if (info.dismissed && !options?.force) return
 
     if (info.status === 'active-preserved-legacy-available') {
       notify({
@@ -74,6 +79,10 @@ export async function checkLegacyMigrationRecovery(): Promise<void> {
   } catch {
     // Non-blocking recovery check
   }
+}
+
+export async function reopenLegacyMigrationRecovery(): Promise<void> {
+  return checkLegacyMigrationRecovery({ force: true })
 }
 
 if (typeof window !== 'undefined') {

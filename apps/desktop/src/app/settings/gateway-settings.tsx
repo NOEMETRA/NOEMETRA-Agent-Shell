@@ -48,6 +48,7 @@ import { cloudTeamChanged, reconnectMovedCloudAgent } from './cloud-team-change'
 import { ConnectionsRegistrySection } from './connections-registry'
 import { CONTROL_TEXT } from './constants'
 import { KeychainEncryptionSetting, useKeychainEncryption } from './keychain-encryption-setting'
+import { LegacyMigrationRecoverySection } from './legacy-migration-recovery-section'
 import { ManagedUpdatesSection } from './managed-updates-section'
 import { EmptyState, ListRow, Pill, SettingsContent, SettingsSkeleton } from './primitives'
 import { SETTING_IDS, settingElementId } from './settings-manifest'
@@ -639,7 +640,10 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
     setCloudDiscover('loading')
 
     try {
-      const result = await desktop.cloud.discover(org)
+      const result = await desktop.cloud.discover(
+        org,
+        activeConnectionId ? { connectionId: activeConnectionId } : undefined
+      )
 
       if (seq !== contextSeq.current) {
         return
@@ -880,9 +884,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
         return
       }
 
-      const result = await desktop.cloud.agentSignIn(agent.dashboardUrl, {
-        connectionId: activeConnectionId || undefined
-      })
+      const result = await desktop.cloud.agentSignIn(agent.dashboardUrl)
 
       if (seq !== contextSeq.current) {
         return
@@ -1461,6 +1463,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
       {embedded ? null : (
         <div className="mt-6 grid gap-1">
           <KeychainEncryptionSetting keychain={keychainEncryption} />
+          <LegacyMigrationRecoverySection />
           <ListRow
             action={
               <Button onClick={() => void window.hermesDesktop?.revealLogs()} size="sm" variant="textStrong">
