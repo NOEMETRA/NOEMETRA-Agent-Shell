@@ -9752,6 +9752,13 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
         }
       }
     }
+
+    // When multiple connections share this URL, an unscoped token cannot be deterministically
+    // attributed to any single connection. Return an unassigned scoped key so an unscoped caller
+    // cannot accidentally select an ambiguous credential (#P2).
+    if (connectionsForUrl.length > 1) {
+      return `${normUrl}#conn=ambiguous`
+    }
   } catch {}
 
   return normUrl
