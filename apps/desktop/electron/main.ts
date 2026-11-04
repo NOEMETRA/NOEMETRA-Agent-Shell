@@ -1316,27 +1316,44 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
 
       for (const conn of legacyRegistry.connections) {
         if (!existingIds.has(conn.id)) {
+          let targetId = conn.id
           let label = conn.label || conn.id
           if (existingLabels.has(label.trim().toLowerCase())) {
             label = `${label} (Legacy)`
           }
-          const connectionToSave = { ...conn, label }
-          if (conn.kind === 'remote' && conn.authMode === 'oauth') {
-            const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`
+
+          // If destination retains an orphaned OAuth partition on disk with active data
+          // for this ID (e.g. from an earlier deleted connection), allocate a fresh unique
+          // ID and partition so the imported connection is isolated from previous cookies (AGENTS.md:46-48).
+          const isRemoteOauth = conn.kind === 'remote' && conn.authMode === 'oauth'
+          const isCloudIsolated = conn.kind === 'cloud' && destHasSharedSession && legacyHasSharedSession
+          if (isRemoteOauth || isCloudIsolated) {
+            let partDir = path.join(currentDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(targetId)}`)
+            if (fs.existsSync(partDir) && hasDatabaseContent(partDir)) {
+              let counter = 1
+              while (
+                existingIds.has(targetId) ||
+                (fs.existsSync(partDir) && hasDatabaseContent(partDir))
+              ) {
+                targetId = `${conn.id}-imported-${counter++}`
+                partDir = path.join(currentDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(targetId)}`)
+              }
+            }
+          }
+
+          const connectionToSave = { ...conn, id: targetId, label }
+          if (isRemoteOauth) {
+            const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(targetId)}`
             connectionToSave.partition = `persist:${partName}`
           } else if (conn.kind === 'cloud') {
             ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
-            if (destHasSharedSession && legacyHasSharedSession) {
-              // Preserve account boundary (AGENTS.md:46-48, 86-91): if destination already has an active
-              // cloud OAuth session, a legacy cloud OAuth connection cannot ride destination's account.
-              // Assign an isolated partition to require explicit reauth, while keeping the connection
-              // actionable in the user's workspace.
-              const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`
+            if (isCloudIsolated) {
+              const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(targetId)}`
               connectionToSave.partition = `persist:${partName}`
             }
           }
           currentRegistry.connections.push(connectionToSave)
-          existingIds.add(conn.id)
+          existingIds.add(targetId)
           existingLabels.add(label.trim().toLowerCase())
           modified = true
 
@@ -1346,9 +1363,11 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
             conn.authMode === 'oauth' &&
             (legacyRegistry.primary === conn.id || isLegacyV1RemoteMatch(conn))
           if (wasSharedRemote) {
-            migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
-          } else if (conn.kind === 'cloud' && destHasSharedSession && legacyHasSharedSession) {
-            migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
+            migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, targetId, true)
+          } else if (isRemoteOauth) {
+            migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, targetId, false)
+          } else if (isCloudIsolated) {
+            migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, targetId, true)
           }
         } else {
           // If an ID collides, compare target endpoint configuration and credentials to avoid dropping distinct legacy connections
@@ -2395,11 +2414,9 @@ function maybeMigrateLegacyDesktopState(): void {
                   fs.copyFileSync(stagedPath, path.join(currentDir, 'Local State.legacy'))
                 } catch {}
                 console.warn('[noemetra] active destination cookies use different Local State key than legacy; legacy sessions will require reauthentication')
-                preservedDatabases.push({
-                  name: 'Local State',
-                  legacyPreserved: 'Local State.legacy',
-                  activeRetained: 'Local State'
-                })
+                // Note: Local State is intentionally excluded from bulk UI recovery (preservedDatabases)
+                // because bulk recovery restores LevelDB/IndexedDB data, whereas swapping Local State would
+                // decouple the destination encryption key from active destination OAuth partitions (AGENTS.md:46-48).
               }
             }
           } else {
