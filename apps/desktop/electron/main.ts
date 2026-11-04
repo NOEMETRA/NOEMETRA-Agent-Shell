@@ -1238,11 +1238,27 @@ function backupPreMigrationDestination(currentDir: string, backupDir: string): b
   }
 }
 
-function rollbackMigrationDestination(currentDir: string, backupDir: string, stagedEntries: string[]): boolean {
+function rollbackMigrationDestination(
+  currentDir: string,
+  backupDir: string,
+  stagedEntries: string[],
+  generatedEntries: string[] = []
+): boolean {
   try {
     let allStagedCleaned = true
+    const backedUpSet = fs.existsSync(backupDir) ? new Set(fs.readdirSync(backupDir)) : new Set<string>()
+    const toRemove = new Set<string>([...stagedEntries, ...generatedEntries])
+
+    // If backupDir did not have connections.json or quarantine file, ensure any newly generated file is removed
+    if (!backedUpSet.has('connections.json') && fs.existsSync(path.join(currentDir, 'connections.json'))) {
+      toRemove.add('connections.json')
+    }
+    if (!backedUpSet.has('native-oauth-tokens.quarantine.json') && fs.existsSync(path.join(currentDir, 'native-oauth-tokens.quarantine.json'))) {
+      toRemove.add('native-oauth-tokens.quarantine.json')
+    }
+
     // First remove any entries copied into currentDir from staging and their legacy sidecars
-    for (const entry of stagedEntries) {
+    for (const entry of toRemove) {
       const target = path.join(currentDir, entry)
       const legacySidecar = path.join(currentDir, `${entry}.legacy`)
       try {
@@ -1253,18 +1269,24 @@ function rollbackMigrationDestination(currentDir: string, backupDir: string, sta
           fs.rmSync(legacySidecar, { recursive: true, force: true })
         }
       } catch (rmErr) {
-        console.error(`[noemetra] rollback failed to remove staged entry ${entry} or sidecar:`, rmErr)
+        console.error(`[noemetra] rollback failed to remove staged/generated entry ${entry} or sidecar:`, rmErr)
         allStagedCleaned = false
       }
     }
-    const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
-    try {
-      if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
-    } catch {}
-    const markerPath = path.join(currentDir, MIGRATION_COMPLETE_MARKER)
-    try {
-      if (fs.existsSync(markerPath)) fs.rmSync(markerPath, { force: true })
-    } catch {}
+
+    const recoveryCopies = [
+      path.join(currentDir, 'connections.legacy.json'),
+      path.join(currentDir, 'connection.legacy.json'),
+      path.join(currentDir, 'Local State.legacy'),
+      path.join(currentDir, 'Local State.intervening'),
+      path.join(currentDir, 'legacy-migration-recovery.json'),
+      path.join(currentDir, MIGRATION_COMPLETE_MARKER)
+    ]
+    for (const file of recoveryCopies) {
+      try {
+        if (fs.existsSync(file)) fs.rmSync(file, { force: true })
+      } catch {}
+    }
 
     // Clean up any staging sidecars
     if (fs.existsSync(currentDir)) {
@@ -1280,7 +1302,7 @@ function rollbackMigrationDestination(currentDir: string, backupDir: string, sta
     }
 
     if (!allStagedCleaned) {
-      console.error('[noemetra] rollback could not remove all staged destination remnants')
+      console.error('[noemetra] rollback could not remove all staged/generated destination remnants')
       return false
     }
     // Restore original pre-migration destination state from backupDir so no existing user data is deleted
@@ -2486,33 +2508,72 @@ function maybeMigrateLegacyDesktopState(): void {
       try {
         if (fs.existsSync(backupCompletePath)) {
           let allStagedRemoved = true
+          const backedUp = fs.readdirSync(backupDir)
+          const backedUpSet = new Set(backedUp)
+          const toRemove = new Set<string>()
+
           if (fs.existsSync(stagingDir)) {
             const staged = fs.readdirSync(stagingDir)
             for (const item of staged) {
-              const target = path.join(currentDir, item)
-              const legacySidecar = path.join(currentDir, `${item}.legacy`)
-              try {
-                if (fs.existsSync(target)) {
-                  fs.rmSync(target, { recursive: true, force: true })
-                }
-                if (fs.existsSync(legacySidecar)) {
-                  fs.rmSync(legacySidecar, { recursive: true, force: true })
-                }
-              } catch (rmErr) {
-                console.error(`[noemetra] recovery failed to remove staged entry ${item} or sidecar:`, rmErr)
-                allStagedRemoved = false
-              }
+              toRemove.add(item)
             }
-            const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+          }
+
+          // If backup snapshot did not have connections.json or quarantine file, ensure any
+          // newly generated registry or quarantine file created during the interrupted migration is removed
+          if (!backedUpSet.has('connections.json') && fs.existsSync(path.join(currentDir, 'connections.json'))) {
+            toRemove.add('connections.json')
+          }
+          if (!backedUpSet.has('native-oauth-tokens.quarantine.json') && fs.existsSync(path.join(currentDir, 'native-oauth-tokens.quarantine.json'))) {
+            toRemove.add('native-oauth-tokens.quarantine.json')
+          }
+
+          for (const item of toRemove) {
+            const target = path.join(currentDir, item)
+            const legacySidecar = path.join(currentDir, `${item}.legacy`)
             try {
-              if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
+              if (fs.existsSync(target)) {
+                fs.rmSync(target, { recursive: true, force: true })
+              }
+              if (fs.existsSync(legacySidecar)) {
+                fs.rmSync(legacySidecar, { recursive: true, force: true })
+              }
+            } catch (rmErr) {
+              console.error(`[noemetra] recovery failed to remove staged/generated entry ${item} or sidecar:`, rmErr)
+              allStagedRemoved = false
+            }
+          }
+
+          const recoveryCopies = [
+            path.join(currentDir, 'connections.legacy.json'),
+            path.join(currentDir, 'connection.legacy.json'),
+            path.join(currentDir, 'Local State.legacy'),
+            path.join(currentDir, 'Local State.intervening'),
+            path.join(currentDir, 'legacy-migration-recovery.json'),
+            path.join(currentDir, MIGRATION_COMPLETE_MARKER)
+          ]
+          for (const file of recoveryCopies) {
+            try {
+              if (fs.existsSync(file)) fs.rmSync(file, { force: true })
             } catch {}
           }
+
+          // Clean up any staging sidecars in currentDir
+          if (fs.existsSync(currentDir)) {
+            const remaining = fs.readdirSync(currentDir)
+            for (const item of remaining) {
+              if (item.startsWith('.legacy-stage-') || item.includes('.legacy-stage-')) {
+                try {
+                  fs.rmSync(path.join(currentDir, item), { recursive: true, force: true })
+                } catch {}
+              }
+            }
+          }
+
           if (!allStagedRemoved) {
-            console.error('[noemetra] recovery could not remove all staged destination remnants; retaining backup snapshot for retry')
+            console.error('[noemetra] recovery could not remove all staged/generated destination remnants; retaining backup snapshot for retry')
             recoverySucceeded = false
           } else {
-            const backedUp = fs.readdirSync(backupDir)
             let allRestored = true
             for (const entry of backedUp) {
               if (entry === '.backup-complete') continue
@@ -2659,6 +2720,7 @@ function maybeMigrateLegacyDesktopState(): void {
       // Only mark migration in progress after confirmed complete backup
       fs.writeFileSync(inProgressPath, '1\n', 'utf8')
       let rollbackFailed = false
+      const generatedEntries: string[] = []
 
       try {
         // Step 3: Transfer staging into currentDir.
@@ -2681,15 +2743,24 @@ function maybeMigrateLegacyDesktopState(): void {
         // are known before processing credentials and databases (AGENTS.md:46-48).
         // If legacy has connections.json, reconcile it directly; if legacy only has
         // v1 connection.json, reconcile its converted registry into destination connections.json.
+        const destHadRegistryInitially = fs.existsSync(path.join(currentDir, 'connections.json'))
+        const destHadQuarantineInitially = fs.existsSync(path.join(currentDir, 'native-oauth-tokens.quarantine.json'))
+
         let connectionIdRemap = new Map<string, string>()
         if (stagedEntries.includes('connections.json')) {
           const stagedConnPath = path.join(stagingDir, 'connections.json')
           const destConnPath = path.join(currentDir, 'connections.json')
           connectionIdRemap = reconcileConnectionsRegistry(destConnPath, stagedConnPath, destHadSharedSessionInitially)
+          if (!destHadRegistryInitially && fs.existsSync(destConnPath)) {
+            generatedEntries.push('connections.json')
+          }
         } else if (stagedEntries.includes('connection.json')) {
           const stagedConnPath = path.join(stagingDir, 'connection.json')
           const destConnPath = path.join(currentDir, 'connections.json')
           connectionIdRemap = reconcileConnectionsRegistry(destConnPath, stagedConnPath, destHadSharedSessionInitially)
+          if (!destHadRegistryInitially && fs.existsSync(destConnPath)) {
+            generatedEntries.push('connections.json')
+          }
         }
 
         for (const entry of stagedEntries) {
@@ -2708,6 +2779,9 @@ function maybeMigrateLegacyDesktopState(): void {
             continue
           } else if (entry === 'native-oauth-tokens.json') {
             mergeNativeOAuthTokenStores(stagingDir, currentDir, connectionIdRemap)
+            if (!destHadQuarantineInitially && fs.existsSync(path.join(currentDir, 'native-oauth-tokens.quarantine.json'))) {
+              generatedEntries.push('native-oauth-tokens.quarantine.json')
+            }
             continue
           }
 
@@ -2890,7 +2964,7 @@ function maybeMigrateLegacyDesktopState(): void {
       } catch (copyErr) {
         // Roll back destination copy on failure (per AGENTS.md authoritative write failure policy):
         // Restore pre-migration destination state from backupDir so no existing user state is lost.
-        const rollbackSucceeded = rollbackMigrationDestination(currentDir, backupDir, stagedEntries)
+        const rollbackSucceeded = rollbackMigrationDestination(currentDir, backupDir, stagedEntries, generatedEntries)
         if (rollbackSucceeded) {
           try {
             fs.rmSync(inProgressPath, { force: true })
