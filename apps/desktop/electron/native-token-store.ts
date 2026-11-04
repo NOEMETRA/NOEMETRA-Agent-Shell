@@ -166,13 +166,19 @@ export function loadNativeTokenSet(baseUrl: string, io: NativeTokenStoreIo): Nat
 
 function safeNormalizeUrl(raw: unknown): string {
   try {
-    const s = String(raw || '').trim()
+    let s = String(raw || '').trim()
     if (!s) return ''
-    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`
-    const parsed = new URL(withScheme)
-    return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
+      s = `http://${s}`
+    }
+    const parsed = new URL(s)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
+    parsed.hash = ''
+    parsed.search = ''
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '')
+    return parsed.toString().replace(/\/+$/, '')
   } catch {
-    return String(raw || '').trim()
+    return ''
   }
 }
 

@@ -457,16 +457,35 @@ test('mergeNativeTokenStoreObjects scopes unscoped legacy tokens to imported con
   assert.equal(merged['https://other.example.com#conn=legacy-other'].value, 'legacy-other-unscoped')
 })
 
-test('mergeNativeTokenStoreObjects reports modified false when all legacy keys already exist in destination', () => {
+test('mergeNativeTokenStoreObjects preserves userinfo in gateway URLs during token key remapping', () => {
+  const userinfoUrl = 'https://alice:secret@gw.example.com:8080/hermes/'
+  const legacyRegistry = {
+    primary: 'cred-conn',
+    connections: [
+      { id: 'cred-conn', kind: 'remote', url: userinfoUrl }
+    ]
+  }
+
   const legacyStore = {
-    'https://gw.example.com#conn=c1': { encoding: 'safeStorage', value: 'old' }
-  }
-  const currentStore = {
-    'https://gw.example.com#conn=c1': { encoding: 'safeStorage', value: 'new' }
+    'https://alice:secret@gw.example.com:8080/hermes': { encoding: 'safeStorage', value: 'secret-tokens' }
   }
 
-  const { merged, modified } = mergeNativeTokenStoreObjects(legacyStore, currentStore)
+  const currentStore = {}
+  const legacyUrlToConnId = buildLegacyUrlToConnectionMap(legacyRegistry)
 
-  assert.equal(modified, false)
-  assert.equal(merged['https://gw.example.com#conn=c1'].value, 'new')
+  const idRemap = new Map<string, string>([
+    ['cred-conn', 'cred-conn-imported-1']
+  ])
+
+  const { merged, modified } = mergeNativeTokenStoreObjects(
+    legacyStore,
+    currentStore,
+    idRemap,
+    legacyUrlToConnId
+  )
+
+  assert.equal(modified, true)
+  // Scoped key must retain the exact user:password@ credentials matching runtime lookup:
+  const expectedKey = 'https://alice:secret@gw.example.com:8080/hermes#conn=cred-conn-imported-1'
+  assert.equal(merged[expectedKey]?.value, 'secret-tokens')
 })

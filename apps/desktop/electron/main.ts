@@ -1603,20 +1603,36 @@ function mergeNativeOAuthTokenStores(
 
   try {
     const legacyRaw = fs.readFileSync(legacyStorePath, 'utf8')
-    const legacyJson = JSON.parse(legacyRaw)
-    if (!legacyJson || typeof legacyJson !== 'object' || Array.isArray(legacyJson)) return
+    let legacyJson: any
+    try {
+      legacyJson = JSON.parse(legacyRaw)
+    } catch (parseErr) {
+      throw new Error(`Corrupted legacy native token store at ${legacyStorePath}: ${parseErr}`)
+    }
+    if (!legacyJson || typeof legacyJson !== 'object' || Array.isArray(legacyJson)) {
+      throw new Error(`Invalid legacy native token store format at ${legacyStorePath}`)
+    }
 
     let currentJson: Record<string, any> = {}
     let destExisted = false
     if (fs.existsSync(currentStorePath)) {
+      let currentRaw: string
       try {
-        const currentRaw = fs.readFileSync(currentStorePath, 'utf8')
-        const parsed = JSON.parse(currentRaw)
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          currentJson = parsed
-          destExisted = true
-        }
-      } catch {}
+        currentRaw = fs.readFileSync(currentStorePath, 'utf8')
+      } catch (readErr) {
+        throw new Error(`Failed to read destination native token store at ${currentStorePath}: ${readErr}`)
+      }
+      let parsed: any
+      try {
+        parsed = JSON.parse(currentRaw)
+      } catch (parseErr) {
+        throw new Error(`Corrupted destination native token store at ${currentStorePath}; refusing to overwrite: ${parseErr}`)
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(`Invalid destination native token store format at ${currentStorePath}; refusing to overwrite`)
+      }
+      currentJson = parsed
+      destExisted = true
     }
 
     let legacyUrlToConnId = new Map<string, string>()
@@ -1625,7 +1641,9 @@ function mergeNativeOAuthTokenStores(
       try {
         const legacyReg = JSON.parse(fs.readFileSync(legacyConnFile, 'utf8'))
         legacyUrlToConnId = buildLegacyUrlToConnectionMap(legacyReg)
-      } catch {}
+      } catch (err) {
+        console.warn('[noemetra] warning: failed to parse legacy connections.json for token mapping:', err)
+      }
     }
 
     const { merged, modified } = mergeNativeTokenStoreObjects(
@@ -1641,7 +1659,8 @@ function mergeNativeOAuthTokenStores(
       console.log('[noemetra] merged native oauth tokens store during legacy migration')
     }
   } catch (err) {
-    console.warn('[noemetra] failed to merge legacy native oauth tokens:', err)
+    console.error('[noemetra] failed to merge native oauth token stores; rolling back migration to protect credentials:', err)
+    throw err
   }
 }
 
