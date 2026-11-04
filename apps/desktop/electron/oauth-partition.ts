@@ -92,7 +92,7 @@ export interface ResolveOauthPartitionOptions {
  * default ports elided (URL does this), trailing slashes trimmed, query and
  * fragment dropped. Returns null for anything that is not a plain http(s) URL.
  */
-function normalizeForMatch(raw: unknown): string | null {
+export function normalizeForMatch(raw: unknown): string | null {
   if (typeof raw !== 'string' || !raw.trim()) {
     return null
   }
