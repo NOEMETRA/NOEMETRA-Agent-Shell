@@ -7756,7 +7756,7 @@ async function gatewayAuthProviders(baseUrl, headers = {}) {
 // see the 404 that identifies a backend predating /api/health (the auth gate
 // answers before the SPA catch-all). `probeIsCredentialed` tells
 // waitForHermesReady how to read a 401 — rejected session vs gated route.
-async function buildReadinessHealthProbe(baseUrl, authMode, token) {
+async function buildReadinessHealthProbe(baseUrl, authMode, token, connectionId?: string) {
   if (authMode === 'oauth') {
     return {
       // fetchJson takes the bearer via `options.bearer` — a raw `headers`
@@ -7766,7 +7766,8 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
         requestWithOauthFallback(baseUrl, {
           ensureNativeAccessToken,
           requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer }),
-          requestWithCookie: () => fetchJsonViaOauthSession(url, options)
+          requestWithCookie: () =>
+            fetchJsonViaOauthSession(url, { ...options, connectionId: options?.connectionId ?? connectionId })
         }),
       probeIsCredentialed: true
     }
@@ -7793,7 +7794,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
 // that is not that exact case surfaces unchanged.
 async function waitForRemoteHermes(remote) {
   try {
-    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, { connectionId: remote.connectionId })
   } catch (error) {
     if (!shouldAttemptCloudBootCascade(remote, error)) {
       throw error
@@ -7815,7 +7816,7 @@ async function waitForRemoteHermes(remote) {
       throw error
     }
 
-    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, { connectionId: remote.connectionId })
   }
 }
 
@@ -7825,9 +7826,9 @@ async function waitForHermes(
   signal?: AbortSignal,
   authMode?: string | null,
   headers: Record<string, string> = {},
-  { alreadyBound = false }: { alreadyBound?: boolean } = {}
+  { alreadyBound = false, connectionId = '' }: { alreadyBound?: boolean; connectionId?: string } = {}
 ): Promise<void> {
-  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token)
+  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token, connectionId)
 
   return waitForHermesReady(baseUrl, {
     token,
@@ -9010,11 +9011,12 @@ function openOauthLoginWindow(
 //      vouched replay-safe (`options.replayOn401`). Anything else keeps the
 //      no-replay rule of requestWithOauthFallback.
 function fetchJsonViaOauthSession(url, options: any = {}) {
-  const partition = resolveOauthPartitionForUrl(url)
+  const connectionId = typeof options?.connectionId === 'string' ? options.connectionId : ''
+  const partition = resolveOauthPartitionForUrl(url, { connectionId })
 
   const attempt = (): Promise<unknown> =>
     new Promise((resolve, reject) => {
-      const sess = getOauthSessionForUrl(url)
+      const sess = getOauthSessionForUrl(url, { connectionId })
 
       if (!sess) {
         reject(new Error('OAuth session partition is unavailable.'))
@@ -9386,11 +9388,24 @@ const recoverCloudCookieSession = createCloudSessionRecovery({
 
 // Native bearer first (including one forced 401 rotation), OAuth cookie second.
 // Transient ticket POST failures keep their bounded retry before Cloud recovery.
-async function mintGatewayWsTicket(baseUrl: string, headers: Record<string, string> = {}): Promise<string> {
+async function mintGatewayWsTicket(
+  baseUrl: string,
+  headers: Record<string, string> = {},
+  connectionId?: string
+): Promise<string> {
   return recoverCloudCookieSession(baseUrl, () =>
     withTransientRetries(
       (): Promise<string> =>
-        mintOauthGatewayWsTicket(baseUrl, { ensureNativeAccessToken, fetchJson, fetchJsonViaOauthSession }, headers),
+        mintOauthGatewayWsTicket(
+          baseUrl,
+          {
+            ensureNativeAccessToken,
+            fetchJson,
+            fetchJsonViaOauthSession: (url, opts: any = {}) =>
+              fetchJsonViaOauthSession(url, { ...opts, connectionId: opts?.connectionId ?? connectionId })
+          },
+          headers
+        ),
       {
         isRetryable: (error: Error): boolean =>
           !(error instanceof NativeAuthChangedError) && !isGatewayAuthRejection(error)
@@ -9420,7 +9435,7 @@ async function freshGatewayWsUrl(profile, webContentsId) {
   }
 
   if (connection.authMode === 'oauth') {
-    const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers)
+    const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers, connection.connectionId)
     const wsUrl = buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
 
     rememberRemoteWsHeaders(wsUrl, connection.headers)
@@ -10929,9 +10944,10 @@ async function buildRemoteConnection(
   const host = remoteHost || hostLabelFromBaseUrl(baseUrl)
 
   if (authMode === 'oauth') {
+    const connId = typeof remoteIdentity === 'string' ? remoteIdentity : undefined
     const ticket = await resolveRemoteOauthTicket(baseUrl, remoteHeaders, {
       hasNativeSession,
-      mintGatewayWsTicket
+      mintGatewayWsTicket: (url, h) => mintGatewayWsTicket(url, h, connId)
     })
 
     const wsUrl = buildGatewayWsUrlWithTicket(baseUrl, ticket)
@@ -17053,7 +17069,8 @@ async function fetchJsonForBackend(
       method: opts.method,
       body: opts.body,
       timeoutMs: opts.timeoutMs,
-      headers: descriptor.headers
+      headers: descriptor.headers,
+      connectionId: descriptor.connectionId || descriptor.id
     }
 
     return requestWithOauthFallback(descriptor.baseUrl, {
