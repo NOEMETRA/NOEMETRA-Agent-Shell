@@ -5,6 +5,8 @@ export interface RegistryGatewayWsConnection {
   authMode: string
   baseUrl: string
   wsUrl: string
+  connectionId?: string
+  partition?: string
   headers?: Record<string, string>
   profile?: null | string
   sharedRemote?: boolean
@@ -12,7 +14,12 @@ export interface RegistryGatewayWsConnection {
 
 interface RegistryGatewayWsUrlDependencies {
   ensureBackend: (connectionId: unknown, profile: unknown) => Promise<RegistryGatewayWsConnection>
-  mintTicket: (baseUrl: string, headers?: Record<string, string>) => Promise<string>
+  mintTicket: (
+    baseUrl: string,
+    headers?: Record<string, string>,
+    connectionId?: string,
+    partition?: string
+  ) => Promise<string>
   buildTicketUrl: (baseUrl: string, ticket: string) => string
   rememberHeaders: (wsUrl: string, headers?: Record<string, string>) => void
 }
@@ -230,7 +237,22 @@ export function createRegistryGatewayWsUrlHandler(dependencies: RegistryGatewayW
     let wsUrl = connection.wsUrl
 
     if (connection.authMode === 'oauth') {
-      const ticket = await dependencies.mintTicket(connection.baseUrl, connection.headers)
+      const connId =
+        typeof connection.connectionId === 'string' && connection.connectionId
+          ? connection.connectionId
+          : typeof connectionId === 'string' && connectionId
+            ? connectionId
+            : undefined
+      const partition =
+        typeof connection.partition === 'string' && connection.partition.trim()
+          ? connection.partition.trim()
+          : undefined
+      const ticket = await dependencies.mintTicket(
+        connection.baseUrl,
+        connection.headers,
+        connId,
+        partition
+      )
       wsUrl = dependencies.buildTicketUrl(connection.baseUrl, ticket)
     }
 

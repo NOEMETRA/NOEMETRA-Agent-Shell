@@ -11259,7 +11259,8 @@ async function buildRemoteConnection(
   remoteHost?,
   remoteKind = 'url',
   remoteIdentity?,
-  headers?
+  headers?,
+  partition?
 ) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
   const remoteHeaders = decryptRemoteHeaders(headers)
@@ -11270,9 +11271,10 @@ async function buildRemoteConnection(
 
   if (authMode === 'oauth') {
     const connId = typeof remoteIdentity === 'string' ? remoteIdentity : undefined
+    const explicitPartition = typeof partition === 'string' && partition.trim() ? partition.trim() : undefined
     const ticket = await resolveRemoteOauthTicket(baseUrl, remoteHeaders, {
       hasNativeSession,
-      mintGatewayWsTicket: (url, h) => mintGatewayWsTicket(url, h, connId)
+      mintGatewayWsTicket: (url, h) => mintGatewayWsTicket(url, h, connId, explicitPartition)
     })
 
     const wsUrl = buildGatewayWsUrlWithTicket(baseUrl, ticket)
@@ -11287,6 +11289,7 @@ async function buildRemoteConnection(
       remoteHost: host || undefined,
       remoteIdentity,
       connectionId: remoteIdentity,
+      partition: explicitPartition,
       remoteKind,
       headers: remoteHeaders,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
@@ -12187,11 +12190,18 @@ async function resolveRemoteBackend(
       undefined,
       route.kind === 'cloud' ? 'cloud' : 'url',
       route.connectionId,
-      route.headers
+      route.headers,
+      (route as any)?.partition
     )
   }
 
-  return route.connectionId ? { ...connection, connectionId: route.connectionId } : connection
+  return route.connectionId
+    ? {
+        ...connection,
+        connectionId: route.connectionId,
+        ...((route as any)?.partition ? { partition: (route as any).partition } : {})
+      }
+    : connection
 }
 
 // A remote profile's sessions live on its remote host's state.db, not on a local
@@ -12802,7 +12812,8 @@ async function ensureRegistryBackend(
     return {
       ...primary,
       profile: profileKey,
-      connectionId: id
+      connectionId: id,
+      ...(source.partition ? { partition: source.partition } : {})
     }
   }
 
@@ -12816,7 +12827,10 @@ async function ensureRegistryBackend(
     })
 
   if (sharedPrimary) {
-    return sharedPrimary
+    return {
+      ...sharedPrimary,
+      ...(source.partition ? { partition: source.partition } : {})
+    }
   }
 
   if (source.kind === 'local') {
@@ -13020,7 +13034,8 @@ async function connectRegistryBackend(
     undefined,
     source.kind === 'cloud' ? 'cloud' : 'url',
     source.id,
-    source.headers
+    source.headers,
+    source.partition
   )
 
   await waitForRemoteHermes(connection)
@@ -13034,6 +13049,7 @@ async function connectRegistryBackend(
     ...connection,
     profile: profileKey,
     connectionId: source.id,
+    ...(source.partition ? { partition: source.partition } : {}),
     // One host, many profiles: REST paths must carry ?profile= (same contract
     // as the global-remote shared-primary route).
     sharedRemote: true,
