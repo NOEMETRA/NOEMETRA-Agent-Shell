@@ -1652,28 +1652,9 @@ function maybeMigrateLegacyDesktopState(): void {
       const backupDir = path.join(currentDir, MIGRATION_BACKUP_DIR)
       const backupCompletePath = path.join(backupDir, '.backup-complete')
 
-      // Coordinate with legacy app: require it to be closed before copying databases
-      // to ensure consistent, quiescent LevelDB and Local Storage snapshots.
-      if (isLegacyAppRunning(legacyDir)) {
-        // Record pending migration marker so a subsequent launch after legacy app
-        // exit can reclaim and merge the state instead of mistaking default files for user state.
-        try {
-          fs.writeFileSync(pendingMarkerPath, '1\n', 'utf8')
-        } catch {}
-        console.warn('[noemetra] legacy Hermes application is currently running; migration postponed until it is closed')
-        return
-      }
-
-      // If an incomplete backup was left behind without migration in progress, clean it up safely
-      if (fs.existsSync(backupDir) && !fs.existsSync(inProgressPath)) {
-        try {
-          fs.rmSync(backupDir, { recursive: true, force: true })
-        } catch {}
-      }
-
-      // If a previous migration was interrupted after changes started:
-      // Only remove destination entries and roll back if backup-complete was confirmed.
-      // Retain backup, staging and inProgressPath unless every restore succeeds completely.
+      // Step 0: Recover interrupted migrations BEFORE checking the legacy app or continuing (per AGENTS.md:73-78).
+      // If a previous migration was interrupted after destination writes began,
+      // destination must be cleanly restored from backup before checking the legacy app or proceeding.
       if (fs.existsSync(inProgressPath)) {
         let recoverySucceeded = false
         try {
@@ -1750,6 +1731,25 @@ function maybeMigrateLegacyDesktopState(): void {
         } catch {
           // ignore cleanup error
         }
+      }
+
+      // If an incomplete backup was left behind without migration in progress, clean it up safely
+      if (fs.existsSync(backupDir) && !fs.existsSync(inProgressPath)) {
+        try {
+          fs.rmSync(backupDir, { recursive: true, force: true })
+        } catch {}
+      }
+
+      // Coordinate with legacy app: require it to be closed before copying databases
+      // to ensure consistent, quiescent LevelDB and Local Storage snapshots.
+      if (isLegacyAppRunning(legacyDir)) {
+        // Record pending migration marker so a subsequent launch after legacy app
+        // exit can reclaim and merge the state instead of mistaking default files for user state.
+        try {
+          fs.writeFileSync(pendingMarkerPath, '1\n', 'utf8')
+        } catch {}
+        console.warn('[noemetra] legacy Hermes application is currently running; migration postponed until it is closed')
+        return
       }
 
       // Non-destructive migration: if migration marker is not yet written, run the intent-preserving
