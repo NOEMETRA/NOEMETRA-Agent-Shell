@@ -25,6 +25,7 @@ export type DesktopRemoteRoute =
   | {
       authMode: 'oauth' | 'token'
       connectionId?: string
+      partition?: string
       headers?: Record<string, unknown>
       kind: 'cloud' | 'remote'
       org?: string
@@ -103,6 +104,8 @@ export function resolveDesktopRemoteRoute({
     const kind = profileConfig?.mode === 'cloud' ? 'cloud' : 'remote'
     const authMode = override.authMode === 'oauth' ? 'oauth' : 'token'
     const route = { ...profileConfig, kind } as StoredRoute
+    const rawPartition = (profileConfig as any)?.partition || (override as any)?.partition
+    const partition = typeof rawPartition === 'string' && rawPartition.trim() ? rawPartition.trim() : undefined
 
     return withConnectionId(
       {
@@ -110,6 +113,7 @@ export function resolveDesktopRemoteRoute({
         headers: override.headers,
         kind,
         org: kind === 'cloud' ? String(profileConfig?.org || '').trim() || undefined : undefined,
+        ...(partition ? { partition } : {}),
         source: 'profile' as const,
         token: override.token,
         url: override.url
@@ -162,6 +166,8 @@ export function resolveDesktopRemoteRoute({
   const kind = config.mode === 'cloud' ? 'cloud' : 'remote'
   const authMode = normAuthMode(config.remote?.authMode)
   const route = { ...config.remote, kind } as StoredRoute
+  const rawPartition = config.remote?.partition
+  const partition = typeof rawPartition === 'string' && rawPartition.trim() ? rawPartition.trim() : undefined
 
   return withConnectionId(
     {
@@ -169,6 +175,7 @@ export function resolveDesktopRemoteRoute({
       headers: config.remote?.headers,
       kind,
       org: kind === 'cloud' ? String(config.remote?.org || '').trim() || undefined : undefined,
+      ...(partition ? { partition } : {}),
       source: 'settings' as const,
       token: config.remote?.token,
       url: String(config.remote?.url || '')
@@ -215,9 +222,13 @@ function resolveRegistryPrimaryRoute(registry: ConnectionRegistry): DesktopRemot
     return null
   }
 
+  const rawEntryPart = entry.partition
+  const entryPart = typeof rawEntryPart === 'string' && rawEntryPart.trim() ? rawEntryPart.trim() : undefined
+
   return {
     authMode: normAuthMode(entry.authMode),
     connectionId: entry.id,
+    ...(entryPart ? { partition: entryPart } : {}),
     headers: entry.headers,
     kind: entry.kind,
     org: entry.kind === 'cloud' ? String(entry.org || '').trim() || undefined : undefined,

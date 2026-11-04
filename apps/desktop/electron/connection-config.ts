@@ -603,6 +603,7 @@ function profileRemoteOverride(config, profile) {
     url,
     authMode: normAuthMode(entry.authMode),
     token: entry.token,
+    ...(typeof entry.partition === 'string' && entry.partition.trim() ? { partition: entry.partition.trim() } : {}),
     ...(Object.keys(headers).length > 0 ? { headers } : {}),
     // A URL-remote/cloud host serves every profile via ?profile=, so a Desktop
     // profile that is only a routing label (e.g. `gris` for the backend's

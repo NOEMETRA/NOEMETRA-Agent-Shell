@@ -461,3 +461,28 @@ test('launchMode=last-used does not force the registry primary before a local sp
 
   assert.equal(route, null)
 })
+
+test('profile remote preserves explicit partition even when matching multiple registry connections', () => {
+  const route = resolveDesktopRemoteRoute({
+    config: {
+      mode: 'local',
+      profiles: {
+        research: {
+          mode: 'remote',
+          url: 'https://shared-gw.example',
+          authMode: 'oauth',
+          partition: 'persist:research-custom-jar'
+        }
+      }
+    },
+    profile: 'research',
+    registry: registry('local', [
+      { id: 'gw-1', kind: 'remote', label: 'GW 1', url: 'https://shared-gw.example', authMode: 'oauth' },
+      { id: 'gw-2', kind: 'remote', label: 'GW 2', url: 'https://shared-gw.example', authMode: 'oauth' }
+    ])
+  })
+
+  assert.equal(route?.source, 'profile')
+  assert.equal((route as any)?.partition, 'persist:research-custom-jar')
+  assert.equal(route?.connectionId, undefined)
+})
