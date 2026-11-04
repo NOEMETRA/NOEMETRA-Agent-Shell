@@ -435,4 +435,42 @@ describe('resolveOauthPartition with connectionId (pre-save sign-in identity)', 
     })
     expect(byUrl).toBe('persist:hermes-remote-oauth-conn-cloud-isolated')
   })
+
+  it('keeps primary account authoritative on shared URL and scopes migrated session by connection identity (AGENTS.md:46-48)', () => {
+    const reg = registry('primary-conn', [
+      {
+        id: 'primary-conn',
+        kind: 'remote',
+        authMode: 'oauth',
+        url: 'https://gw.shared.example.com'
+      },
+      {
+        id: 'migrated-conn',
+        kind: 'remote',
+        authMode: 'oauth',
+        url: 'https://gw.shared.example.com',
+        partition: 'persist:hermes-remote-oauth-conn-migrated-conn'
+      }
+    ])
+
+    // Calls resolving by URL alone without connectionId belong to the primary connection (legacy partition)
+    const byUrl = resolveOauthPartition('https://gw.shared.example.com/api/status', {
+      registry: reg
+    })
+    expect(byUrl).toBe(LEGACY_OAUTH_PARTITION)
+
+    // Calls carrying the migrated connection identity resolve to the migrated dedicated partition
+    const byMigratedId = resolveOauthPartition('https://gw.shared.example.com/api/status', {
+      registry: reg,
+      connectionId: 'migrated-conn'
+    })
+    expect(byMigratedId).toBe('persist:hermes-remote-oauth-conn-migrated-conn')
+
+    // Calls carrying primary connection identity resolve to primary's partition
+    const byPrimaryId = resolveOauthPartition('https://gw.shared.example.com/api/status', {
+      registry: reg,
+      connectionId: 'primary-conn'
+    })
+    expect(byPrimaryId).toBe(LEGACY_OAUTH_PARTITION)
+  })
 })

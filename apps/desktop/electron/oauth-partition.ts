@@ -207,6 +207,25 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
     return LEGACY_OAUTH_PARTITION
   }
 
+  // When resolving by URL alone without a connection identity: if the request URL matches
+  // the registry PRIMARY connection (or v1 remote), the primary connection is authoritative
+  // for its own URL and must never have its account cookies hijacked by a secondary/migrated
+  // connection that happens to share the same URL (AGENTS.md:46-48).
+  if (primaryId) {
+    const primaryEntry = (registry.connections as unknown[]).find(c => entryField(c, 'id') === primaryId)
+    if (primaryEntry) {
+      const primaryBaseNorm = normalizeForMatch(entryField(primaryEntry, 'url'))
+      if (primaryBaseNorm && matchesBase(requestNorm, primaryBaseNorm)) {
+        const explicitPart = entryField(primaryEntry, 'partition')
+        if (typeof explicitPart === 'string' && explicitPart.trim()) {
+          const part = explicitPart.trim()
+          return part.startsWith('persist:') ? part : `persist:${part}`
+        }
+        return LEGACY_OAUTH_PARTITION
+      }
+    }
+  }
+
   let best: { baseNorm: string; id: string } | null = null
 
   for (const entry of registry.connections) {
