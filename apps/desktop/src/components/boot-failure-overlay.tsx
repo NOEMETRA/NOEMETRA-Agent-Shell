@@ -25,6 +25,7 @@ import {
   deriveProviderShape,
   isRemoteConfig,
   isRemoteReauthFailure,
+  resolveReauthConnectionId,
   signInLabel,
   sshFailureMessage
 } from './boot-failure-reauth'
@@ -245,9 +246,7 @@ export function BootFailureOverlay() {
       if (!connId && desktop?.connections?.list) {
         try {
           const reg = await desktop.connections.list()
-          if (reg?.primary) {
-            connId = reg.primary
-          }
+          connId = resolveReauthConnectionId(config.remoteUrl, config.connectionId, reg) || ''
         } catch {
           // Generic fallback
         }

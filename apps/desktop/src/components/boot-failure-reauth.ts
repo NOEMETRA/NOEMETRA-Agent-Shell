@@ -165,3 +165,55 @@ export function signInLabel(reauth: RemoteReauth | null, copy: SignInCopy = DEFA
 
   return copy.withProvider(provider ?? copy.identityProvider)
 }
+
+function normalizeGatewayUrl(raw: unknown): string {
+  try {
+    const s = String(raw || '').trim()
+    if (!s) return ''
+    const parsed = new URL(s)
+    parsed.username = ''
+    parsed.password = ''
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, '').toLowerCase()
+  } catch {
+    return String(raw || '').trim().replace(/\/+$/, '').toLowerCase()
+  }
+}
+
+/**
+ * Resolve connection ID for remote reauthentication (#P2).
+ *
+ * Scoped state must retain its owner: if the configured remote differs from
+ * registry.primary, it must NOT assume the primary ID, but resolve against
+ * matching connections or remain unscoped.
+ */
+export function resolveReauthConnectionId(
+  remoteUrl: string | undefined | null,
+  configuredConnId: string | undefined | null,
+  registry: { primary?: string | null; connections?: Array<{ id: string; url?: string }> } | null | undefined
+): string | undefined {
+  if (configuredConnId && typeof configuredConnId === 'string' && configuredConnId.trim()) {
+    return configuredConnId.trim()
+  }
+
+  const normRemoteUrl = normalizeGatewayUrl(remoteUrl)
+  if (!normRemoteUrl || !registry || !Array.isArray(registry.connections)) {
+    return undefined
+  }
+
+  // Check if primary matches this remote URL
+  if (registry.primary) {
+    const primaryConn = registry.connections.find(c => c && c.id === registry.primary)
+    if (primaryConn && normalizeGatewayUrl(primaryConn.url) === normRemoteUrl) {
+      return primaryConn.id
+    }
+  }
+
+  // Check for an unambiguous matching connection
+  const matches = registry.connections.filter(c => c && normalizeGatewayUrl(c.url) === normRemoteUrl)
+  if (matches.length === 1 && matches[0]?.id) {
+    return matches[0].id
+  }
+
+  return undefined
+}
+

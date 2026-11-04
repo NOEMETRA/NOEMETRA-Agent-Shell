@@ -7,6 +7,7 @@ import {
   isRemoteConfig,
   isRemoteReauthError,
   isRemoteReauthFailure,
+  resolveReauthConnectionId,
   shouldApplyPostBootProgressError,
   sshFailureMessage
 } from './boot-failure-reauth'
@@ -173,3 +174,48 @@ describe('deriveProviderShape', () => {
     )
   })
 })
+
+describe('resolveReauthConnectionId', () => {
+  const registry = {
+    primary: 'primary-conn',
+    connections: [
+      { id: 'primary-conn', url: 'https://primary.example.com' },
+      { id: 'secondary-conn', url: 'https://secondary.example.com' }
+    ]
+  }
+
+  it('preserves an explicit configured connection ID', () => {
+    expect(resolveReauthConnectionId('https://primary.example.com', 'explicit-conn', registry)).toBe('explicit-conn')
+  })
+
+  it('resolves primary ID when remoteUrl matches the primary connection', () => {
+    expect(resolveReauthConnectionId('https://primary.example.com/', '', registry)).toBe('primary-conn')
+    expect(resolveReauthConnectionId('https://PRIMARY.example.com', null, registry)).toBe('primary-conn')
+  })
+
+  it('resolves matching secondary ID when remoteUrl differs from primary but matches another connection', () => {
+    expect(resolveReauthConnectionId('https://secondary.example.com', '', registry)).toBe('secondary-conn')
+  })
+
+  it('does NOT assign primary ID when remoteUrl differs and no matching connection exists', () => {
+    expect(resolveReauthConnectionId('https://unrelated.example.com', '', registry)).toBeUndefined()
+  })
+
+  it('returns undefined when remoteUrl matches multiple connections ambiguously and primary differs', () => {
+    const ambiguousRegistry = {
+      primary: 'other-conn',
+      connections: [
+        { id: 'other-conn', url: 'https://other.example.com' },
+        { id: 'conn-a', url: 'https://shared.example.com' },
+        { id: 'conn-b', url: 'https://shared.example.com' }
+      ]
+    }
+    expect(resolveReauthConnectionId('https://shared.example.com', '', ambiguousRegistry)).toBeUndefined()
+  })
+
+  it('returns undefined for empty or invalid inputs', () => {
+    expect(resolveReauthConnectionId('', '', registry)).toBeUndefined()
+    expect(resolveReauthConnectionId(null, null, null)).toBeUndefined()
+  })
+})
+
