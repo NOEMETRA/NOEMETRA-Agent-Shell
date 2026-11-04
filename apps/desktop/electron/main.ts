@@ -1338,14 +1338,16 @@ function ensureSharedOauthPartitionPreserved(legacyUserDataDir: string, currentU
   }
 }
 
-function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): void {
+function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, initialDestHasSharedSession?: boolean): void {
   if (!fs.existsSync(legacyFile)) return
 
   const currentDir = path.dirname(currentFile)
   const legacyDir = path.dirname(legacyFile)
   const currentSharedPart = path.join(currentDir, 'Partitions', 'hermes-remote-oauth')
   const legacySharedPart = path.join(legacyDir, 'Partitions', 'hermes-remote-oauth')
-  const destHasSharedSession = fs.existsSync(currentSharedPart) && hasDatabaseContent(currentSharedPart)
+  const destHasSharedSession = typeof initialDestHasSharedSession === 'boolean'
+    ? initialDestHasSharedSession
+    : (fs.existsSync(currentSharedPart) && hasDatabaseContent(currentSharedPart))
   const legacyHasSharedSession = fs.existsSync(legacySharedPart) && hasDatabaseContent(legacySharedPart)
 
   if (!fs.existsSync(currentFile)) {
@@ -2361,7 +2363,16 @@ function maybeMigrateLegacyDesktopState(): void {
         throw stageCopyErr
       }
 
-      const stagedEntries = fs.readdirSync(stagingDir)
+      // Sort staged entries so that connections.json is reconciled BEFORE Partitions/ directories
+      // are transferred into currentDir, preventing imported partition databases from being
+      // mistaken for pre-existing destination sessions (AGENTS.md:68).
+      const stagedEntries = fs.readdirSync(stagingDir).sort((a, b) => {
+        if (a === 'connections.json') return -1
+        if (b === 'connections.json') return 1
+        if (a === 'Partitions') return 1
+        if (b === 'Partitions') return -1
+        return a.localeCompare(b)
+      })
 
       // Step 2: Complete destination backup snapshot BEFORE marking migration in progress.
       // If snapshot cannot be completed, abort immediately without touching destination
@@ -2387,10 +2398,12 @@ function maybeMigrateLegacyDesktopState(): void {
         // and preserve legacy database to sidecar (.legacy) with an authoritative recovery manifest.
         // If destination has only empty boot boilerplate, restore legacy database directly into destPath.
         const preservedDatabases: Array<{ name: string; legacyPreserved: string; activeRetained: string }> = []
-        // Determine whether destination had active cookies prior to any transfer in Step 3.
+        // Determine whether destination had active cookies and shared OAuth session prior to any transfer in Step 3.
         // We must probe this BEFORE connections.json or Partitions/ are reconciled into currentDir,
-        // otherwise imported legacy partitions would be mistaken for pre-existing destination cookies.
+        // otherwise imported legacy partitions would be mistaken for pre-existing destination sessions (AGENTS.md:68).
         const destHadActiveCookiesInitially = hasActiveCookieData(currentDir)
+        const currentSharedPart = path.join(currentDir, 'Partitions', 'hermes-remote-oauth')
+        const destHadSharedSessionInitially = fs.existsSync(currentSharedPart) && hasDatabaseContent(currentSharedPart)
 
         for (const entry of stagedEntries) {
           const stagedPath = path.join(stagingDir, entry)
@@ -2449,7 +2462,7 @@ function maybeMigrateLegacyDesktopState(): void {
               fs.cpSync(stagedPath, destPath, { recursive: true })
             }
           } else if (entry === 'connections.json') {
-            reconcileConnectionsRegistry(destPath, stagedPath)
+            reconcileConnectionsRegistry(destPath, stagedPath, destHadSharedSessionInitially)
           } else if (entry === 'Partitions') {
             const partitionsDestDir = destPath
             fs.mkdirSync(partitionsDestDir, { recursive: true })
@@ -8954,17 +8967,26 @@ const oauthSessionsByPartition = new Map()
 
 let oauthSession = null
 
+function normalizeExplicitPartition(partition?: string | null): string {
+  if (!partition || typeof partition !== 'string') return ''
+  const trimmed = partition.trim()
+  if (!trimmed) return ''
+  return trimmed.startsWith('persist:') ? trimmed : `persist:${trimmed}`
+}
+
 function getOauthSession(partition?: string) {
-  if (partition && partition !== OAUTH_SESSION_PARTITION) {
+  const normPartition = normalizeExplicitPartition(partition) || OAUTH_SESSION_PARTITION
+
+  if (normPartition && normPartition !== OAUTH_SESSION_PARTITION) {
     if (!app.isReady()) {
       return null
     }
 
-    let sess = oauthSessionsByPartition.get(partition)
+    let sess = oauthSessionsByPartition.get(normPartition)
 
     if (!sess) {
-      sess = session.fromPartition(partition)
-      oauthSessionsByPartition.set(partition, sess)
+      sess = session.fromPartition(normPartition)
+      oauthSessionsByPartition.set(normPartition, sess)
       installRemoteHeaderRulesOnSession(sess)
     }
 
@@ -8997,7 +9019,8 @@ function resolveOauthPartitionForUrl(url, { connectionId = '', pendingAuthMode =
 }
 
 function getOauthSessionForUrl(url, { connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}) {
-  const partition = explicitPartition || resolveOauthPartitionForUrl(url, { connectionId, pendingAuthMode, pendingKind })
+  const normalizedExplicit = normalizeExplicitPartition(explicitPartition)
+  const partition = normalizedExplicit || resolveOauthPartitionForUrl(url, { connectionId, pendingAuthMode, pendingKind })
 
   return getOauthSession(partition)
 }
@@ -9019,7 +9042,8 @@ function getOauthSessionForUrl(url, { connectionId = '', pendingAuthMode = '', p
 const oauthCookieWarmups = new Map()
 
 function warmOauthCookieStore(url?, { connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}) {
-  const partition = explicitPartition || resolveOauthPartitionForUrl(url, { connectionId, pendingAuthMode, pendingKind })
+  const normalizedExplicit = normalizeExplicitPartition(explicitPartition)
+  const partition = normalizedExplicit || resolveOauthPartitionForUrl(url, { connectionId, pendingAuthMode, pendingKind })
   const pending = oauthCookieWarmups.get(partition)
 
   if (pending) {
@@ -9197,9 +9221,10 @@ function openOauthLoginWindow(
   baseUrl,
   { silent = false, background = false, connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}
 ) {
-  const identity = { connectionId, pendingAuthMode, pendingKind, partition: explicitPartition }
+  const normalizedExplicit = normalizeExplicitPartition(explicitPartition)
+  const identity = { connectionId, pendingAuthMode, pendingKind, partition: normalizedExplicit }
   const unattended = background || !canShowInteractiveOauthLogin()
-  const partition = explicitPartition || resolveOauthPartitionForUrl(baseUrl, identity)
+  const partition = normalizedExplicit || resolveOauthPartitionForUrl(baseUrl, identity)
 
   return oauthLoginFlights.run(loginFlightKey(partition, baseUrl), unattended ? 'background' : 'foreground', () => {
     const sess = app.isReady() ? getOauthSessionForUrl(baseUrl, identity) : null
@@ -9271,7 +9296,7 @@ function openOauthLoginWindow(
 //      no-replay rule of requestWithOauthFallback.
 function fetchJsonViaOauthSession(url, options: any = {}) {
   const connectionId = typeof options?.connectionId === 'string' ? options.connectionId : ''
-  const explicitPartition = typeof options?.partition === 'string' ? options.partition.trim() : ''
+  const explicitPartition = normalizeExplicitPartition(options?.partition)
   const partition = explicitPartition || resolveOauthPartitionForUrl(url, { connectionId })
 
   const attempt = (): Promise<unknown> =>
