@@ -66,6 +66,8 @@ export interface RegistryConnection {
   org?: string
   /** Cloud instance name, separate from the user-editable label. */
   name?: string
+  /** Explicit session partition for migrated or isolated OAuth connections (AGENTS.md:46-48). */
+  partition?: string
   /** ssh fields (normalizeSshConfig shapes). */
   host?: string
   user?: string
@@ -925,6 +927,8 @@ export interface ConnectionInput {
   org?: string
   /** Cloud instance name, separate from the user-editable label. */
   name?: string
+  /** Explicit session partition for migrated or isolated OAuth connections (AGENTS.md:46-48). */
+  partition?: string
   host?: string
   user?: string
   port?: number | string
@@ -1085,6 +1089,10 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
       entry.org = org
     }
 
+    if (typeof input.partition === 'string' && input.partition.trim()) {
+      entry.partition = input.partition.trim()
+    }
+
     return entry
   }
 
@@ -1128,6 +1136,7 @@ export function mergeConnectionInput(input: ConnectionInput, existing?: null | R
   inherit('keyPath')
   inherit('remoteHermesPath')
   inherit('remoteProfile')
+  inherit('partition')
   // Headers inherit like other dial fields: an edit payload that omits the
   // field keeps the stored set; an explicit payload (even {}) is
   // authoritative so the editor can clear them.
@@ -1323,6 +1332,10 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
 
         if (kind === 'cloud' && org) {
           clean.org = org
+        }
+
+        if (typeof entry.partition === 'string' && entry.partition.trim()) {
+          clean.partition = entry.partition.trim()
         }
       } else if (kind === 'ssh') {
         const ssh = normalizeSshConfig({ ...entry, mode: 'ssh' })
