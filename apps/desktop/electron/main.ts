@@ -845,7 +845,7 @@ function isLegacyAppRunning(legacyDir: string): boolean {
         // ENOENT / EINVAL / unreadable
       }
     } else if (process.platform === 'win32') {
-      // Windows: check for running legacy Hermes executables
+      // Windows: check for running legacy Hermes executables (including all canary and variant builds)
       try {
         const out = execFileSync('tasklist.exe', ['/NH', '/FO', 'CSV'], {
           encoding: 'utf8',
@@ -853,11 +853,20 @@ function isLegacyAppRunning(legacyDir: string): boolean {
           windowsHide: true
         })
         const isHermesRunning = out.split('\n').some((line) => {
-          const lower = line.toLowerCase()
+          const lower = line.toLowerCase().trim()
           return (
-            lower.includes('"hermes.exe"') ||
-            lower.includes('"hermes agent.exe"') ||
-            lower.includes('"hermes light.exe"')
+            lower.startsWith('"hermes') ||
+            lower.includes('hermes.exe') ||
+            lower.includes('hermes agent.exe') ||
+            lower.includes('hermes light.exe') ||
+            lower.includes('hermes canary.exe') ||
+            lower.includes('hermescanary.exe') ||
+            lower.includes('hermes agent canary.exe') ||
+            lower.includes('hermesagentcanary.exe') ||
+            lower.includes('hermes light canary.exe') ||
+            lower.includes('hermeslightcanary.exe') ||
+            lower.includes('hermes bundled canary.exe') ||
+            lower.includes('hermesbundledcanary.exe')
           )
         })
         if (isHermesRunning) return true
@@ -865,14 +874,23 @@ function isLegacyAppRunning(legacyDir: string): boolean {
         // fallback to file handles
       }
 
-      // Windows: Electron holds an exclusive handle on SingletonLock
-      try {
-        if (fs.existsSync(lockFile)) {
-          const fd = fs.openSync(lockFile, 'r+')
-          fs.closeSync(fd)
+      // Windows: Electron / Chromium holds exclusive lock on SingletonLock or database files while running
+      const candidateLockFiles = [
+        lockFile,
+        path.join(legacyDir, 'Cookies'),
+        path.join(legacyDir, 'state.db'),
+        path.join(legacyDir, 'SingletonCookie'),
+        path.join(legacyDir, 'SingletonSocket')
+      ]
+      for (const checkFile of candidateLockFiles) {
+        try {
+          if (fs.existsSync(checkFile)) {
+            const fd = fs.openSync(checkFile, 'r+')
+            fs.closeSync(fd)
+          }
+        } catch (err: any) {
+          if (err.code === 'EBUSY' || err.code === 'EPERM') return true
         }
-      } catch (err: any) {
-        if (err.code === 'EBUSY' || err.code === 'EPERM') return true
       }
     } else {
       // macOS / BSD: ProcessSingleton symlink <hostname>-<pid>
@@ -12148,7 +12166,8 @@ async function testDesktopConnectionConfig(input: any = {}) {
     testHeaders = remote.headers || {}
   }
 
-  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders)) as any
+  const connectionId = block?.connectionId || block?.id || ''
+  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders, connectionId)) as any
 
   // The HTTP status check above proves the backend is reachable, but the chat
   // surface only works once the renderer's live WebSocket to ``/api/ws``
@@ -12158,7 +12177,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // connect to Hermes gateway". Mirror the renderer's connect here so the test
   // reflects the full path the app actually uses.
   const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
-    mintTicket: url => mintGatewayWsTicket(url, testHeaders)
+    mintTicket: url => mintGatewayWsTicket(url, testHeaders, connectionId)
   })
 
   // Skip the WS leg only when the runtime genuinely lacks a WebSocket (so an
@@ -12182,10 +12201,10 @@ async function testDesktopConnectionConfig(input: any = {}) {
   }
 }
 
-async function fetchConnectionStatus(baseUrl, authMode, token, headers = {}) {
+async function fetchConnectionStatus(baseUrl, authMode, token, headers = {}, connectionId?: string) {
   // Native PKCE bearer first, OAuth session cookies second — the same two
   // credentials real traffic uses, in the same order (fetchJsonForBackend).
-  return fetchJsonForBackend({ baseUrl, authMode, token, headers }, '/api/status', { timeoutMs: 8_000 })
+  return fetchJsonForBackend({ baseUrl, authMode, token, headers, connectionId }, '/api/status', { timeoutMs: 8_000 })
 }
 
 function resetBootProgressForReconnect() {
@@ -16566,7 +16585,7 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     }
   }
 
-  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders)) as any
+  const status = (await fetchConnectionStatus(baseUrl, authMode, token, testHeaders, entry.id)) as any
 
   // The Test button is the cheapest moment to (re)learn this backend's stable
   // identity for the same-backend roster collapse + Settings hint.
@@ -16575,7 +16594,7 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
   // Same HTTP+WS two-leg check as testDesktopConnectionConfig: HTTP alone is
   // a false positive when the WebSocket leg is blocked.
   const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
-    mintTicket: url => mintGatewayWsTicket(url, testHeaders)
+    mintTicket: url => mintGatewayWsTicket(url, testHeaders, entry.id)
   })
 
   if (wsUrl && typeof globalThis.WebSocket === 'function') {

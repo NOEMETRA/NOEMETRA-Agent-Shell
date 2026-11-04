@@ -325,15 +325,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // read (not the legacy shared jar an unsaved URL would fall back to).
   oauthLoginConnectionConfig: (remoteUrl, options) =>
     ipcRenderer.invoke('hermes:connection-config:oauth-login', remoteUrl, options),
-  oauthLogoutConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl),
+  oauthLogoutConnectionConfig: (remoteUrl, options) =>
+    ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl, options),
   // Hermes Cloud: one portal login powers discovery + silent per-agent sign-in
   // (cloud-auto-discovery Phase 3).
   cloud: {
-    status: () => ipcRenderer.invoke('hermes:cloud:status'),
-    login: () => ipcRenderer.invoke('hermes:cloud:login'),
-    logout: () => ipcRenderer.invoke('hermes:cloud:logout'),
+    status: opts => ipcRenderer.invoke('hermes:cloud:status', opts),
+    login: opts => ipcRenderer.invoke('hermes:cloud:login', opts),
+    logout: opts => ipcRenderer.invoke('hermes:cloud:logout', opts),
     discover: org => ipcRenderer.invoke('hermes:cloud:discover', org),
-    agentSignIn: dashboardUrl => ipcRenderer.invoke('hermes:cloud:agent-sign-in', dashboardUrl)
+    agentSignIn: (dashboardUrl, opts) => ipcRenderer.invoke('hermes:cloud:agent-sign-in', dashboardUrl, opts)
   },
   profile: {
     getDefault: () => ipcRenderer.invoke('hermes:profile:default:get'),

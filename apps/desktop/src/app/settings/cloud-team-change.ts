@@ -30,13 +30,13 @@ export async function reconnectMovedCloudAgent(
   }
 
   const { url } = connection
-  await desktop.oauthLogoutConnectionConfig(url)
+  await desktop.oauthLogoutConnectionConfig(url, { connectionId: connection.id })
 
   if (!isCurrent()) {
     return false
   }
 
-  const result = await desktop.cloud.agentSignIn(url)
+  const result = await desktop.cloud.agentSignIn(url, { connectionId: connection.id })
 
   if (!isCurrent() || !result.connected) {
     return false
