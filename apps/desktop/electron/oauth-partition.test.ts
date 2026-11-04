@@ -473,4 +473,33 @@ describe('resolveOauthPartition with connectionId (pre-save sign-in identity)', 
     })
     expect(byPrimaryId).toBe(LEGACY_OAUTH_PARTITION)
   })
+
+  it('preserves longest-prefix matching for secondary OAuth connections when primary is a prefix (AGENTS.md:46-48)', () => {
+    const reg = registry('primary-host', [
+      {
+        id: 'primary-host',
+        kind: 'remote',
+        authMode: 'oauth',
+        url: 'https://host.example.com'
+      },
+      {
+        id: 'secondary-team',
+        kind: 'remote',
+        authMode: 'oauth',
+        url: 'https://host.example.com/team'
+      }
+    ])
+
+    // Request for secondary's sub-path must match secondary via longest-prefix matching
+    const teamUrl = resolveOauthPartition('https://host.example.com/team/api/status', {
+      registry: reg
+    })
+    expect(teamUrl).toContain('secondary-team')
+
+    // Request for host root must match primary
+    const rootUrl = resolveOauthPartition('https://host.example.com/api/status', {
+      registry: reg
+    })
+    expect(rootUrl).toBe(LEGACY_OAUTH_PARTITION)
+  })
 })

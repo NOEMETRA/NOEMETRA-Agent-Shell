@@ -207,26 +207,7 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
     return LEGACY_OAUTH_PARTITION
   }
 
-  // When resolving by URL alone without a connection identity: if the request URL matches
-  // the registry PRIMARY connection (or v1 remote), the primary connection is authoritative
-  // for its own URL and must never have its account cookies hijacked by a secondary/migrated
-  // connection that happens to share the same URL (AGENTS.md:46-48).
-  if (primaryId) {
-    const primaryEntry = (registry.connections as unknown[]).find(c => entryField(c, 'id') === primaryId)
-    if (primaryEntry) {
-      const primaryBaseNorm = normalizeForMatch(entryField(primaryEntry, 'url'))
-      if (primaryBaseNorm && matchesBase(requestNorm, primaryBaseNorm)) {
-        const explicitPart = entryField(primaryEntry, 'partition')
-        if (typeof explicitPart === 'string' && explicitPart.trim()) {
-          const part = explicitPart.trim()
-          return part.startsWith('persist:') ? part : `persist:${part}`
-        }
-        return LEGACY_OAUTH_PARTITION
-      }
-    }
-  }
-
-  let best: { baseNorm: string; id: string } | null = null
+  let best: { baseNorm: string; id: string; isPrimary: boolean; partition: string } | null = null
 
   for (const entry of registry.connections) {
     if (!entry || typeof entry !== 'object') {
@@ -238,21 +219,17 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
       continue
     }
 
-    const hasExplicitPart = typeof (entry as any).partition === 'string' && (entry as any).partition.trim().length > 0
-
-    // Only NON-primary v2 `remote` entries with cookie-flow auth get their own
-    // jar, UNLESS the entry declares an explicit partition (AGENTS.md:46-48).
-    // Cloud entries normally share the portal jar and token entries never use
-    // cookies; an unpartitioned primary (and the v1 remote it migrated from)
-    // keeps the legacy jar so an upgrade does not sign the user out.
-    if (id === primaryId && !hasExplicitPart) {
-      continue
-    }
+    const isPrimary = Boolean(primaryId && id === primaryId)
+    const explicitPart = entryField(entry, 'partition')
+    const hasExplicitPart = typeof explicitPart === 'string' && explicitPart.trim().length > 0
 
     const kind = (entry as any).kind
     const authMode = (entry as any).authMode
 
+    // Primary entries are always eligible for URL resolution (using their explicit partition or legacy jar).
+    // Non-primary entries must be cookie-auth remotes (or have an explicit partition declared).
     const isEligibleOauth =
+      isPrimary ||
       (kind === 'remote' && authMode === 'oauth') ||
       (hasExplicitPart && (authMode === 'oauth' || kind === 'cloud'))
 
@@ -261,8 +238,12 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
     }
 
     const baseNorm = normalizeForMatch((entry as any).url)
+    if (!baseNorm) {
+      continue
+    }
 
-    if (!baseNorm || (v1Norm && baseNorm === v1Norm && !hasExplicitPart)) {
+    // A non-primary entry without an explicit partition matching v1RemoteUrl stays on legacy jar
+    if (!isPrimary && !hasExplicitPart && v1Norm && baseNorm === v1Norm) {
       continue
     }
 
@@ -270,24 +251,38 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
       continue
     }
 
-    // Longest base-url prefix wins (sub-path gateways behind one proxy);
-    // identical URLs tie-break on the lexicographically smallest id so the
-    // choice is deterministic across processes and launches.
-    if (!best || baseNorm.length > best.baseNorm.length || (baseNorm.length === best.baseNorm.length && id < best.id)) {
-      best = { baseNorm, id }
+    // Determine the partition this connection maps to:
+    // 1. Explicit partition declared on the connection (AGENTS.md:46-48).
+    // 2. Primary connection without explicit partition -> LEGACY_OAUTH_PARTITION.
+    // 3. Secondary OAuth remote -> dedicated partition derived from connection id.
+    const partition = hasExplicitPart
+      ? explicitPart.trim().startsWith('persist:')
+        ? explicitPart.trim()
+        : `persist:${explicitPart.trim()}`
+      : isPrimary
+        ? LEGACY_OAUTH_PARTITION
+        : `${CONNECTION_PARTITION_PREFIX}${sanitizePartitionComponent(id)}`
+
+    // Longest base-url prefix wins (most specific sub-path gateways behind one proxy).
+    // When base lengths are equal:
+    //   1. Primary precedence breaks the tie so an unscoped request to a shared URL
+    //      uses the primary connection's account rather than a secondary account (AGENTS.md:46-48).
+    //   2. If neither or both are primary, tie-break on the lexicographically smallest id.
+    if (
+      !best ||
+      baseNorm.length > best.baseNorm.length ||
+      (baseNorm.length === best.baseNorm.length && (
+        (isPrimary && !best.isPrimary) ||
+        (isPrimary === best.isPrimary && id < best.id)
+      ))
+    ) {
+      best = { baseNorm, id, isPrimary, partition }
     }
   }
 
-  if (!best) {
-    return LEGACY_OAUTH_PARTITION
+  if (best) {
+    return best.partition
   }
 
-  const bestEntry = (registry.connections as any[]).find(c => (c as any).id === best.id)
-  const explicitPart = entryField(bestEntry, 'partition')
-  if (typeof explicitPart === 'string' && explicitPart.trim()) {
-    const part = explicitPart.trim()
-    return part.startsWith('persist:') ? part : `persist:${part}`
-  }
-
-  return `${CONNECTION_PARTITION_PREFIX}${sanitizePartitionComponent(best.id)}`
+  return LEGACY_OAUTH_PARTITION
 }
