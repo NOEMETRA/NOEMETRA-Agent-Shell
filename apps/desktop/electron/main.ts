@@ -1381,9 +1381,37 @@ function applyPendingLegacyDatabaseRestore(): void {
           const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
           let manifestPublished = true
           if (tx.action === 'restore-intervening') {
-            try {
-              if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
-            } catch {}
+            const legacyDatabases: Array<{ name: string; legacyPreserved: string; activeRetained: string }> = []
+            for (const db of tx.databases || []) {
+              const legacyName = `${db.name}.legacy`
+              if (fs.existsSync(path.join(currentDir, legacyName))) {
+                legacyDatabases.push({
+                  name: db.name,
+                  legacyPreserved: legacyName,
+                  activeRetained: db.name
+                })
+              }
+            }
+            if (legacyDatabases.length > 0) {
+              try {
+                fs.writeFileSync(
+                  manifestPath,
+                  JSON.stringify(
+                    {
+                      migratedAt: new Date().toISOString(),
+                      status: 'active-preserved-legacy-available',
+                      databases: legacyDatabases
+                    },
+                    null,
+                    2
+                  ),
+                  'utf8'
+                )
+              } catch (manifestErr) {
+                console.error('[noemetra] failed to write recovery manifest during committed recovery:', manifestErr)
+                manifestPublished = false
+              }
+            }
           } else {
             const interveningDatabases: Array<{ name: string; interveningPreserved: string; activeRetained: string }> = []
             for (const db of tx.databases || []) {
@@ -1434,7 +1462,15 @@ function applyPendingLegacyDatabaseRestore(): void {
               fs.rmSync(swapTxPath, { force: true })
             } catch {}
           } else {
-            console.error('[noemetra] manifest publication failed; retaining committed transaction and backups for retry on next launch')
+            console.error('[noemetra] manifest publication failed; stopping startup to protect data')
+            try {
+              dialog.showErrorBox(
+                'Database Recovery Interrupted',
+                'A database restore was committed, but the recovery manifest could not be published. NOEMETRA Agent Shell cannot start until disk permissions are resolved.'
+              )
+            } catch {}
+            app.exit(1)
+            return
           }
           return
         }
@@ -1563,62 +1599,117 @@ function applyPendingLegacyDatabaseRestore(): void {
       swapped: boolean
     }> = []
 
-    for (const item of dbsToRestore) {
-      const activePath = path.join(currentDir, item.name)
-      const legacyPath = path.join(currentDir, item.legacyPreserved)
-      const interveningPath = path.join(currentDir, `${item.name}.intervening`)
-      const backupPath = path.join(currentDir, `.${item.name}.swap-backup-${txId}`)
+    try {
+      for (const item of dbsToRestore) {
+        const activePath = path.join(currentDir, item.name)
+        const legacyPath = path.join(currentDir, item.legacyPreserved)
+        const interveningPath = path.join(currentDir, `${item.name}.intervening`)
+        const backupPath = path.join(currentDir, `.${item.name}.swap-backup-${txId}`)
 
-      // Create pre-swap backup of active database if it exists
-      const activeExistedInitially = fs.existsSync(activePath)
-      if (activeExistedInitially) {
-        fs.cpSync(activePath, backupPath, { recursive: true })
+        // Create pre-swap backup of active database if it exists
+        const activeExistedInitially = fs.existsSync(activePath)
+        if (activeExistedInitially) {
+          fs.cpSync(activePath, backupPath, { recursive: true })
+        }
+
+        txDatabases.push({
+          name: item.name,
+          sourcePath: legacyPath,
+          activePath,
+          backupPath,
+          interveningPath,
+          activeExistedInitially,
+          state: 'pending',
+          swapped: false
+        })
       }
 
-      txDatabases.push({
-        name: item.name,
-        sourcePath: legacyPath,
-        activePath,
-        backupPath,
-        interveningPath,
-        activeExistedInitially,
-        state: 'pending',
-        swapped: false
-      })
-    }
+      // Persist swap transaction BEFORE touching any active database or intervening snapshot
+      fs.writeFileSync(
+        swapTxPath,
+        JSON.stringify(
+          {
+            id: txId,
+            action: request.action || 'restore-legacy',
+            phase: 'swapping',
+            databases: txDatabases
+          },
+          null,
+          2
+        ),
+        'utf8'
+      )
 
-    // Persist swap transaction BEFORE touching any active database or intervening snapshot
-    fs.writeFileSync(
-      swapTxPath,
-      JSON.stringify(
-        {
-          id: txId,
-          action: request.action || 'restore-legacy',
-          phase: 'swapping',
-          databases: txDatabases
-        },
-        null,
-        2
-      ),
-      'utf8'
-    )
-
-    // Step 2: If restoring legacy data, preserve the genuine active state in .intervening snapshots FIRST
-    if (request.action !== 'restore-intervening') {
-      for (const db of txDatabases) {
-        if (fs.existsSync(db.backupPath)) {
-          // Use temporary stage for atomic update of intervening snapshot
-          const interveningStage = `${db.interveningPath}.stage-${txId}`
-          if (fs.existsSync(interveningStage)) {
-            fs.rmSync(interveningStage, { recursive: true, force: true })
+      // Step 2: Preserve the genuine active state in snapshot files FIRST before swapping (AGENTS.md:59-63)
+      if (request.action === 'restore-intervening') {
+        // Displacing active database (containing legacy data + user modifications) into .legacy snapshot
+        for (const db of txDatabases) {
+          if (fs.existsSync(db.backupPath)) {
+            const legacyPath = path.join(currentDir, `${db.name}.legacy`)
+            const legacyStage = `${legacyPath}.stage-${txId}`
+            if (fs.existsSync(legacyStage)) {
+              fs.rmSync(legacyStage, { recursive: true, force: true })
+            }
+            fs.cpSync(db.backupPath, legacyStage, { recursive: true })
+            if (fs.existsSync(legacyPath)) {
+              fs.rmSync(legacyPath, { recursive: true, force: true })
+            }
+            fs.renameSync(legacyStage, legacyPath)
           }
-          fs.cpSync(db.backupPath, interveningStage, { recursive: true })
-          if (fs.existsSync(db.interveningPath)) {
-            fs.rmSync(db.interveningPath, { recursive: true, force: true })
+        }
+      } else {
+        // Displacing active database (intervening setup) into .intervening snapshot
+        for (const db of txDatabases) {
+          if (fs.existsSync(db.backupPath)) {
+            // Use temporary stage for atomic update of intervening snapshot
+            const interveningStage = `${db.interveningPath}.stage-${txId}`
+            if (fs.existsSync(interveningStage)) {
+              fs.rmSync(interveningStage, { recursive: true, force: true })
+            }
+            fs.cpSync(db.backupPath, interveningStage, { recursive: true })
+            if (fs.existsSync(db.interveningPath)) {
+              fs.rmSync(db.interveningPath, { recursive: true, force: true })
+            }
+            fs.renameSync(interveningStage, db.interveningPath)
           }
-          fs.renameSync(interveningStage, db.interveningPath)
         }
       }
+    } catch (prepErr) {
+      console.error('[noemetra] failed to prepare restore transaction; stopping startup to protect data:', prepErr)
+      // Clean up any staging or temporary backup files created for this unstarted transaction
+      for (const db of txDatabases) {
+        if (db.backupPath && fs.existsSync(db.backupPath)) {
+          try {
+            fs.rmSync(db.backupPath, { recursive: true, force: true })
+          } catch {}
+        }
+        const interveningStage = `${db.interveningPath}.stage-${txId}`
+        if (fs.existsSync(interveningStage)) {
+          try {
+            fs.rmSync(interveningStage, { recursive: true, force: true })
+          } catch {}
+        }
+        const legacyPath = path.join(currentDir, `${db.name}.legacy`)
+        const legacyStage = `${legacyPath}.stage-${txId}`
+        if (fs.existsSync(legacyStage)) {
+          try {
+            fs.rmSync(legacyStage, { recursive: true, force: true })
+          } catch {}
+        }
+      }
+      if (fs.existsSync(swapTxPath)) {
+        try {
+          fs.rmSync(swapTxPath, { force: true })
+        } catch {}
+      }
+      try {
+        dialog.showErrorBox(
+          'Database Restore Failed',
+          'Failed to prepare the database restore transaction. To protect existing data from corruption, NOEMETRA Agent Shell will now exit.'
+        )
+      } catch {}
+      app.exit(1)
+      return
     }
 
     // Step 3: Perform the swap for each database and mark progress
@@ -1777,13 +1868,48 @@ function applyPendingLegacyDatabaseRestore(): void {
       return
     }
 
-    // Step 5: Publish recovery manifest BEFORE deleting backups
+    // Step 5: Publish recovery manifest BEFORE deleting backups (AGENTS.md:73-78)
     const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
     if (request.action === 'restore-intervening') {
-      try {
-        if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
-      } catch (rmManifestErr) {
-        console.warn('[noemetra] could not remove previous recovery manifest:', rmManifestErr)
+      // User restored previous (intervening) setup: retain an actionable recovery manifest
+      // for the displaced legacy databases (preserving user changes made while legacy was active)!
+      const legacyDatabases: Array<{ name: string; legacyPreserved: string; activeRetained: string }> = []
+      for (const item of dbsToRestore) {
+        const legacyName = `${item.name}.legacy`
+        if (fs.existsSync(path.join(currentDir, legacyName))) {
+          legacyDatabases.push({
+            name: item.name,
+            legacyPreserved: legacyName,
+            activeRetained: item.name
+          })
+        }
+      }
+      if (legacyDatabases.length > 0) {
+        try {
+          fs.writeFileSync(
+            manifestPath,
+            JSON.stringify(
+              {
+                migratedAt: new Date().toISOString(),
+                status: 'active-preserved-legacy-available',
+                databases: legacyDatabases
+              },
+              null,
+              2
+            ),
+            'utf8'
+          )
+        } catch (manifestErr) {
+          console.error('[noemetra] failed to write legacy recovery manifest; stopping startup to protect data:', manifestErr)
+          try {
+            dialog.showErrorBox(
+              'Database Restore Interrupted',
+              'Database restore completed, but the recovery manifest could not be written. NOEMETRA Agent Shell cannot start until disk permissions are resolved.'
+            )
+          } catch {}
+          app.exit(1)
+          return
+        }
       }
     } else {
       // User restored legacy data: retain an actionable recovery manifest for the displaced intervening databases!
@@ -1815,9 +1941,14 @@ function applyPendingLegacyDatabaseRestore(): void {
             'utf8'
           )
         } catch (manifestErr) {
-          console.error('[noemetra] failed to write intervening recovery manifest; retaining committed transaction and backups for retry:', manifestErr)
-          // RETAIN the committed transaction and backups! Do NOT delete them.
-          // On next launch, STEP 0 detects phase === 'committed' and retries publishing the manifest!
+          console.error('[noemetra] failed to write intervening recovery manifest; stopping startup to protect data:', manifestErr)
+          try {
+            dialog.showErrorBox(
+              'Database Restore Interrupted',
+              'Database restore completed, but the recovery manifest could not be written. NOEMETRA Agent Shell cannot start until disk permissions are resolved.'
+            )
+          } catch {}
+          app.exit(1)
           return
         }
       }
@@ -1842,7 +1973,14 @@ function applyPendingLegacyDatabaseRestore(): void {
 
     console.log('[noemetra] successfully restored database(s) before Chromium startup')
   } catch (err) {
-    console.error('[noemetra] unexpected error in applyPendingLegacyDatabaseRestore:', err)
+    console.error('[noemetra] unexpected error in applyPendingLegacyDatabaseRestore; stopping startup to protect data:', err)
+    try {
+      dialog.showErrorBox(
+        'Database Restore Interrupted',
+        'A database restore operation encountered an unexpected error. To protect your data from corruption, NOEMETRA Agent Shell cannot start until this issue is resolved.'
+      )
+    } catch {}
+    app.exit(1)
   }
 }
 
