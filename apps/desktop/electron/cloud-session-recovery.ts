@@ -2,8 +2,8 @@ import { isNousCloudAgentUrl } from './backend-health'
 
 interface CloudRecoveryDeps {
   hasNativeSession: (baseUrl: string) => boolean
-  restoreCookieSession: (baseUrl: string) => Promise<boolean>
-  onRecovered?: (baseUrl: string) => void
+  restoreCookieSession: (baseUrl: string, connectionId?: string) => Promise<boolean>
+  onRecovered?: (baseUrl: string, connectionId?: string) => void
   now?: () => number
 }
 
@@ -13,7 +13,7 @@ export function createCloudSessionRecovery(deps: CloudRecoveryDeps) {
   const failedAt = new Map<string, number>()
   const now = deps.now ?? Date.now
 
-  return async <T>(baseUrl: string, mint: () => Promise<T>): Promise<T> => {
+  return async <T>(baseUrl: string, mint: () => Promise<T>, connectionId?: string): Promise<T> => {
     const hadNativeSession = deps.hasNativeSession(baseUrl)
 
     try {
@@ -28,27 +28,28 @@ export function createCloudSessionRecovery(deps: CloudRecoveryDeps) {
         throw error
       }
 
-      let recovery = inflight.get(baseUrl)
+      const key = connectionId ? `${baseUrl}::${connectionId}` : baseUrl
+      let recovery = inflight.get(key)
 
       if (!recovery) {
-        const failed = failedAt.get(baseUrl)
+        const failed = failedAt.get(key)
 
         if (failed !== undefined && now() - failed < 60_000) {
           throw error
         }
 
         recovery = Promise.resolve()
-          .then(() => deps.restoreCookieSession(baseUrl))
+          .then(() => deps.restoreCookieSession(baseUrl, connectionId))
           .catch(() => false)
           .then(restored => {
             if (!restored) {
-              failedAt.set(baseUrl, now())
+              failedAt.set(key, now())
             }
 
             return restored
           })
-          .finally(() => inflight.delete(baseUrl))
-        inflight.set(baseUrl, recovery)
+          .finally(() => inflight.delete(key))
+        inflight.set(key, recovery)
       }
 
       if (!(await recovery)) {
@@ -63,12 +64,12 @@ export function createCloudSessionRecovery(deps: CloudRecoveryDeps) {
 
       try {
         const ticket = await mint()
-        failedAt.delete(baseUrl)
-        deps.onRecovered?.(baseUrl)
+        failedAt.delete(key)
+        deps.onRecovered?.(baseUrl, connectionId)
 
         return ticket
       } catch (retryError) {
-        failedAt.set(baseUrl, now())
+        failedAt.set(key, now())
         throw retryError
       }
     }

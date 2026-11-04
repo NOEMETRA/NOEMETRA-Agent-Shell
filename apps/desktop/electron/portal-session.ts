@@ -203,10 +203,11 @@ export function createPortalSession({
 
   // Loading the portal lets NAS choose its own refresher: Privy client renewal,
   // or the NAS server-side refresh redirect. Never pin a provider in Desktop.
-  // Concurrent callers share one hidden window so they cannot race rotating
-  // refresh tokens; a `force` caller (discovery just got a 401 with this very
-  // cookie) is never satisfied by a short-circuit, only by a real renewal.
-  let portalAccessRenewal: Promise<boolean> | null = null
+  // Concurrent callers share one hidden window per partition so they cannot race
+  // rotating refresh tokens without coalescing across distinct account sessions.
+  // A `force` caller (discovery just got a 401 with this very cookie) is never
+  // satisfied by a short-circuit, only by a real renewal.
+  const portalAccessRenewals = new Map<string, Promise<boolean>>()
 
   async function renewPortalAccessSilently({ force = false, partition }: { force?: boolean; partition?: string } = {}) {
     const sess = getOauthSession(partition)
@@ -225,30 +226,37 @@ export function createPortalSession({
       return true
     }
 
-    portalAccessRenewal ??= (async () => {
-      const previous = await readAccessCookies(partition)
+    const key = partition || ''
+    let pending = portalAccessRenewals.get(key)
 
-      // Hard deadline: this window is never revealed, so an unrenewable session
-      // (revoked refresh token, portal down) must resolve false rather than
-      // hang the discovery call behind an invisible window.
-      const outcome = await driveCookieWindow(sess, previous, {
-        kind: 'portal-renew',
-        title: 'Renewing Hermes Cloud session…',
-        show: false,
-        pollMs: 500,
-        deadlineMs: 12_000
-      }, partition)
+    if (!pending) {
+      pending = (async () => {
+        const previous = await readAccessCookies(partition)
 
-      const ok = outcome === 'landed'
+        // Hard deadline: this window is never revealed, so an unrenewable session
+        // (revoked refresh token, portal down) must resolve false rather than
+        // hang the discovery call behind an invisible window.
+        const outcome = await driveCookieWindow(sess, previous, {
+          kind: 'portal-renew',
+          title: 'Renewing Hermes Cloud session…',
+          show: false,
+          pollMs: 500,
+          deadlineMs: 12_000
+        }, partition)
 
-      rememberLog(`[cloud] silent portal access renewal ${ok ? 'succeeded' : 'did not complete'}`)
+        const ok = outcome === 'landed'
 
-      return ok
-    })().finally(() => {
-      portalAccessRenewal = null
-    })
+        rememberLog(`[cloud] silent portal access renewal ${ok ? 'succeeded' : 'did not complete'}`)
 
-    return portalAccessRenewal
+        return ok
+      })().finally(() => {
+        portalAccessRenewals.delete(key)
+      })
+
+      portalAccessRenewals.set(key, pending)
+    }
+
+    return pending
   }
 
   // Drive a one-time interactive portal sign-in in the OAuth partition. Unlike

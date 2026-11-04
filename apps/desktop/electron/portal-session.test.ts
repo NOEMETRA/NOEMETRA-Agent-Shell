@@ -102,3 +102,36 @@ test('partition parameter is forwarded to getOauthSession and warmOauthCookieSto
   expect(hasAccess).toBe(true)
   expect(requestedPartitions).toContain('persist:custom-part')
 })
+
+test('concurrent portal renewals are coalesced separately per partition', async () => {
+  const windowsCreated: any[] = []
+  const session1 = {
+    cookies: {
+      get: async () => [{ name: 'nas-refresh', value: 'rt1' }]
+    }
+  } as unknown as Session
+  const session2 = {
+    cookies: {
+      get: async () => [{ name: 'nas-refresh', value: 'rt2' }]
+    }
+  } as unknown as Session
+
+  const portal = createPortalSession({
+    isReady: () => true,
+    getOauthSession: (part?: string) => (part === 'persist:part-2' ? session2 : session1),
+    resolvePortalBaseUrl: () => 'https://portal.example.test',
+    warmOauthCookieStore: async () => {},
+    createWindow: options => {
+      const win = new PortalWindow(new Error('noop'))
+      windowsCreated.push({ options, win })
+      return win as unknown as BrowserWindow
+    },
+    rememberLog: () => {}
+  })
+
+  portal.renewPortalAccessSilently({ force: true, partition: 'persist:part-1' }).catch(() => {})
+  portal.renewPortalAccessSilently({ force: true, partition: 'persist:part-2' }).catch(() => {})
+
+  await vi.waitFor(() => expect(windowsCreated.length).toBe(2))
+  expect(windowsCreated.length).toBe(2)
+})

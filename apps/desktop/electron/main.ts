@@ -9376,10 +9376,10 @@ async function readGatewayFileDataUrl(connection: GatewayFileConnection, request
 const recoverCloudCookieSession = createCloudSessionRecovery({
   hasNativeSession,
   onRecovered: baseUrl => rememberLog(`[cloud] saved gateway session recovered for ${hostLabelFromBaseUrl(baseUrl)}`),
-  restoreCookieSession: async baseUrl => {
+  restoreCookieSession: async (baseUrl, connectionId) => {
     // The saved portal identity is the authority for cookie agent sessions.
     // Roster polling must never reveal an interactive sign-in window.
-    const part = resolveOauthPartitionForUrl(baseUrl)
+    const part = resolveOauthPartitionForUrl(baseUrl, { connectionId })
     const partition = part !== OAUTH_SESSION_PARTITION ? part : undefined
 
     if (!(await hasLivePortalSession(partition))) {
@@ -9390,7 +9390,7 @@ const recoverCloudCookieSession = createCloudSessionRecovery({
       return false
     }
 
-    await openOauthLoginWindow(baseUrl, { silent: true, background: true })
+    await openOauthLoginWindow(baseUrl, { silent: true, background: true, connectionId })
 
     return true
   }
@@ -9403,24 +9403,27 @@ async function mintGatewayWsTicket(
   headers: Record<string, string> = {},
   connectionId?: string
 ): Promise<string> {
-  return recoverCloudCookieSession(baseUrl, () =>
-    withTransientRetries(
-      (): Promise<string> =>
-        mintOauthGatewayWsTicket(
-          baseUrl,
-          {
-            ensureNativeAccessToken,
-            fetchJson,
-            fetchJsonViaOauthSession: (url, opts: any = {}) =>
-              fetchJsonViaOauthSession(url, { ...opts, connectionId: opts?.connectionId ?? connectionId })
-          },
-          headers
-        ),
-      {
-        isRetryable: (error: Error): boolean =>
-          !(error instanceof NativeAuthChangedError) && !isGatewayAuthRejection(error)
-      }
-    )
+  return recoverCloudCookieSession(
+    baseUrl,
+    () =>
+      withTransientRetries(
+        (): Promise<string> =>
+          mintOauthGatewayWsTicket(
+            baseUrl,
+            {
+              ensureNativeAccessToken,
+              fetchJson,
+              fetchJsonViaOauthSession: (url, opts: any = {}) =>
+                fetchJsonViaOauthSession(url, { ...opts, connectionId: opts?.connectionId ?? connectionId })
+            },
+            headers
+          ),
+        {
+          isRetryable: (error: Error): boolean =>
+            !(error instanceof NativeAuthChangedError) && !isGatewayAuthRejection(error)
+        }
+      ),
+    connectionId
   )
 }
 
