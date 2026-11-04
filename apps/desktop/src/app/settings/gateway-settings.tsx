@@ -422,7 +422,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
         throw error
       }
 
-      const outcome = await reestablishCloudAgentSession(desktop, dashboardUrl)
+      const outcome = await reestablishCloudAgentSession(desktop, dashboardUrl, id)
 
       if (outcome !== 'connected') {
         notify({
@@ -722,7 +722,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
 
     let cancelled = false
     desktop.cloud
-      .status()
+      .status({ connectionId: activeConnectionId || undefined })
       .then(status => {
         if (cancelled) {
           return
@@ -757,7 +757,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
 
     return () => void (cancelled = true)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reload on mode change only
-  }, [state.mode])
+  }, [state.mode, activeConnectionId])
 
   const cloudSignIn = async () => {
     const desktop = window.hermesDesktop
@@ -770,7 +770,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
     setCloudSigningIn(true)
 
     try {
-      const result = await desktop.cloud.login()
+      const result = await desktop.cloud.login({ connectionId: activeConnectionId || undefined })
 
       if (seq !== signingSeq.current) {
         return
@@ -803,7 +803,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
     setCloudSigningIn(true)
 
     try {
-      await desktop.cloud.logout()
+      await desktop.cloud.logout({ connectionId: activeConnectionId || undefined })
 
       if (seq !== signingSeq.current) {
         return
@@ -880,7 +880,9 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
         return
       }
 
-      const result = await desktop.cloud.agentSignIn(agent.dashboardUrl)
+      const result = await desktop.cloud.agentSignIn(agent.dashboardUrl, {
+        connectionId: activeConnectionId || undefined
+      })
 
       if (seq !== contextSeq.current) {
         return

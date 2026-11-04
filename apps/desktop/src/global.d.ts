@@ -270,15 +270,21 @@ declare global {
         remoteUrl: string,
         options?: DesktopOauthLoginOptions
       ) => Promise<DesktopOauthLoginResult>
-      oauthLogoutConnectionConfig: (remoteUrl: string) => Promise<DesktopOauthLogoutResult>
+      oauthLogoutConnectionConfig: (
+        remoteUrl: string,
+        options?: { connectionId?: string }
+      ) => Promise<DesktopOauthLogoutResult>
       // Hermes Cloud: one portal login powers discovery + silent per-agent
       // sign-in (cloud-auto-discovery Phase 3).
       cloud: {
-        status: () => Promise<DesktopCloudStatus>
-        login: () => Promise<DesktopCloudStatus & { ok: boolean }>
-        logout: () => Promise<DesktopCloudStatus & { ok: boolean }>
+        status: (opts?: { connectionId?: string; partition?: string }) => Promise<DesktopCloudStatus>
+        login: (opts?: { connectionId?: string; partition?: string }) => Promise<DesktopCloudStatus & { ok: boolean }>
+        logout: (opts?: { connectionId?: string; partition?: string }) => Promise<DesktopCloudStatus & { ok: boolean }>
         discover: (org?: string) => Promise<DesktopCloudDiscoverResult>
-        agentSignIn: (dashboardUrl: string) => Promise<DesktopCloudAgentSignInResult>
+        agentSignIn: (
+          dashboardUrl: string,
+          opts?: { connectionId?: string }
+        ) => Promise<DesktopCloudAgentSignInResult>
       }
       profile: {
         getDefault: () => Promise<DesktopProfileRoute | null>
