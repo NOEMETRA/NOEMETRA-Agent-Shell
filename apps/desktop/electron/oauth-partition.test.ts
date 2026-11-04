@@ -362,4 +362,30 @@ describe('resolveOauthPartition with connectionId (pre-save sign-in identity)', 
     expect(got.startsWith('persist:')).toBe(true)
     expect(got).not.toMatch(/[\s/€]/)
   })
+
+  it('resolves an explicit partition declared on a connection even when URL matches v1RemoteUrl (AGENTS.md:46-48)', () => {
+    const reg = registry('local', [
+      { id: 'local', kind: 'local' },
+      {
+        id: 'imported-conn',
+        kind: 'remote',
+        authMode: 'oauth',
+        url: 'https://gw-a.example.com',
+        partition: 'persist:hermes-remote-oauth-conn-imported-conn'
+      }
+    ])
+
+    const byId = resolveOauthPartition('https://gw-a.example.com', {
+      registry: reg,
+      connectionId: 'imported-conn',
+      v1RemoteUrl: 'https://gw-a.example.com'
+    })
+    expect(byId).toBe('persist:hermes-remote-oauth-conn-imported-conn')
+
+    const byUrl = resolveOauthPartition('https://gw-a.example.com/api/test', {
+      registry: reg,
+      v1RemoteUrl: 'https://gw-a.example.com'
+    })
+    expect(byUrl).toBe('persist:hermes-remote-oauth-conn-imported-conn')
+  })
 })

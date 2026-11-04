@@ -186,6 +186,12 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
         : LEGACY_OAUTH_PARTITION
     }
 
+    const explicitPart = entryField(own, 'partition')
+    if (typeof explicitPart === 'string' && explicitPart.trim()) {
+      const part = explicitPart.trim()
+      return part.startsWith('persist:') ? part : `persist:${part}`
+    }
+
     const ownBaseNorm = normalizeForMatch(entryField(own, 'url'))
 
     if (
@@ -223,8 +229,9 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
     }
 
     const baseNorm = normalizeForMatch((entry as any).url)
+    const hasExplicitPart = typeof (entry as any).partition === 'string' && (entry as any).partition.trim().length > 0
 
-    if (!baseNorm || (v1Norm && baseNorm === v1Norm)) {
+    if (!baseNorm || (v1Norm && baseNorm === v1Norm && !hasExplicitPart)) {
       continue
     }
 
@@ -242,6 +249,13 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
 
   if (!best) {
     return LEGACY_OAUTH_PARTITION
+  }
+
+  const bestEntry = (registry.connections as any[]).find(c => (c as any).id === best.id)
+  const explicitPart = entryField(bestEntry, 'partition')
+  if (typeof explicitPart === 'string' && explicitPart.trim()) {
+    const part = explicitPart.trim()
+    return part.startsWith('persist:') ? part : `persist:${part}`
   }
 
   return `${CONNECTION_PARTITION_PREFIX}${sanitizePartitionComponent(best.id)}`

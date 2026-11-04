@@ -405,7 +405,7 @@ import { loginFlightKey, OauthLoginFlights } from './oauth-login-flights'
 import { startOauthLoginWindow } from './oauth-login-window'
 import { isExpectedOauthNavigationAbort } from './oauth-navigation'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
-import { LEGACY_OAUTH_PARTITION, normalizeForMatch, resolveOauthPartition } from './oauth-partition'
+import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
 import {
   canShowInteractiveOauthLogin,
   mintGatewayWsTicket as mintOauthGatewayWsTicket,
@@ -1217,39 +1217,6 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
   const destHasSharedSession = fs.existsSync(currentSharedPart)
   const legacyHasSharedSession = fs.existsSync(legacySharedPart)
 
-  const destConfigPath = path.join(currentDir, 'connection.json')
-  let destV1RemoteUrl: string | null = null
-  let destConfig: any = null
-  if (fs.existsSync(destConfigPath)) {
-    try {
-      destConfig = JSON.parse(fs.readFileSync(destConfigPath, 'utf8'))
-      if (destConfig && destConfig.remote && typeof destConfig.remote.url === 'string') {
-        destV1RemoteUrl = normalizeForMatch(destConfig.remote.url)
-      }
-    } catch {}
-  }
-
-  const reconcileV1RoutingException = (connUrl: unknown, targetId: string) => {
-    if (!destV1RemoteUrl) return
-    const normUrl = normalizeForMatch(connUrl)
-    if (normUrl && normUrl === destV1RemoteUrl) {
-      if (destConfig && destConfig.remote && destConfig.remote.url) {
-        delete destConfig.remote.url
-        try {
-          writeSecretFileAtomic(destConfigPath, JSON.stringify(destConfig, null, 2))
-          connectionConfigCache = destConfig
-          try {
-            connectionConfigCacheMtime = fs.statSync(destConfigPath).mtimeMs
-          } catch {}
-          destV1RemoteUrl = null
-          console.log(`[noemetra] reconciled v1 remote routing exception for migrated connection ${targetId}`)
-        } catch (cfgErr) {
-          console.warn('[noemetra] failed to reconcile connection.json v1 remote URL:', cfgErr)
-        }
-      }
-    }
-  }
-
   try {
     const currentRegistry = JSON.parse(fs.readFileSync(currentFile, 'utf8'))
     const legacyRegistry = JSON.parse(fs.readFileSync(legacyFile, 'utf8'))
@@ -1287,17 +1254,19 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           if (existingLabels.has(label.trim().toLowerCase())) {
             label = `${label} (Legacy)`
           }
-          currentRegistry.connections.push({ ...conn, label })
+          const connectionToSave = { ...conn, label }
+          if (conn.kind === 'remote' && conn.authMode === 'oauth') {
+            const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`
+            connectionToSave.partition = `persist:${partName}`
+          }
+          currentRegistry.connections.push(connectionToSave)
           existingIds.add(conn.id)
           existingLabels.add(label.trim().toLowerCase())
           modified = true
 
           // If legacy primary remote connection is migrating into destination as non-primary, seed its dedicated partition from shared jar
-          if (conn.kind === 'remote' && conn.authMode === 'oauth') {
-            if (legacyRegistry.primary === conn.id) {
-              migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
-            }
-            reconcileV1RoutingException(conn.url, conn.id)
+          if (conn.kind === 'remote' && conn.authMode === 'oauth' && legacyRegistry.primary === conn.id) {
+            migrateConnectionOauthPartition(legacyDir, currentDir, conn.id, conn.id, true)
           } else if (conn.kind === 'cloud') {
             ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
           }
@@ -1326,7 +1295,12 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
             if (existingLabels.has(label.trim().toLowerCase())) {
               label = `${label} (Legacy)`
             }
-            currentRegistry.connections.push({ ...conn, id: newId, label })
+            const connectionToSave = { ...conn, id: newId, label }
+            if (conn.kind === 'remote' && conn.authMode === 'oauth') {
+              const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(newId)}`
+              connectionToSave.partition = `persist:${partName}`
+            }
+            currentRegistry.connections.push(connectionToSave)
             existingIds.add(newId)
             existingLabels.add(label.trim().toLowerCase())
             modified = true
@@ -1340,12 +1314,14 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
                 newId,
                 legacyRegistry.primary === conn.id
               )
-              reconcileV1RoutingException(conn.url, newId)
             } else if (conn.kind === 'cloud') {
               ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
             }
           } else if (isRemoteOauth && legacyHasSession && !currentHasSession) {
             // Endpoints match and destination has no session yet: seed destination partition from legacy session
+            const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`
+            existing.partition = `persist:${partName}`
+            modified = true
             migrateConnectionOauthPartition(
               legacyDir,
               currentDir,
@@ -1353,7 +1329,6 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
               conn.id,
               legacyRegistry.primary === conn.id
             )
-            reconcileV1RoutingException(conn.url, conn.id)
           }
         }
       }
