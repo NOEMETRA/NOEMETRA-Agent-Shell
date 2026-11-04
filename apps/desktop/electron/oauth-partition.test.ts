@@ -551,4 +551,17 @@ describe('resolveOauthPartition with connectionId (pre-save sign-in identity)', 
     })
     expect(standard).not.toBe('persist:conn-isolated')
   })
+
+  it('normalizes explicit partition names missing persist: prefix to persistent jars', () => {
+    const reg = registry('local', [
+      { id: 'local', kind: 'local' },
+      { id: 'custom-part', kind: 'remote', url: 'https://gateway.example', authMode: 'oauth', partition: 'custom-partition-name' }
+    ])
+
+    const got = resolveOauthPartition('https://gateway.example/api/status', {
+      registry: reg,
+      connectionId: 'custom-part'
+    })
+    expect(got).toBe('persist:custom-partition-name')
+  })
 })
