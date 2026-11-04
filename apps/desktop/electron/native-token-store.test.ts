@@ -385,7 +385,6 @@ test('an unparseable gateway URL logs a fixed placeholder rather than the raw va
 
 test('mergeNativeTokenStoreObjects preserves destination tokens on key collisions and remaps scoped keys', () => {
   const legacyStore = {
-    'https://gw.example.com': { encoding: 'safeStorage', value: 'legacy-unscoped' },
     'https://gw.example.com#conn=remote-1': { encoding: 'safeStorage', value: 'legacy-remote-1' },
     'https://gw.example.com#conn=remote-2': { encoding: 'safeStorage', value: 'legacy-remote-2' },
     'https://other.example.com#conn=conn-3': { encoding: 'safeStorage', value: 'legacy-other-3' }
@@ -409,8 +408,45 @@ test('mergeNativeTokenStoreObjects preserves destination tokens on key collision
   assert.equal(merged['https://gw.example.com#conn=remote-2-imported-1'].value, 'legacy-remote-2')
   assert.equal(merged['https://gw.example.com#conn=remote-2'], undefined)
   assert.equal(merged['https://other.example.com#conn=conn-3-legacy'].value, 'legacy-other-3')
-  // Legacy unscoped token is imported when destination has no collision:
-  assert.equal(merged['https://gw.example.com'].value, 'legacy-unscoped')
+})
+
+test('mergeNativeTokenStoreObjects quarantines ambiguous legacy unscoped tokens to protect account isolation', () => {
+  // Two non-primary connections share the same gateway URL in legacy
+  const legacyRegistry = {
+    primary: 'other-conn',
+    connections: [
+      { id: 'other-conn', kind: 'remote', url: 'https://other.example.com' },
+      { id: 'team-a', kind: 'remote', url: 'https://gw.example.com' },
+      { id: 'team-b', kind: 'remote', url: 'https://gw.example.com' }
+    ]
+  }
+
+  const legacyStore = {
+    'https://gw.example.com': { encoding: 'safeStorage', value: 'ambiguous-team-token' }
+  }
+
+  const currentStore = {
+    'https://gw.example.com#conn=dest-conn': { encoding: 'safeStorage', value: 'dest-token' }
+  }
+
+  const legacyUrlToConnId = buildLegacyUrlToConnectionMap(legacyRegistry)
+  // buildLegacyUrlToConnectionMap refuses to pick an owner for ambiguous URLs:
+  assert.equal(legacyUrlToConnId.get('https://gw.example.com'), undefined)
+
+  const { merged, quarantined, modified } = mergeNativeTokenStoreObjects(
+    legacyStore,
+    currentStore,
+    new Map(),
+    legacyUrlToConnId
+  )
+
+  // Token must NOT land in the active store under bare URL:
+  assert.equal(merged['https://gw.example.com'], undefined)
+  // Nor under any active connection:
+  assert.equal(Object.keys(merged).length, 1)
+  assert.equal(merged['https://gw.example.com#conn=dest-conn'].value, 'dest-token')
+  // It must be placed in quarantine for recovery:
+  assert.equal(quarantined['https://gw.example.com']?.value, 'ambiguous-team-token')
 })
 
 test('mergeNativeTokenStoreObjects scopes unscoped legacy tokens to imported connection and prevents collision', () => {

@@ -1646,12 +1646,34 @@ function mergeNativeOAuthTokenStores(
       }
     }
 
-    const { merged, modified } = mergeNativeTokenStoreObjects(
+    const { merged, quarantined, modified } = mergeNativeTokenStoreObjects(
       legacyJson,
       currentJson,
       idRemap,
       legacyUrlToConnId
     )
+
+    if (Object.keys(quarantined).length > 0) {
+      const quarantinePath = path.join(currentDir, 'native-oauth-tokens.quarantine.json')
+      try {
+        let existingQuarantine: Record<string, any> = {}
+        if (fs.existsSync(quarantinePath)) {
+          try {
+            const raw = fs.readFileSync(quarantinePath, 'utf8')
+            const parsed = JSON.parse(raw)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              existingQuarantine = parsed
+            }
+          } catch {}
+        }
+        const combined = { ...existingQuarantine, ...quarantined }
+        fs.mkdirSync(path.dirname(quarantinePath), { recursive: true })
+        fs.writeFileSync(quarantinePath, JSON.stringify(combined, null, 2), { mode: 0o600 })
+        console.warn(`[noemetra] quarantined ${Object.keys(quarantined).length} ambiguous legacy native tokens into native-oauth-tokens.quarantine.json`)
+      } catch (quarantineErr) {
+        console.warn('[noemetra] failed to write native-oauth-tokens.quarantine.json:', quarantineErr)
+      }
+    }
 
     if (modified || !destExisted) {
       fs.mkdirSync(path.dirname(currentStorePath), { recursive: true })
