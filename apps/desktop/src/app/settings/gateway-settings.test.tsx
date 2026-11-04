@@ -439,7 +439,31 @@ describe('GatewaySettings', () => {
     )
     expect(agentSignIn).toHaveBeenCalledWith('https://new-iso.example', { partition: 'persist:portal-iso' })
     registry.value = null
-    activeId.value = null
+    activeId.value = 'saved-b'
+  })
+
+  it('does not pass active remote connection ID to cloud.login or cloud.status when configuring Cloud', async () => {
+    registry.value = {
+      primary: 'remote-1',
+      connections: [
+        { id: 'remote-1', kind: 'remote', label: 'Remote Gateway', url: 'https://remote.example', authMode: 'oauth' }
+      ]
+    }
+    activeId.value = 'remote-1'
+    getConnectionConfig.mockResolvedValue({ ...localConnection, mode: 'cloud' })
+    const login = vi.fn().mockResolvedValue({ ok: true, signedIn: true })
+    const status = vi.fn().mockResolvedValue({ signedIn: false })
+    const discover = vi.fn().mockResolvedValue({ agents: [], org: null })
+    Object.assign(window.hermesDesktop, {
+      cloud: { status, login, discover }
+    })
+    render(<GatewaySettings embedded />)
+    await waitFor(() => expect(status).toHaveBeenCalledWith({ connectionId: undefined }))
+    const signInButton = await screen.findByRole('button', { name: 'Sign in to Hermes Cloud' })
+    fireEvent.click(signInButton)
+    await waitFor(() => expect(login).toHaveBeenCalledWith({ connectionId: undefined }))
+    registry.value = null
+    activeId.value = 'saved-b'
   })
   // #114856: an env-pinned remote (HERMES_DESKTOP_REMOTE_URL) whose session
   // lapsed could not be re-authenticated from Settings → Gateway at all — the

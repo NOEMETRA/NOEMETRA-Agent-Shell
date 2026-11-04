@@ -288,6 +288,9 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
   const contextSeq = useRef(0)
   const registry = useStore($connectionsRegistry)
   const activeConnectionId = useStore($activeConnectionId)
+  const activeCloudConnection = registry?.connections.find(c => c.id === activeConnectionId && c.kind === 'cloud')
+  const activeCloudConnectionId = activeCloudConnection?.id
+  const activeCloudPartition = activeCloudConnection?.partition
   const savedCloudConnections = registry?.connections.filter(connection => connection.kind === 'cloud') ?? []
 
   useEffect(() => {
@@ -640,16 +643,12 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
     setCloudDiscover('loading')
 
     try {
-      const activeConnection = registry?.connections.find(c => c.id === activeConnectionId)
-      const activePartition =
-        activeConnection?.kind === 'cloud' && activeConnection?.partition ? activeConnection.partition : undefined
-
       const result = await desktop.cloud.discover(
         org,
-        activeConnectionId
+        activeCloudConnectionId
           ? {
-              connectionId: activeConnectionId,
-              ...(activePartition ? { partition: activePartition } : {})
+              connectionId: activeCloudConnectionId,
+              ...(activeCloudPartition ? { partition: activeCloudPartition } : {})
             }
           : undefined
       )
@@ -735,7 +734,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
 
     let cancelled = false
     desktop.cloud
-      .status({ connectionId: activeConnectionId || undefined })
+      .status({ connectionId: activeCloudConnectionId || undefined })
       .then(status => {
         if (cancelled) {
           return
@@ -770,7 +769,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
 
     return () => void (cancelled = true)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reload on mode change only
-  }, [state.mode, activeConnectionId])
+  }, [state.mode, activeCloudConnectionId])
 
   const cloudSignIn = async () => {
     const desktop = window.hermesDesktop
@@ -783,7 +782,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
     setCloudSigningIn(true)
 
     try {
-      const result = await desktop.cloud.login({ connectionId: activeConnectionId || undefined })
+      const result = await desktop.cloud.login({ connectionId: activeCloudConnectionId || undefined })
 
       if (seq !== signingSeq.current) {
         return
@@ -816,7 +815,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
     setCloudSigningIn(true)
 
     try {
-      await desktop.cloud.logout({ connectionId: activeConnectionId || undefined })
+      await desktop.cloud.logout({ connectionId: activeCloudConnectionId || undefined })
 
       if (seq !== signingSeq.current) {
         return
@@ -893,12 +892,8 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
         return
       }
 
-      const activeConnection = registry?.connections.find(c => c.id === activeConnectionId)
-      const activePartition =
-        activeConnection?.kind === 'cloud' && activeConnection?.partition ? activeConnection.partition : undefined
-
-      const result = activePartition
-        ? await desktop.cloud.agentSignIn(agent.dashboardUrl, { partition: activePartition })
+      const result = activeCloudPartition
+        ? await desktop.cloud.agentSignIn(agent.dashboardUrl, { partition: activeCloudPartition })
         : await desktop.cloud.agentSignIn(agent.dashboardUrl)
 
       if (seq !== contextSeq.current) {
@@ -921,7 +916,7 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
         remoteUrl: agent.dashboardUrl,
         cloudOrg: cloudOrgRef.current ?? undefined,
         cloudName: agent.name,
-        ...(activePartition ? { partition: activePartition } : {})
+        ...(activeCloudPartition ? { partition: activeCloudPartition } : {})
       })
 
       if (seq !== contextSeq.current) {

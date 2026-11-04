@@ -9067,11 +9067,12 @@ function openOauthLoginWindow(
 //      no-replay rule of requestWithOauthFallback.
 function fetchJsonViaOauthSession(url, options: any = {}) {
   const connectionId = typeof options?.connectionId === 'string' ? options.connectionId : ''
-  const partition = resolveOauthPartitionForUrl(url, { connectionId })
+  const explicitPartition = typeof options?.partition === 'string' ? options.partition.trim() : ''
+  const partition = explicitPartition || resolveOauthPartitionForUrl(url, { connectionId })
 
   const attempt = (): Promise<unknown> =>
     new Promise((resolve, reject) => {
-      const sess = getOauthSessionForUrl(url, { connectionId })
+      const sess = getOauthSessionForUrl(url, { connectionId, partition: explicitPartition })
 
       if (!sess) {
         reject(new Error('OAuth session partition is unavailable.'))
@@ -9578,7 +9579,8 @@ async function discoverCloudAgents(org?: string, opts?: { connectionId?: string;
           {
             method: 'GET',
             timeoutMs: 15_000,
-            connectionId: connectionId || undefined
+            connectionId: connectionId || undefined,
+            partition: portalPartition
           }
         ),
       org
