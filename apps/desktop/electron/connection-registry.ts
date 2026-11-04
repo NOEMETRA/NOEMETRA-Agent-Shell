@@ -1654,7 +1654,8 @@ export function reconcileAppliedGlobalConnection(
       token: block.token,
       headers: block.headers,
       org: block.org,
-      name
+      name,
+      partition: block.partition || existing?.partition
     },
     registry
   )

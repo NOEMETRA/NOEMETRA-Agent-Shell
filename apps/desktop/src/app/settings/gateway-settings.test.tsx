@@ -63,6 +63,7 @@ const localConnection = {
 
 beforeEach(() => {
   registry.value = null
+  activeId.value = 'saved-b'
   selectConnection.mockReset().mockResolvedValue(undefined)
   getConnectionConfig.mockResolvedValue(localConnection)
   saveConnectionConfig.mockResolvedValue(localConnection)
@@ -390,6 +391,55 @@ describe('GatewaySettings', () => {
     )
     expect(agentSignIn).toHaveBeenCalledExactlyOnceWith('https://new-a.example')
     expect(applyConnectionConfig).toHaveBeenCalledTimes(1)
+  })
+
+  it('carries active isolated partition through agent discovery, sign-in and save', async () => {
+    registry.value = {
+      primary: 'cloud-isolated',
+      connections: [
+        {
+          id: 'cloud-isolated',
+          kind: 'cloud',
+          label: 'Primary Isolated',
+          url: 'https://iso.example',
+          authMode: 'oauth',
+          partition: 'persist:portal-iso'
+        }
+      ]
+    }
+    activeId.value = 'cloud-isolated'
+    getConnectionConfig.mockResolvedValue({ ...localConnection, mode: 'cloud' })
+    const agentSignIn = vi.fn().mockResolvedValue({ connected: true })
+    const applyConnectionConfig = vi.fn().mockResolvedValue({ ...localConnection, mode: 'cloud' })
+    const discover = vi.fn().mockResolvedValue({
+      agents: [{ id: 'new-iso', name: 'Isolated Bot', dashboardUrl: 'https://new-iso.example' }],
+      org: { id: 'org-iso' }
+    })
+    Object.assign(window.hermesDesktop, {
+      applyConnectionConfig,
+      cloud: {
+        status: vi.fn().mockResolvedValue({ signedIn: true }),
+        agentSignIn,
+        discover
+      }
+    })
+    render(<GatewaySettings embedded />)
+    const connectButton = await screen.findByRole('button', { name: 'Connect', exact: true })
+    expect(discover).toHaveBeenCalledWith(undefined, { connectionId: 'cloud-isolated', partition: 'persist:portal-iso' })
+    fireEvent.click(connectButton)
+    await waitFor(() =>
+      expect(applyConnectionConfig).toHaveBeenCalledWith({
+        mode: 'cloud',
+        remoteAuthMode: 'oauth',
+        remoteUrl: 'https://new-iso.example',
+        cloudOrg: 'org-iso',
+        cloudName: 'Isolated Bot',
+        partition: 'persist:portal-iso'
+      })
+    )
+    expect(agentSignIn).toHaveBeenCalledWith('https://new-iso.example', { partition: 'persist:portal-iso' })
+    registry.value = null
+    activeId.value = null
   })
   // #114856: an env-pinned remote (HERMES_DESKTOP_REMOTE_URL) whose session
   // lapsed could not be re-authenticated from Settings → Gateway at all — the

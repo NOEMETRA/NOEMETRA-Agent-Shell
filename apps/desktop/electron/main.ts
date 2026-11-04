@@ -1372,7 +1372,7 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
               currentDir,
               conn.id,
               conn.id,
-              legacyRegistry.primary === conn.id
+              legacyRegistry.primary === conn.id || isLegacyV1RemoteMatch(conn)
             )
           }
         }
@@ -8868,8 +8868,16 @@ async function captureRemoteSessionCookiesIntoMirror(sess, partition, baseUrl) {
   }
 }
 
-async function hasOauthSessionCookie(baseUrl, { connectionId = '', pendingAuthMode = '', pendingKind = '' } = {}) {
-  const sess = getOauthSessionForUrl(baseUrl, { connectionId, pendingAuthMode, pendingKind })
+async function hasOauthSessionCookie(
+  baseUrl,
+  { connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}
+) {
+  const sess = getOauthSessionForUrl(baseUrl, {
+    connectionId,
+    pendingAuthMode,
+    pendingKind,
+    partition: explicitPartition
+  })
 
   if (!sess) {
     return false
@@ -8983,11 +8991,11 @@ const oauthLoginFlights = new OauthLoginFlights()
 
 function openOauthLoginWindow(
   baseUrl,
-  { silent = false, background = false, connectionId = '', pendingAuthMode = '', pendingKind = '' } = {}
+  { silent = false, background = false, connectionId = '', pendingAuthMode = '', pendingKind = '', partition: explicitPartition = '' } = {}
 ) {
-  const identity = { connectionId, pendingAuthMode, pendingKind }
+  const identity = { connectionId, pendingAuthMode, pendingKind, partition: explicitPartition }
   const unattended = background || !canShowInteractiveOauthLogin()
-  const partition = resolveOauthPartitionForUrl(baseUrl, identity)
+  const partition = explicitPartition || resolveOauthPartitionForUrl(baseUrl, identity)
 
   return oauthLoginFlights.run(loginFlightKey(partition, baseUrl), unattended ? 'background' : 'foreground', () => {
     const sess = app.isReady() ? getOauthSessionForUrl(baseUrl, identity) : null
@@ -9687,9 +9695,12 @@ function trimCloudAgents(body) {
 // if the portal session were absent it would fall through to an interactive
 // login, which the discovery gate already prevents). Returns once the agent's
 // gateway session cookie is present.
-async function cloudAgentSilentSignIn(dashboardUrl, { background = false, connectionId = '' } = {}) {
+async function cloudAgentSilentSignIn(
+  dashboardUrl,
+  { background = false, connectionId = '', partition: explicitPartition = '' } = {}
+) {
   const baseUrl = normalizeRemoteBaseUrl(dashboardUrl)
-  const partition = resolveOauthPartitionForUrl(baseUrl, { connectionId })
+  const partition = explicitPartition || resolveOauthPartitionForUrl(baseUrl, { connectionId })
   const portalPartition = partition !== OAUTH_SESSION_PARTITION ? partition : undefined
 
   // Pre-req: a live portal session must exist, or this would surface an
@@ -9709,9 +9720,9 @@ async function cloudAgentSilentSignIn(dashboardUrl, { background = false, connec
     await renewPortalAccessSilently({ partition: portalPartition })
   }
 
-  await openOauthLoginWindow(baseUrl, { silent: true, background, connectionId })
+  await openOauthLoginWindow(baseUrl, { silent: true, background, connectionId, partition })
 
-  return { baseUrl, connected: await hasOauthSessionCookie(baseUrl, { connectionId }) }
+  return { baseUrl, connected: await hasOauthSessionCookie(baseUrl, { connectionId, partition }) }
 }
 
 // ---------------------------------------------------------------------------
@@ -10799,7 +10810,8 @@ function buildRemoteBlock(
   org?: string,
   headers?: object,
   name?: string,
-  remoteProfile?: string
+  remoteProfile?: string,
+  partition?: string
 ) {
   if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
     throw new Error('Remote gateway session token is required.')
@@ -10813,6 +10825,7 @@ function buildRemoteBlock(
     org?: string
     name?: string
     remoteProfile?: string
+    partition?: string
   } = {
     url: normalizeRemoteBaseUrl(remoteUrl),
     authMode,
@@ -10841,6 +10854,11 @@ function buildRemoteBlock(
 
   if (remoteProfileName) {
     block.remoteProfile = remoteProfileName.remoteProfile
+  }
+
+  const partitionValue = typeof partition === 'string' ? partition.trim() : ''
+  if (partitionValue) {
+    block.partition = partitionValue
   }
 
   return block
@@ -10887,6 +10905,8 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
         ).trim()
       : ''
 
+  const partition = typeof input.partition === 'string' ? input.partition.trim() : (existingBlock.partition || '')
+
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
   const remoteHeaders =
@@ -10930,7 +10950,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
     if (remoteLike) {
       profiles[key] = {
         mode,
-        ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders, cloudName, input.remoteProfile)
+        ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders, cloudName, input.remoteProfile, partition)
       }
     } else {
       const localEntry = localProfileEntry(rawExistingBlock)
@@ -10950,7 +10970,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   }
 
   const nextRemote = remoteLike
-    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders, cloudName)
+    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders, cloudName, undefined, partition)
     : existingMode === 'ssh'
       ? rawExistingBlock
       : { url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl, authMode, token: nextToken }
@@ -17365,13 +17385,14 @@ ipcMain.handle('hermes:cloud:discover', async (_event, org, opts?: { connectionI
   }
   return discoverCloudAgents(selectedOrg, options)
 })
-ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl, opts?: { connectionId?: string }) => {
+ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl, opts?: { connectionId?: string; partition?: string }) => {
   // Silent per-agent sign-in via the shared or dedicated portal session. Returns the agent's
   // gateway baseUrl + whether its session cookie landed; the renderer then
   // saves a cloud-mode connection pointed at this dashboardUrl.
   const connId = typeof dashboardUrl === 'object' ? dashboardUrl?.connectionId : opts?.connectionId
+  const partition = typeof dashboardUrl === 'object' ? dashboardUrl?.partition : opts?.partition
   const url = typeof dashboardUrl === 'string' ? dashboardUrl : dashboardUrl?.dashboardUrl || dashboardUrl?.url
-  return cloudAgentSilentSignIn(url, { connectionId: connId })
+  return cloudAgentSilentSignIn(url, { connectionId: connId, partition })
 })
 ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
   assertCanMutateManagedPrimaryRouting()

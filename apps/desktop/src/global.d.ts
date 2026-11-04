@@ -286,7 +286,7 @@ declare global {
         ) => Promise<DesktopCloudDiscoverResult>
         agentSignIn: (
           dashboardUrl: string,
-          opts?: { connectionId?: string }
+          opts?: { connectionId?: string; partition?: string }
         ) => Promise<DesktopCloudAgentSignInResult>
       }
       profile: {
@@ -1256,6 +1256,7 @@ export interface DesktopConnectionConfigInput {
   // For a URL-remote/cloud per-profile override: the profile name on the remote
   // host when it differs from this Desktop routing label.
   remoteProfile?: string
+  partition?: string
 }
 
 export interface DesktopConnectionTestResult {
@@ -1312,6 +1313,7 @@ export interface DesktopRegistryConnection {
   // connections sharing it are one physical backend registered under two
   // addresses (display-only "Same backend as …" hint in Settings).
   installId?: string
+  partition?: string
 }
 
 export interface DesktopConnectionsRegistry {
@@ -1352,6 +1354,7 @@ export interface DesktopRegistryConnectionInput {
   keyPath?: string
   remoteHermesPath?: string
   remoteProfile?: string
+  partition?: string
 }
 
 // One agent in the union roster: a profile on a registered source, with the
