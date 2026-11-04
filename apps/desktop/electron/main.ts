@@ -9507,10 +9507,37 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
       return scopedKey
     }
 
-    // If no scoped token found under this connectionId, check if it's the primary
-    // connection falling back to a pre-migration legacy unscoped token on baseUrl:
-    if (isPrimaryOrUnscopedConnection(cid) && _loadNativeTokens(normUrl) !== null) {
-      return normUrl
+    // If no scoped token found under this connectionId, check if a pre-upgrade
+    // unscoped token exists on baseUrl that unambiguously belongs to this connection
+    // (either the primary connection or the sole connection registered for this URL).
+    // Migrate it to the scoped key to avoid requiring users to sign in again after upgrade.
+    if (_loadNativeTokens(normUrl) !== null) {
+      try {
+        const registry = readDesktopConnectionsRegistry()
+        const connectionsForUrl = (registry?.connections || []).filter(
+          (c: any) =>
+            c &&
+            (c.kind === 'remote' || c.kind === 'cloud') &&
+            c.url &&
+            normalizeRemoteBaseUrl(c.url) === normUrl
+        )
+        const isPrimary = registry?.primary === cid
+        const isSoleMatch = connectionsForUrl.length === 1 && connectionsForUrl[0]?.id === cid
+
+        if (isPrimary || isSoleMatch) {
+          const legacyTokens = _loadNativeTokens(normUrl)
+          if (legacyTokens) {
+            _storeNativeTokens(scopedKey, legacyTokens)
+            _clearNativeTokens(normUrl)
+            return scopedKey
+          }
+          return normUrl
+        }
+      } catch {
+        if (isPrimaryOrUnscopedConnection(cid)) {
+          return normUrl
+        }
+      }
     }
 
     return scopedKey
@@ -9524,6 +9551,15 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
       const primaryScopedKey = `${normUrl}#conn=${primaryId}`
       if (_loadNativeTokens(primaryScopedKey) !== null) {
         return primaryScopedKey
+      }
+      // Migrate unambiguous legacy token on baseUrl to the primary connection
+      if (_loadNativeTokens(normUrl) !== null) {
+        const legacyTokens = _loadNativeTokens(normUrl)
+        if (legacyTokens) {
+          _storeNativeTokens(primaryScopedKey, legacyTokens)
+          _clearNativeTokens(normUrl)
+          return primaryScopedKey
+        }
       }
     }
   } catch {}
