@@ -1206,6 +1206,7 @@ function applyPendingLegacyDatabaseRestore(): void {
         if (tx && tx.phase === 'committed') {
           console.log('[noemetra] prior swap transaction was committed; completing publication and cleanup')
           const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
+          let manifestPublished = true
           if (tx.action === 'restore-intervening') {
             try {
               if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
@@ -1239,23 +1240,29 @@ function applyPendingLegacyDatabaseRestore(): void {
                 )
               } catch (manifestErr) {
                 console.error('[noemetra] failed to write recovery manifest during committed recovery:', manifestErr)
+                manifestPublished = false
               }
             }
           }
-          // Clean up backups and markers now that manifest is published
-          for (const db of tx.databases || []) {
-            if (db.backupPath && fs.existsSync(db.backupPath)) {
-              try {
-                fs.rmSync(db.backupPath, { recursive: true, force: true })
-              } catch {}
+
+          if (manifestPublished) {
+            // Clean up backups and markers now that manifest is published
+            for (const db of tx.databases || []) {
+              if (db.backupPath && fs.existsSync(db.backupPath)) {
+                try {
+                  fs.rmSync(db.backupPath, { recursive: true, force: true })
+                } catch {}
+              }
             }
+            try {
+              fs.rmSync(pendingRestorePath, { force: true })
+            } catch {}
+            try {
+              fs.rmSync(swapTxPath, { force: true })
+            } catch {}
+          } else {
+            console.error('[noemetra] manifest publication failed; retaining committed transaction and backups for retry on next launch')
           }
-          try {
-            fs.rmSync(pendingRestorePath, { force: true })
-          } catch {}
-          try {
-            fs.rmSync(swapTxPath, { force: true })
-          } catch {}
           return
         }
 
@@ -1523,28 +1530,41 @@ function applyPendingLegacyDatabaseRestore(): void {
     }
 
     // Step 4: Mark transaction committed BEFORE publishing manifest and cleaning up backups (per AGENTS.md:73-78)
-    fs.writeFileSync(
-      swapTxPath,
-      JSON.stringify(
-        {
-          id: txId,
-          action: request.action || 'restore-legacy',
-          phase: 'committed',
-          databases: txDatabases
-        },
-        null,
-        2
-      ),
-      'utf8'
-    )
+    try {
+      fs.writeFileSync(
+        swapTxPath,
+        JSON.stringify(
+          {
+            id: txId,
+            action: request.action || 'restore-legacy',
+            phase: 'committed',
+            databases: txDatabases
+          },
+          null,
+          2
+        ),
+        'utf8'
+      )
+    } catch (txCommitErr) {
+      console.error('[noemetra] failed to write committed transaction record; stopping startup to protect data:', txCommitErr)
+      try {
+        dialog.showErrorBox(
+          'Database Restore Interrupted',
+          'A database restore completed but its transaction commit could not be persisted. To protect your data from rollback on next launch, NOEMETRA Agent Shell cannot start.'
+        )
+      } catch {}
+      app.exit(1)
+      return
+    }
 
     // Step 5: Publish recovery manifest BEFORE deleting backups
     const manifestPath = path.join(currentDir, 'legacy-migration-recovery.json')
     if (request.action === 'restore-intervening') {
-      // User restored their intervening setup: clean up manifest as reverse recovery cycle is complete
       try {
         if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath, { force: true })
-      } catch {}
+      } catch (rmManifestErr) {
+        console.warn('[noemetra] could not remove previous recovery manifest:', rmManifestErr)
+      }
     } else {
       // User restored legacy data: retain an actionable recovery manifest for the displaced intervening databases!
       // This satisfies [apps/desktop/AGENTS.md:73-78] by offering reverse restore after the restart.
@@ -1575,12 +1595,15 @@ function applyPendingLegacyDatabaseRestore(): void {
             'utf8'
           )
         } catch (manifestErr) {
-          console.error('[noemetra] failed to write intervening recovery manifest:', manifestErr)
+          console.error('[noemetra] failed to write intervening recovery manifest; retaining committed transaction and backups for retry:', manifestErr)
+          // RETAIN the committed transaction and backups! Do NOT delete them.
+          // On next launch, STEP 0 detects phase === 'committed' and retries publishing the manifest!
+          return
         }
       }
     }
 
-    // Step 6: Now that manifest is published, remove pending request, backups and transaction record
+    // Step 6: Manifest is published. Remove pending request, backups and transaction record.
     try {
       fs.rmSync(pendingRestorePath, { force: true })
     } catch {}
@@ -1597,7 +1620,6 @@ function applyPendingLegacyDatabaseRestore(): void {
       fs.rmSync(swapTxPath, { force: true })
     } catch {}
 
-    console.log('[noemetra] successfully restored database(s) before Chromium startup')
     console.log('[noemetra] successfully restored database(s) before Chromium startup')
   } catch (err) {
     console.error('[noemetra] unexpected error in applyPendingLegacyDatabaseRestore:', err)
@@ -1712,7 +1734,14 @@ function maybeMigrateLegacyDesktopState(): void {
             fs.rmSync(stagingDir, { recursive: true, force: true })
           } catch {}
         } else {
-          console.error('[noemetra] interrupted-migration recovery did not complete; aborting migration to preserve snapshot for later retry')
+          console.error('[noemetra] interrupted-migration recovery did not complete; stopping startup to preserve snapshot for later retry')
+          try {
+            dialog.showErrorBox(
+              'Migration Recovery Interrupted',
+              'A previous migration could not be cleanly recovered. To protect your data, NOEMETRA Agent Shell cannot start until disk permissions or locks are resolved.'
+            )
+          } catch {}
+          app.exit(1)
           return
         }
       } else if (fs.existsSync(stagingDir)) {
@@ -1904,7 +1933,15 @@ function maybeMigrateLegacyDesktopState(): void {
           } catch {}
         } else {
           rollbackFailed = true
-          console.error('[noemetra] rollback did not complete; retaining backup, staging and in-progress marker for recovery')
+          console.error('[noemetra] rollback did not complete; stopping startup to preserve backup and staging for recovery')
+          try {
+            dialog.showErrorBox(
+              'Migration Recovery Interrupted',
+              'A migration operation failed and could not be completely rolled back. To protect your data, NOEMETRA Agent Shell cannot start until disk permissions or locks are resolved.'
+            )
+          } catch {}
+          app.exit(1)
+          return
         }
         throw copyErr
       } finally {
