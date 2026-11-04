@@ -9476,6 +9476,17 @@ function scopedNativeTokenKey(baseUrl: string, connectionId?: string): string {
   return cid ? `${normUrl}#conn=${cid}` : normUrl
 }
 
+function isPrimaryOrUnscopedConnection(connectionId?: string): boolean {
+  const cid = typeof connectionId === 'string' ? connectionId.trim() : ''
+  if (!cid) return true
+  try {
+    const registry = readDesktopConnectionsRegistry()
+    return registry?.primary === cid
+  } catch {
+    return true
+  }
+}
+
 function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): string {
   const normUrl = normalizeRemoteBaseUrl(baseUrl)
   const cid = typeof connectionId === 'string' ? connectionId.trim() : ''
@@ -9486,12 +9497,9 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
     return scopedKey
   }
 
-  try {
-    const registry = readDesktopConnectionsRegistry()
-    if (registry?.primary === cid) {
-      return normUrl
-    }
-  } catch {}
+  if (isPrimaryOrUnscopedConnection(cid)) {
+    return normUrl
+  }
 
   return scopedKey
 }
@@ -17621,9 +17629,11 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
         throw new NativeAuthChangedError()
       }
 
-      nativeAccessTokenCoordinator.storeTokens(baseUrl, tokens)
       if (loginConnectionId) {
         nativeAccessTokenCoordinator.storeTokens(scopedNativeTokenKey(baseUrl, loginConnectionId), tokens)
+      }
+      if (isPrimaryOrUnscopedConnection(loginConnectionId)) {
+        nativeAccessTokenCoordinator.storeTokens(baseUrl, tokens)
       }
       // Confirmed sign-in — release the reauth latch so the next
       // startHermes() re-dials instead of replaying the stale rejection.
@@ -17664,9 +17674,11 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
 
   if (connected) {
     // A confirmed cookie login supersedes any older native identity.
-    nativeAccessTokenCoordinator.clearTokens(baseUrl)
     if (loginConnectionId) {
       nativeAccessTokenCoordinator.clearTokens(scopedNativeTokenKey(baseUrl, loginConnectionId))
+    }
+    if (isPrimaryOrUnscopedConnection(loginConnectionId)) {
+      nativeAccessTokenCoordinator.clearTokens(baseUrl)
     }
     remoteReauthFailure = null
   }
@@ -17683,9 +17695,11 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl, r
   // logout clears BOTH auth shapes.
   // Clear before awaiting cookie I/O: a pending login/refresh cannot restore
   // logout, and a later login must not be erased when cookie clearing settles.
-  nativeAccessTokenCoordinator.clearTokens(baseUrl)
   if (connectionId) {
     nativeAccessTokenCoordinator.clearTokens(scopedNativeTokenKey(baseUrl, connectionId))
+  }
+  if (isPrimaryOrUnscopedConnection(connectionId)) {
+    nativeAccessTokenCoordinator.clearTokens(baseUrl)
   }
   await clearOauthSession(baseUrl, { connectionId })
 
