@@ -241,8 +241,20 @@ export function BootFailureOverlay() {
         // Generic copy is fine.
       }
 
+      let connId = config.connectionId || ''
+      if (!connId && desktop?.connections?.list) {
+        try {
+          const reg = await desktop.connections.list()
+          if (reg?.primary) {
+            connId = reg.primary
+          }
+        } catch {
+          // Generic fallback
+        }
+      }
+
       if (!cancelled) {
-        setRemoteReauth({ url: config.remoteUrl, ...shape })
+        setRemoteReauth({ url: config.remoteUrl, connectionId: connId || undefined, ...shape })
       }
     })()
 
@@ -321,7 +333,7 @@ export function BootFailureOverlay() {
       if (connectionConfig?.mode === 'cloud' && desktop?.cloud) {
         // The ladder drops this gateway's lapsed cookies itself — logging out
         // here as well would fire the IPC twice for the cloud path.
-        const outcome = await reestablishCloudAgentSession(desktop, remoteReauth.url)
+        const outcome = await reestablishCloudAgentSession(desktop, remoteReauth.url, remoteReauth.connectionId)
 
         if (outcome === 'portal-incomplete') {
           notify({
@@ -335,9 +347,15 @@ export function BootFailureOverlay() {
 
         connected = true
       } else {
-        await desktop?.oauthLogoutConnectionConfig?.(remoteReauth.url)
+        if (remoteReauth.connectionId) {
+          await desktop?.oauthLogoutConnectionConfig?.(remoteReauth.url, { connectionId: remoteReauth.connectionId })
+        } else {
+          await desktop?.oauthLogoutConnectionConfig?.(remoteReauth.url)
+        }
 
-        const result: DesktopOauthLoginResult | undefined = await desktop?.oauthLoginConnectionConfig(remoteReauth.url)
+        const result: DesktopOauthLoginResult | undefined = remoteReauth.connectionId
+          ? await desktop?.oauthLoginConnectionConfig(remoteReauth.url, { connectionId: remoteReauth.connectionId })
+          : await desktop?.oauthLoginConnectionConfig(remoteReauth.url)
         connected = result?.connected === true
         error = result?.error
       }
