@@ -943,13 +943,73 @@ const MIGRATION_PENDING_MARKER = '.legacy-migration-pending'
 const MIGRATION_BACKUP_DIR = '.migration-backup'
 const DATABASE_DIR_NAMES = new Set(['Local Storage', 'Session Storage', 'IndexedDB'])
 
+function hasActiveCookieRecords(filePath: string): boolean {
+  try {
+    if (!fs.existsSync(filePath)) return false
+    const stat = fs.statSync(filePath)
+    if (stat.size < 512) return false
+
+    // Method 1: Query table row count with node:sqlite
+    try {
+      const { DatabaseSync } = require('node:sqlite')
+      const db = new DatabaseSync(filePath, { readOnly: true })
+      try {
+        const row = db.prepare('SELECT COUNT(*) as count FROM cookies').get() as any
+        return Boolean(row && Number(row.count) > 0)
+      } finally {
+        db.close()
+      }
+    } catch {
+      // Fallback: parse SQLite B-tree pages to count data cells
+      const buf = fs.readFileSync(filePath)
+      if (buf.length < 100 || buf.subarray(0, 16).toString('utf8') !== 'SQLite format 3\0') {
+        return false
+      }
+      let pageSize = buf.readUInt16BE(16)
+      if (pageSize === 1) pageSize = 65536
+      let leafTableCells = 0
+      for (let offset = 0; offset < buf.length; offset += pageSize) {
+        const headerOffset = offset === 0 ? 100 : offset
+        if (headerOffset + 5 <= buf.length) {
+          const pageType = buf.readUInt8(headerOffset)
+          if (pageType === 0x0d) {
+            leafTableCells += buf.readUInt16BE(headerOffset + 3)
+          }
+        }
+      }
+      // Schema metadata in sqlite_schema accounts for ~2-4 cells on empty databases.
+      // Additional cells indicate actual cookie records stored in the cookies table.
+      return leafTableCells > 4
+    }
+  } catch {}
+  return false
+}
+
 function hasDatabaseContent(dbDir: string): boolean {
   try {
     if (!fs.existsSync(dbDir)) return false
     const rootStat = fs.statSync(dbDir)
     if (!rootStat.isDirectory()) {
-      // Single database file (e.g. SQLite Cookies, state.db).
-      // Empty SQLite template is typically <= 4096 bytes; real stored data is larger.
+      // Single database file
+      const basename = path.basename(dbDir)
+      if (basename.toLowerCase() === 'cookies') {
+        return hasActiveCookieRecords(dbDir)
+      }
+      // SQLite state.db or other single file: probe actual table cell count or size
+      if (basename.endsWith('.db')) {
+        try {
+          const { DatabaseSync } = require('node:sqlite')
+          const db = new DatabaseSync(dbDir, { readOnly: true })
+          try {
+            const row = db.prepare("SELECT COUNT(*) as count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get() as any
+            return Boolean(row && Number(row.count) > 0)
+          } finally {
+            db.close()
+          }
+        } catch {
+          return rootStat.size > 8192
+        }
+      }
       return rootStat.size > 4096
     }
     const files = fs.readdirSync(dbDir, { recursive: true })
@@ -959,6 +1019,10 @@ function hasDatabaseContent(dbDir: string): boolean {
         const stat = fs.statSync(filePath)
         if (stat.isDirectory()) continue
         const basename = path.basename(filePath)
+        if (basename.toLowerCase() === 'cookies') {
+          if (hasActiveCookieRecords(filePath)) return true
+          continue
+        }
         // LevelDB table files with size > 0 contain compacted data
         if (basename.endsWith('.ldb') && stat.size > 0) {
           return true
@@ -987,10 +1051,12 @@ function hasDatabaseContent(dbDir: string): boolean {
 
 function hasActiveCookieData(dir: string): boolean {
   try {
-    const rootCookies = path.join(dir, 'Cookies')
-    const networkCookies = path.join(dir, 'Network', 'Cookies')
-    if (hasDatabaseContent(rootCookies) || hasDatabaseContent(networkCookies)) {
-      return true
+    const candidateCookieFiles = [
+      path.join(dir, 'Cookies'),
+      path.join(dir, 'Network', 'Cookies')
+    ]
+    for (const file of candidateCookieFiles) {
+      if (hasActiveCookieRecords(file)) return true
     }
     const partitionsDir = path.join(dir, 'Partitions')
     if (fs.existsSync(partitionsDir)) {
@@ -998,8 +1064,8 @@ function hasActiveCookieData(dir: string): boolean {
         if (part.endsWith('.legacy')) continue
         const partDir = path.join(partitionsDir, part)
         if (
-          hasDatabaseContent(path.join(partDir, 'Cookies')) ||
-          hasDatabaseContent(path.join(partDir, 'Network', 'Cookies'))
+          hasActiveCookieRecords(path.join(partDir, 'Cookies')) ||
+          hasActiveCookieRecords(path.join(partDir, 'Network', 'Cookies'))
         ) {
           return true
         }
