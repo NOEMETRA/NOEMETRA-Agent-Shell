@@ -234,7 +234,10 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
             local_url = custom_base
 
     norm_url = local_url.strip().rstrip("/")
-    base_v1 = norm_url if norm_url.endswith("/v1") else f"{norm_url}/v1"
+    if provider_name == "ollama":
+        target_base_url = norm_url if norm_url.endswith("/v1") else f"{norm_url}/v1"
+    else:
+        target_base_url = norm_url
 
     if not isinstance(config.get("model"), dict):
         config["model"] = {}
@@ -244,10 +247,10 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
     for extra_key in ("wire_format", "headers", "extra_body", "auth_header"):
         model_cfg.pop(extra_key, None)
     model_cfg["provider"] = provider_name
-    model_cfg["base_url"] = base_v1
+    model_cfg["base_url"] = target_base_url
     model_cfg["default"] = selected_model
 
-    print_success(f"Configured provider: {provider_name} (model: {selected_model}, endpoint: {base_v1})")
+    print_success(f"Configured provider: {provider_name} (model: {selected_model}, endpoint: {target_base_url})")
 
     # Step 2: Terminal Backend; Step 3: defaults
     setup_terminal_backend(config)
