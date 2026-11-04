@@ -513,4 +513,22 @@ describe('resolveOauthPartition with connectionId (pre-save sign-in identity)', 
     })
     expect(rootUrl).toBe(LEGACY_OAUTH_PARTITION)
   })
+
+  it('resolves explicit partition directly when passed to resolveOauthPartition', () => {
+    const reg = registry('local', [
+      { id: 'local', kind: 'local' },
+      { id: 'cloud-iso', kind: 'cloud', url: 'https://iso.example', authMode: 'oauth', partition: 'persist:portal-iso' }
+    ])
+
+    const byId = resolveOauthPartition('https://iso.example/api/status', {
+      registry: reg,
+      connectionId: 'cloud-iso'
+    })
+    expect(byId).toBe('persist:portal-iso')
+
+    const byUrl = resolveOauthPartition('https://iso.example/api/status', {
+      registry: reg
+    })
+    expect(byUrl).toBe('persist:portal-iso')
+  })
 })
