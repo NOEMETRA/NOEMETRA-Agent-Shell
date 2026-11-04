@@ -1645,3 +1645,12 @@ test('FIX #95701: transport and server failures at the ticket mint stay retryabl
     assert.equal(wrapped.isReauthRequired, undefined)
   }
 })
+
+test('normalizeRemoteBaseUrl preserves path case while lowercasing scheme and host', () => {
+  const urlUpper = normalizeRemoteBaseUrl('https://GW.EXAMPLE.COM:8080/Team/Gateway/')
+  const urlLower = normalizeRemoteBaseUrl('https://gw.example.com:8080/team/gateway/')
+
+  assert.equal(urlUpper, 'https://gw.example.com:8080/Team/Gateway')
+  assert.equal(urlLower, 'https://gw.example.com:8080/team/gateway')
+  assert.notEqual(urlUpper, urlLower, 'distinct path cases must not be treated as identical endpoints')
+})
