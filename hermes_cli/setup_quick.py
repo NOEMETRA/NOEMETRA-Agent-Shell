@@ -266,8 +266,7 @@ def _run_first_time_local_setup(config: dict, hermes_home, is_existing: bool, im
         setup_gateway(config)
         save_config(config)
     else:
-        from hermes_cli.gateway_setup_service import ensure_gateway_service
-        ensure_gateway_service(context="setup", interactive=False, config=config)
+        print_info("Skipped messaging platform setup for local inference.")
 
     print()
     print_success("Setup complete! Your local NOEMETRA Agent is ready.")
