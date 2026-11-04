@@ -1160,10 +1160,10 @@ function migrateConnectionOauthPartition(
   const dstPart = path.join(currentUserDataDir, 'Partitions', newPartName)
   const stagingPart = path.join(legacyUserDataDir, 'Partitions', newPartName)
 
-  const candidateSrc = fs.existsSync(srcPart)
-    ? srcPart
-    : wasLegacyPrimary && fs.existsSync(legacySharedPart)
-      ? legacySharedPart
+  const candidateSrc = wasLegacyPrimary && fs.existsSync(legacySharedPart)
+    ? legacySharedPart
+    : fs.existsSync(srcPart)
+      ? srcPart
       : null
 
   if (candidateSrc) {
@@ -10961,6 +10961,7 @@ async function buildRemoteConnection(
       authMode: 'oauth',
       remoteHost: host || undefined,
       remoteIdentity,
+      connectionId: remoteIdentity,
       remoteKind,
       headers: remoteHeaders,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
@@ -10987,6 +10988,7 @@ async function buildRemoteConnection(
     authMode: 'token',
     remoteHost: host || undefined,
     remoteIdentity,
+    connectionId: remoteIdentity,
     remoteKind,
     headers: remoteHeaders,
     token,
@@ -11859,7 +11861,7 @@ async function resolveRemoteBackend(
       route.source,
       undefined,
       route.kind === 'cloud' ? 'cloud' : 'url',
-      undefined,
+      route.connectionId,
       route.headers
     )
   }
@@ -12687,7 +12689,7 @@ async function connectRegistryBackend(
     `registry:${source.id}`,
     undefined,
     source.kind === 'cloud' ? 'cloud' : 'url',
-    undefined,
+    source.id,
     source.headers
   )
 
