@@ -204,15 +204,10 @@ export function resolveReauthConnectionId(
     return undefined
   }
 
-  // Check if primary matches this remote URL
-  if (registry.primary) {
-    const primaryConn = registry.connections.find(c => c && c.id === registry.primary)
-    if (primaryConn && normalizeGatewayUrl(primaryConn.url) === normRemoteUrl) {
-      return primaryConn.id
-    }
-  }
-
-  // Check for an unambiguous matching connection
+  // Find all connections matching this remote URL.
+  // Per desktop scope invariant (AGENTS.md:46-48), never infer the primary account (or any account)
+  // when multiple connections share the same gateway URL. A shared URL is ambiguous; resolve
+  // exclusively when there is a single, unambiguous match.
   const matches = registry.connections.filter(c => c && normalizeGatewayUrl(c.url) === normRemoteUrl)
   if (matches.length === 1 && matches[0]?.id) {
     return matches[0].id
