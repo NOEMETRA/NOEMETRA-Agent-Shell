@@ -9577,7 +9577,12 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
           // A refused request is never a user gesture: try the hidden
           // auto-SSO, and on failure leave the 401 to the app's own "Sign in"
           // surface instead of opening a window nobody asked for.
-          await openOauthLoginWindow(origin, { silent: true, background: true })
+          await openOauthLoginWindow(origin, {
+            silent: true,
+            background: true,
+            connectionId,
+            partition: explicitPartition || partition
+          })
         } catch (reloginError) {
           rememberLog(
             `Remote session re-login after 401 failed for ${new URL(url).host}: ${reloginError?.message || reloginError}`
