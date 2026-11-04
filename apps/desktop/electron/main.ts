@@ -401,7 +401,7 @@ import {
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
-import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import { loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { execGit, killTimedGitChildren, setNoConsoleGitRoots } from './no-console-git'
 import { registerNativeNotifications } from './notification-ipc'
 import { loginFlightKey, OauthLoginFlights } from './oauth-login-flights'
@@ -1350,8 +1350,9 @@ function ensureSharedOauthPartitionPreserved(legacyUserDataDir: string, currentU
   }
 }
 
-function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, initialDestHasSharedSession?: boolean): void {
-  if (!fs.existsSync(legacyFile)) return
+function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, initialDestHasSharedSession?: boolean): Map<string, string> {
+  const idRemap = new Map<string, string>()
+  if (!fs.existsSync(legacyFile)) return idRemap
 
   const currentDir = path.dirname(currentFile)
   const legacyDir = path.dirname(legacyFile)
@@ -1367,7 +1368,7 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
     // copying the legacy registry directly is completely safe.
     if (!destHasSharedSession) {
       fs.copyFileSync(legacyFile, currentFile)
-      return
+      return idRemap
     }
     // Destination has an active shared OAuth session on disk even though connections.json
     // is absent (e.g. from an intervening boot or unconfigured session).
@@ -1447,6 +1448,7 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
           currentRegistry.connections.push(connectionToSave)
           existingIds.add(targetId)
           existingLabels.add(label.trim().toLowerCase())
+          idRemap.set(conn.id, targetId)
           modified = true
 
           // If legacy remote connection used the shared jar (primary or v1-matching remote), seed its dedicated partition from shared jar
@@ -1507,6 +1509,7 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
             currentRegistry.connections.push(connectionToSave)
             existingIds.add(newId)
             existingLabels.add(label.trim().toLowerCase())
+            idRemap.set(conn.id, newId)
             modified = true
 
             // Preserve OAuth partition identity for renamed remote connection, or shared jar for cloud connection
@@ -1527,18 +1530,21 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
                 true
               )
             }
-          } else if (isRemoteOauth && legacyHasSession && !currentHasSession) {
-            // Endpoints match and destination has no session yet: seed destination partition from legacy session
-            const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`
-            existing.partition = `persist:${partName}`
-            modified = true
-            migrateConnectionOauthPartition(
-              legacyDir,
-              currentDir,
-              conn.id,
-              conn.id,
-              legacyRegistry.primary === conn.id || isLegacyV1RemoteMatch(conn)
-            )
+          } else {
+            idRemap.set(conn.id, conn.id)
+            if (isRemoteOauth && legacyHasSession && !currentHasSession) {
+              // Endpoints match and destination has no session yet: seed destination partition from legacy session
+              const partName = `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`
+              existing.partition = `persist:${partName}`
+              modified = true
+              migrateConnectionOauthPartition(
+                legacyDir,
+                currentDir,
+                conn.id,
+                conn.id,
+                legacyRegistry.primary === conn.id || isLegacyV1RemoteMatch(conn)
+              )
+            }
           }
         }
       }
@@ -1571,6 +1577,7 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
         fs.writeFileSync(currentFile, JSON.stringify(currentRegistry, null, 2), 'utf8')
       }
     }
+    return idRemap
   } catch (err) {
     // Preserve legacy registry copy as a recovery affordance before propagating write/parse failure
     const dir = path.dirname(currentFile)
@@ -1582,6 +1589,45 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
     } catch {}
     console.error('[noemetra] failed to reconcile connections registry; rolling back transaction to retry:', err)
     throw err
+  }
+}
+
+function mergeNativeOAuthTokenStores(
+  legacyDir: string,
+  currentDir: string,
+  idRemap: Map<string, string> = new Map()
+): void {
+  const legacyStorePath = path.join(legacyDir, 'native-oauth-tokens.json')
+  const currentStorePath = path.join(currentDir, 'native-oauth-tokens.json')
+  if (!fs.existsSync(legacyStorePath)) return
+
+  try {
+    const legacyRaw = fs.readFileSync(legacyStorePath, 'utf8')
+    const legacyJson = JSON.parse(legacyRaw)
+    if (!legacyJson || typeof legacyJson !== 'object' || Array.isArray(legacyJson)) return
+
+    let currentJson: Record<string, any> = {}
+    let destExisted = false
+    if (fs.existsSync(currentStorePath)) {
+      try {
+        const currentRaw = fs.readFileSync(currentStorePath, 'utf8')
+        const parsed = JSON.parse(currentRaw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          currentJson = parsed
+          destExisted = true
+        }
+      } catch {}
+    }
+
+    const { merged, modified } = mergeNativeTokenStoreObjects(legacyJson, currentJson, idRemap)
+
+    if (modified || !destExisted) {
+      fs.mkdirSync(path.dirname(currentStorePath), { recursive: true })
+      fs.writeFileSync(currentStorePath, JSON.stringify(merged, null, 2), { mode: 0o600 })
+      console.log('[noemetra] merged native oauth tokens store during legacy migration')
+    }
+  } catch (err) {
+    console.warn('[noemetra] failed to merge legacy native oauth tokens:', err)
   }
 }
 
@@ -2417,9 +2463,25 @@ function maybeMigrateLegacyDesktopState(): void {
         const currentSharedPart = path.join(currentDir, 'Partitions', 'hermes-remote-oauth')
         const destHadSharedSessionInitially = fs.existsSync(currentSharedPart) && hasDatabaseContent(currentSharedPart)
 
+        // Pre-reconcile connections.json so any connection ID remappings (idRemap)
+        // are known before processing credentials and databases (AGENTS.md:46-48).
+        let connectionIdRemap = new Map<string, string>()
+        if (stagedEntries.includes('connections.json')) {
+          const stagedConnPath = path.join(stagingDir, 'connections.json')
+          const destConnPath = path.join(currentDir, 'connections.json')
+          connectionIdRemap = reconcileConnectionsRegistry(destConnPath, stagedConnPath, destHadSharedSessionInitially)
+        }
+
         for (const entry of stagedEntries) {
           const stagedPath = path.join(stagingDir, entry)
           const destPath = path.join(currentDir, entry)
+
+          if (entry === 'connections.json') {
+            continue
+          } else if (entry === 'native-oauth-tokens.json') {
+            mergeNativeOAuthTokenStores(stagingDir, currentDir, connectionIdRemap)
+            continue
+          }
 
           const isDatabaseDir = DATABASE_DIR_NAMES.has(entry) || fs.existsSync(path.join(stagedPath, 'leveldb'))
 
@@ -2473,8 +2535,6 @@ function maybeMigrateLegacyDesktopState(): void {
               }
               fs.cpSync(stagedPath, destPath, { recursive: true })
             }
-          } else if (entry === 'connections.json') {
-            reconcileConnectionsRegistry(destPath, stagedPath, destHadSharedSessionInitially)
           } else if (entry === 'Partitions') {
             const partitionsDestDir = destPath
             fs.mkdirSync(partitionsDestDir, { recursive: true })
@@ -9543,22 +9603,56 @@ function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): st
     return scopedKey
   }
 
-  // Unscoped caller (no connectionId): resolve to the primary connection's scoped key if it exists
+  // Unscoped caller (no connectionId): resolve to the primary connection's scoped key if it matches this baseUrl,
+  // or to the unambiguous sole connection for this baseUrl (#P2).
   try {
     const registry = readDesktopConnectionsRegistry()
     const primaryId = registry?.primary
     if (primaryId) {
-      const primaryScopedKey = `${normUrl}#conn=${primaryId}`
-      if (_loadNativeTokens(primaryScopedKey) !== null) {
-        return primaryScopedKey
+      const primaryConn = (registry?.connections || []).find((c: any) => c && c.id === primaryId)
+      const primaryMatchesUrl =
+        primaryConn &&
+        (primaryConn.kind === 'remote' || primaryConn.kind === 'cloud') &&
+        primaryConn.url &&
+        normalizeRemoteBaseUrl(primaryConn.url) === normUrl
+
+      if (primaryMatchesUrl) {
+        const primaryScopedKey = `${normUrl}#conn=${primaryId}`
+        if (_loadNativeTokens(primaryScopedKey) !== null) {
+          return primaryScopedKey
+        }
+        // Migrate unambiguous legacy token on baseUrl to the primary connection
+        if (_loadNativeTokens(normUrl) !== null) {
+          const legacyTokens = _loadNativeTokens(normUrl)
+          if (legacyTokens) {
+            _storeNativeTokens(primaryScopedKey, legacyTokens)
+            _clearNativeTokens(normUrl)
+            return primaryScopedKey
+          }
+        }
       }
-      // Migrate unambiguous legacy token on baseUrl to the primary connection
+    }
+
+    // If primary does not match baseUrl, check if there is an unambiguous sole connection for this baseUrl
+    const connectionsForUrl = (registry?.connections || []).filter(
+      (c: any) =>
+        c &&
+        (c.kind === 'remote' || c.kind === 'cloud') &&
+        c.url &&
+        normalizeRemoteBaseUrl(c.url) === normUrl
+    )
+    if (connectionsForUrl.length === 1 && connectionsForUrl[0]?.id) {
+      const soleId = connectionsForUrl[0].id
+      const soleScopedKey = `${normUrl}#conn=${soleId}`
+      if (_loadNativeTokens(soleScopedKey) !== null) {
+        return soleScopedKey
+      }
       if (_loadNativeTokens(normUrl) !== null) {
         const legacyTokens = _loadNativeTokens(normUrl)
         if (legacyTokens) {
-          _storeNativeTokens(primaryScopedKey, legacyTokens)
+          _storeNativeTokens(soleScopedKey, legacyTokens)
           _clearNativeTokens(normUrl)
-          return primaryScopedKey
+          return soleScopedKey
         }
       }
     }

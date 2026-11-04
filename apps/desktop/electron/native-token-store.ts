@@ -163,3 +163,32 @@ export function loadNativeTokenSet(baseUrl: string, io: NativeTokenStoreIo): Nat
     return null
   }
 }
+
+/**
+ * Pure merger for native token store contents: combines legacy and current token records,
+ * remapping #conn=<oldId> references to new connection IDs where applicable.
+ * Active destination entries take precedence over legacy entries on key collisions.
+ */
+export function mergeNativeTokenStoreObjects(
+  legacyStore: Record<string, any>,
+  currentStore: Record<string, any>,
+  idRemap: Map<string, string> = new Map()
+): { merged: Record<string, any>; modified: boolean } {
+  const merged: Record<string, any> = { ...currentStore }
+  let modified = false
+
+  for (const [key, value] of Object.entries(legacyStore)) {
+    let targetKey = key
+    if (key.includes('#conn=')) {
+      const [urlPart, connId] = key.split('#conn=')
+      const mappedId = idRemap.get(connId) || connId
+      targetKey = `${urlPart}#conn=${mappedId}`
+    }
+    if (!merged[targetKey]) {
+      merged[targetKey] = value
+      modified = true
+    }
+  }
+
+  return { merged, modified }
+}
