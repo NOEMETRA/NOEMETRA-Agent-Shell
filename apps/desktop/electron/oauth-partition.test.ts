@@ -434,6 +434,17 @@ describe('resolveOauthPartition with connectionId (pre-save sign-in identity)', 
       registry: reg
     })
     expect(byUrl).toBe('persist:hermes-remote-oauth-conn-cloud-isolated')
+
+    const portalPartition = resolveOauthPartition('https://portal.nousresearch.com', {
+      registry: reg,
+      connectionId: 'cloud-isolated'
+    })
+    expect(portalPartition).toBe('persist:hermes-remote-oauth-conn-cloud-isolated')
+
+    const defaultPortalPartition = resolveOauthPartition('https://portal.nousresearch.com', {
+      registry: reg
+    })
+    expect(defaultPortalPartition).toBe(LEGACY_OAUTH_PARTITION)
   })
 
   it('keeps primary account authoritative on shared URL and scopes migrated session by connection identity (AGENTS.md:46-48)', () => {

@@ -295,7 +295,7 @@ describe('GatewaySettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Use gateway' }))
     await waitFor(() => expect(selectConnection).toHaveBeenCalledWith(saved.id))
     expect(calls).toEqual(['logout', 'login', 'save'])
-    expect(agentSignIn).toHaveBeenCalledWith(saved.url)
+    expect(agentSignIn).toHaveBeenCalledWith(saved.url, { connectionId: saved.id })
     expect(save).toHaveBeenCalledWith({ ...saved, org: 'new-team' })
     expect(saveConnectionConfig).not.toHaveBeenCalled()
     registry.value = null
@@ -585,8 +585,8 @@ describe('GatewaySettings', () => {
       await waitFor(() => expect(selectConnection).toHaveBeenCalledTimes(2))
       expect(selectConnection).toHaveBeenNthCalledWith(1, saved.id)
       expect(selectConnection).toHaveBeenNthCalledWith(2, saved.id)
-      expect(oauthLogoutConnectionConfig).toHaveBeenCalledWith(saved.url)
-      expect(window.hermesDesktop!.cloud!.agentSignIn).toHaveBeenCalledWith(saved.url)
+      expect(oauthLogoutConnectionConfig).toHaveBeenCalledWith(saved.url, { connectionId: saved.id })
+      expect(window.hermesDesktop!.cloud!.agentSignIn).toHaveBeenCalledWith(saved.url, { connectionId: saved.id })
       // The portal session was already live: no interactive portal login.
       expect(window.hermesDesktop!.cloud!.login).not.toHaveBeenCalled()
       registry.value = null
@@ -660,7 +660,7 @@ describe('GatewaySettings', () => {
 
       await waitFor(() => expect(selectConnection).toHaveBeenCalledTimes(2))
       expect(window.hermesDesktop!.cloud!.login).toHaveBeenCalledTimes(1)
-      expect(window.hermesDesktop!.cloud!.agentSignIn).toHaveBeenCalledWith(saved.url)
+      expect(window.hermesDesktop!.cloud!.agentSignIn).toHaveBeenCalledWith(saved.url, { connectionId: saved.id })
       registry.value = null
     })
   })
