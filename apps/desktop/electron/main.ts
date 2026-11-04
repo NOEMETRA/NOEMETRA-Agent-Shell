@@ -3913,7 +3913,8 @@ protocol.registerSchemesAsPrivileged([
 
 function registerMediaProtocol(): void {
   const handler: ReturnType<typeof createMediaProtocolHandler> = createMediaProtocolHandler({
-    ensureRemoteBearer: (baseUrl: string): Promise<string | null> => ensureNativeAccessToken(baseUrl),
+    ensureRemoteBearer: (baseUrl: string, connectionId?: string): Promise<string | null> =>
+      ensureNativeAccessTokenScoped(baseUrl, connectionId),
     // Electron's file:// loader ignores Range, which prevents video seeking.
     fetchLocal: fetchLocalMedia,
     fetchRemote: (url, headers, method) =>
@@ -3923,8 +3924,11 @@ function registerMediaProtocol(): void {
         headers,
         method
       }),
-    fetchRemoteWithCookies: (url, headers, method) => {
-      const oauthSession = getOauthSessionForUrl(url)
+    fetchRemoteWithCookies: (url, headers, method, options?: { connectionId?: string; partition?: string }) => {
+      const oauthSession = getOauthSessionForUrl(url, {
+        connectionId: options?.connectionId,
+        partition: options?.partition
+      })
 
       if (!oauthSession) {
         throw new Error('OAuth session partition is unavailable.')
@@ -9490,18 +9494,35 @@ function isPrimaryOrUnscopedConnection(connectionId?: string): boolean {
 function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): string {
   const normUrl = normalizeRemoteBaseUrl(baseUrl)
   const cid = typeof connectionId === 'string' ? connectionId.trim() : ''
-  if (!cid) return normUrl
 
-  const scopedKey = `${normUrl}#conn=${cid}`
-  if (_loadNativeTokens(scopedKey) !== null) {
+  if (cid) {
+    const scopedKey = `${normUrl}#conn=${cid}`
+    if (_loadNativeTokens(scopedKey) !== null) {
+      return scopedKey
+    }
+
+    // If no scoped token found under this connectionId, check if it's the primary
+    // connection falling back to a pre-migration legacy unscoped token on baseUrl:
+    if (isPrimaryOrUnscopedConnection(cid) && _loadNativeTokens(normUrl) !== null) {
+      return normUrl
+    }
+
     return scopedKey
   }
 
-  if (isPrimaryOrUnscopedConnection(cid)) {
-    return normUrl
-  }
+  // Unscoped caller (no connectionId): resolve to the primary connection's scoped key if it exists
+  try {
+    const registry = readDesktopConnectionsRegistry()
+    const primaryId = registry?.primary
+    if (primaryId) {
+      const primaryScopedKey = `${normUrl}#conn=${primaryId}`
+      if (_loadNativeTokens(primaryScopedKey) !== null) {
+        return primaryScopedKey
+      }
+    }
+  } catch {}
 
-  return scopedKey
+  return normUrl
 }
 
 function _loadNativeTokens(key: string): NativeTokenSet | null {
@@ -17629,11 +17650,12 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
         throw new NativeAuthChangedError()
       }
 
-      if (loginConnectionId) {
-        nativeAccessTokenCoordinator.storeTokens(scopedNativeTokenKey(baseUrl, loginConnectionId), tokens)
-      }
-      if (isPrimaryOrUnscopedConnection(loginConnectionId)) {
-        nativeAccessTokenCoordinator.storeTokens(baseUrl, tokens)
+      const tokenKey = loginConnectionId ? scopedNativeTokenKey(baseUrl, loginConnectionId) : baseUrl
+      nativeAccessTokenCoordinator.storeTokens(tokenKey, tokens)
+      // When saving a scoped token for the primary connection, clear any legacy unscoped
+      // token so only one canonical refresh-token authority exists (#P1).
+      if (loginConnectionId && isPrimaryOrUnscopedConnection(loginConnectionId)) {
+        nativeAccessTokenCoordinator.clearTokens(baseUrl)
       }
       // Confirmed sign-in — release the reauth latch so the next
       // startHermes() re-dials instead of replaying the stale rejection.

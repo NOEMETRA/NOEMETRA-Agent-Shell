@@ -394,6 +394,36 @@ describe('createMediaProtocolHandler', () => {
     expect(headers.get('authorization')).toBeNull()
   })
 
+  it('propagates connectionId and partition to ensureRemoteBearer and fetchRemoteWithCookies', async () => {
+    const ensureRemoteBearer = vi.fn(async (_url: string, _connId?: string) => null)
+    const fetchRemoteWithCookies = vi.fn(async () => new Response('cookie', { status: 206 }))
+    const deps = dependencies({
+      ensureRemoteBearer,
+      fetchRemoteWithCookies,
+      resolveRemoteConnection: vi.fn(async () => ({
+        authMode: 'oauth' as const,
+        baseUrl: 'https://gateway.test',
+        connectionId: 'custom-conn',
+        partition: 'persist:custom-part',
+        mode: 'remote' as const,
+        token: null
+      }))
+    })
+
+    const response = await createMediaProtocolHandler(deps)(
+      request('hermes-media://remote/%2Ftmp%2Fclip.mp4?connectionId=custom-conn')
+    )
+
+    expect(response.status).toBe(206)
+    expect(ensureRemoteBearer).toHaveBeenCalledWith('https://gateway.test', 'custom-conn')
+    expect(fetchRemoteWithCookies).toHaveBeenCalledWith(
+      'https://gateway.test/api/files/stream?path=%2Ftmp%2Fclip.mp4',
+      expect.any(Headers),
+      'GET',
+      { connectionId: 'custom-conn', partition: 'persist:custom-part' }
+    )
+  })
+
   it('preserves explicit HEAD requests through the isolated-cookie remote fetch', async () => {
     const fetchRemoteWithCookies = vi.fn(async (..._args: unknown[]) => new Response(null, { status: 200 }))
 
