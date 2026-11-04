@@ -164,15 +164,66 @@ export function loadNativeTokenSet(baseUrl: string, io: NativeTokenStoreIo): Nat
   }
 }
 
+function safeNormalizeUrl(raw: unknown): string {
+  try {
+    const s = String(raw || '').trim()
+    if (!s) return ''
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`
+    const parsed = new URL(withScheme)
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`
+  } catch {
+    return String(raw || '').trim()
+  }
+}
+
+/**
+ * Map normalized gateway URLs to their owning connection ID in the legacy registry.
+ * Priority: primary connection first, followed by sole connections configured for that URL.
+ */
+export function buildLegacyUrlToConnectionMap(legacyRegistry: any): Map<string, string> {
+  const map = new Map<string, string>()
+  if (!legacyRegistry || !Array.isArray(legacyRegistry.connections)) return map
+
+  const primaryId = legacyRegistry.primary
+  const primaryConn = legacyRegistry.connections.find((c: any) => c && c.id === primaryId)
+  if (primaryConn && (primaryConn.kind === 'remote' || primaryConn.kind === 'cloud') && primaryConn.url) {
+    const norm = safeNormalizeUrl(primaryConn.url)
+    if (norm) map.set(norm, primaryConn.id)
+  }
+
+  const byUrl = new Map<string, any[]>()
+  for (const conn of legacyRegistry.connections) {
+    if (conn && (conn.kind === 'remote' || conn.kind === 'cloud') && conn.url) {
+      const norm = safeNormalizeUrl(conn.url)
+      if (norm) {
+        const list = byUrl.get(norm) || []
+        list.push(conn)
+        byUrl.set(norm, list)
+      }
+    }
+  }
+
+  for (const [norm, conns] of byUrl.entries()) {
+    if (!map.has(norm) && conns.length === 1 && conns[0]?.id) {
+      map.set(norm, conns[0].id)
+    }
+  }
+
+  return map
+}
+
 /**
  * Pure merger for native token store contents: combines legacy and current token records,
  * remapping #conn=<oldId> references to new connection IDs where applicable.
  * Active destination entries take precedence over legacy entries on key collisions.
+ * Unscoped legacy tokens are scoped to their original connection from the legacy registry
+ * so they cannot collide with or be appropriated by destination connections.
  */
 export function mergeNativeTokenStoreObjects(
   legacyStore: Record<string, any>,
   currentStore: Record<string, any>,
-  idRemap: Map<string, string> = new Map()
+  idRemap: Map<string, string> = new Map(),
+  legacyUrlToConnId: Map<string, string> = new Map()
 ): { merged: Record<string, any>; modified: boolean } {
   const merged: Record<string, any> = { ...currentStore }
   let modified = false
@@ -183,6 +234,14 @@ export function mergeNativeTokenStoreObjects(
       const [urlPart, connId] = key.split('#conn=')
       const mappedId = idRemap.get(connId) || connId
       targetKey = `${urlPart}#conn=${mappedId}`
+    } else {
+      // Unscoped legacy key (bare URL): check if legacy registry had an owning connection for this URL
+      const normKey = safeNormalizeUrl(key)
+      const legacyConnId = legacyUrlToConnId.get(normKey) || legacyUrlToConnId.get(key)
+      if (legacyConnId) {
+        const mappedId = idRemap.get(legacyConnId) || legacyConnId
+        targetKey = `${normKey}#conn=${mappedId}`
+      }
     }
     if (!merged[targetKey]) {
       merged[targetKey] = value
