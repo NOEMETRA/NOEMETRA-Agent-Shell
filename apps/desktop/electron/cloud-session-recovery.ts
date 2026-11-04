@@ -1,7 +1,7 @@
 import { isNousCloudAgentUrl } from './backend-health'
 
 interface CloudRecoveryDeps {
-  hasNativeSession: (baseUrl: string) => boolean
+  hasNativeSession: (baseUrl: string, connectionId?: string) => boolean
   restoreCookieSession: (baseUrl: string, connectionId?: string) => Promise<boolean>
   onRecovered?: (baseUrl: string, connectionId?: string) => void
   now?: () => number
@@ -14,7 +14,7 @@ export function createCloudSessionRecovery(deps: CloudRecoveryDeps) {
   const now = deps.now ?? Date.now
 
   return async <T>(baseUrl: string, mint: () => Promise<T>, connectionId?: string): Promise<T> => {
-    const hadNativeSession = deps.hasNativeSession(baseUrl)
+    const hadNativeSession = deps.hasNativeSession(baseUrl, connectionId)
 
     try {
       return await mint()
@@ -22,7 +22,7 @@ export function createCloudSessionRecovery(deps: CloudRecoveryDeps) {
       if (
         !isNousCloudAgentUrl(baseUrl) ||
         hadNativeSession ||
-        deps.hasNativeSession(baseUrl) ||
+        deps.hasNativeSession(baseUrl, connectionId) ||
         (error as { statusCode?: number })?.statusCode !== 401
       ) {
         throw error
@@ -58,7 +58,7 @@ export function createCloudSessionRecovery(deps: CloudRecoveryDeps) {
 
       // Native login may have changed while the background cookie flow ran.
       // Never turn that transition into a cross-identity fallback.
-      if (deps.hasNativeSession(baseUrl)) {
+      if (deps.hasNativeSession(baseUrl, connectionId)) {
         throw error
       }
 

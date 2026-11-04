@@ -8031,7 +8031,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token, connectionId?
       // uncredentialed and reintroduce the 401 loop.
       probeHealth: (url: string, options: any = {}) =>
         requestWithOauthFallback(baseUrl, {
-          ensureNativeAccessToken,
+          ensureNativeAccessToken: u => ensureNativeAccessTokenScoped(u, connectionId),
           requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer }),
           requestWithCookie: () =>
             fetchJsonViaOauthSession(url, { ...options, connectionId: options?.connectionId ?? connectionId })
@@ -9464,37 +9464,72 @@ function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
   persistNativeTokenSet(baseUrl, tokens, _nativeTokenStoreIo())
 }
 
-function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
-  baseUrl = normalizeRemoteBaseUrl(baseUrl)
-  const cached = _nativeTokens.get(baseUrl)
+function scopedNativeTokenKey(baseUrl: string, connectionId?: string): string {
+  const normUrl = normalizeRemoteBaseUrl(baseUrl)
+  const cid = typeof connectionId === 'string' ? connectionId.trim() : ''
+  return cid ? `${normUrl}#conn=${cid}` : normUrl
+}
+
+function resolveNativeTokenLookupKey(baseUrl: string, connectionId?: string): string {
+  const normUrl = normalizeRemoteBaseUrl(baseUrl)
+  const cid = typeof connectionId === 'string' ? connectionId.trim() : ''
+  if (!cid) return normUrl
+
+  const scopedKey = `${normUrl}#conn=${cid}`
+  if (_loadNativeTokens(scopedKey) !== null) {
+    return scopedKey
+  }
+
+  try {
+    const registry = readDesktopConnectionsRegistry()
+    if (registry?.primary === cid) {
+      return normUrl
+    }
+  } catch {}
+
+  return scopedKey
+}
+
+function _loadNativeTokens(key: string): NativeTokenSet | null {
+  const normKey = key.includes('#conn=')
+    ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
+    : normalizeRemoteBaseUrl(key)
+  const cached = _nativeTokens.get(normKey)
 
   if (cached) {
     return cached
   }
 
-  const tokens = loadNativeTokenSet(baseUrl, _nativeTokenStoreIo())
+  const tokens = loadNativeTokenSet(normKey, _nativeTokenStoreIo())
 
   if (tokens) {
-    _nativeTokens.set(baseUrl, tokens)
+    _nativeTokens.set(normKey, tokens)
   }
 
   return tokens
 }
 
-function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet) {
-  _persistNativeTokens(baseUrl, tokens)
-  _nativeTokens.set(baseUrl, tokens)
+function _storeNativeTokens(key: string, tokens: NativeTokenSet) {
+  const normKey = key.includes('#conn=')
+    ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
+    : normalizeRemoteBaseUrl(key)
+  _persistNativeTokens(normKey, tokens)
+  _nativeTokens.set(normKey, tokens)
 }
 
-function _clearNativeTokens(baseUrl: string) {
-  _nativeTokens.delete(baseUrl)
-  _persistNativeTokens(baseUrl, null)
+function _clearNativeTokens(key: string) {
+  const normKey = key.includes('#conn=')
+    ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
+    : normalizeRemoteBaseUrl(key)
+  _nativeTokens.delete(normKey)
+  _persistNativeTokens(normKey, null)
 }
 
 // True when we hold native bearer tokens for this gateway (the native-flow
 // analogue of hasLiveOauthSession's cookie check).
-function hasNativeSession(baseUrl: string): boolean {
-  return _loadNativeTokens(baseUrl) !== null
+function hasNativeSession(baseUrl: string, connectionId?: string): boolean {
+  const key = resolveNativeTokenLookupKey(baseUrl, connectionId)
+  return _loadNativeTokens(key) !== null
 }
 
 // POST JSON WITHOUT the OAuth cookie partition — used for the native token +
@@ -9521,15 +9556,23 @@ const nativeAccessTokenCoordinator: ReturnType<typeof createNativeAccessTokenCoo
     clearTokens: _clearNativeTokens,
     isRefreshAuthRejection: (error: unknown): boolean => readStatusCode(error) === 401,
     loadTokens: _loadNativeTokens,
-    normalizeBaseUrl: normalizeRemoteBaseUrl,
-    refreshTokens: async (baseUrl: string, tokens: NativeTokenSet): Promise<NativeTokenSet> =>
-      parseTokenResponse(
+    normalizeBaseUrl: (urlOrKey: string) => {
+      if (urlOrKey.includes('#conn=')) {
+        const [url, connPart] = urlOrKey.split('#conn=')
+        return `${normalizeRemoteBaseUrl(url)}#conn=${connPart}`
+      }
+      return normalizeRemoteBaseUrl(urlOrKey)
+    },
+    refreshTokens: async (key: string, tokens: NativeTokenSet): Promise<NativeTokenSet> => {
+      const realBaseUrl = key.includes('#conn=') ? key.split('#conn=')[0] : key
+      return parseTokenResponse(
         await postJsonNoAuth(
-          nativeRefreshUrl(baseUrl),
+          nativeRefreshUrl(realBaseUrl),
           { refresh_token: tokens.refreshToken, provider: tokens.provider },
           { timeoutMs: 10_000 }
         )
-      ),
+      )
+    },
     storeTokens: _storeNativeTokens,
     tokenNeedsRefresh
   })
@@ -9540,11 +9583,22 @@ const nativeAccessTokenCoordinator: ReturnType<typeof createNativeAccessTokenCoo
 const ensureNativeAccessToken: (baseUrl: string, options?: NativeAccessTokenOptions) => Promise<string | null> =
   nativeAccessTokenCoordinator.ensure
 
+function ensureNativeAccessTokenScoped(
+  baseUrl: string,
+  connectionId?: string,
+  options?: NativeAccessTokenOptions
+): Promise<string | null> {
+  const key = resolveNativeTokenLookupKey(baseUrl, connectionId)
+  return nativeAccessTokenCoordinator.ensure(key, options)
+}
+
 interface GatewayFileConnection extends RegistryBackendRequestScope {
   gatewayEndpoint?: GatewayEndpoint
   authMode?: 'oauth' | 'token' | 'native'
   baseUrl: string
   token?: null | string
+  connectionId?: string
+  partition?: string
 }
 
 interface GatewayFileSavePayload {
@@ -9599,14 +9653,19 @@ async function saveGatewayFile(payload: GatewayFileSavePayload = {}): Promise<Ga
       const url: string = `${connection.baseUrl}${requestPath}`
 
       if (connection.authMode === 'oauth') {
+        const fileConnId = connection.connectionId || connectionId
         return requestWithOauthFallback(connection.baseUrl, {
-          ensureNativeAccessToken,
+          ensureNativeAccessToken: u => ensureNativeAccessTokenScoped(u, fileConnId),
           requestWithBearer: (bearer: string): Promise<GatewayFileSaveResult> =>
             downloadViaTokenToFile(url, null, context, deps, { bearer }),
           requestWithCookie: (): Promise<GatewayFileSaveResult> =>
             downloadViaOauthSessionToFile<Session>(url, context, {
               ...deps,
-              getSession: getOauthSessionForUrl,
+              getSession: downloadUrl =>
+                getOauthSessionForUrl(downloadUrl, {
+                  connectionId: fileConnId,
+                  partition: connection.partition
+                }),
               request: electronNet.request
             })
         })
@@ -9690,7 +9749,7 @@ async function mintGatewayWsTicket(
           mintOauthGatewayWsTicket(
             baseUrl,
             {
-              ensureNativeAccessToken,
+              ensureNativeAccessToken: (u, opts) => ensureNativeAccessTokenScoped(u, connectionId, opts),
               fetchJson,
               fetchJsonViaOauthSession: (url, opts: any = {}) =>
                 fetchJsonViaOauthSession(url, {
@@ -10993,9 +11052,10 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
       // RFC 8252 flow) counts as connected too — otherwise a completed native
       // sign-in shows "not connected" in Settings. The authoritative liveness
       // check is the ws-ticket mint in resolveRemoteBackend at actual connect time.
+      const connId = block.connectionId || block.id
       remoteOauthConnected = oauthSessionIsLive(
-        hasNativeSession(remoteUrl),
-        await hasLiveOauthSession(remoteUrl, { connectionId: block.connectionId || block.id })
+        hasNativeSession(remoteUrl, connId),
+        await hasLiveOauthSession(remoteUrl, { connectionId: connId })
       )
     } catch {
       remoteOauthConnected = false
@@ -11298,7 +11358,7 @@ async function buildRemoteConnection(
     const connId = typeof remoteIdentity === 'string' ? remoteIdentity : undefined
     const explicitPartition = typeof partition === 'string' && partition.trim() ? partition.trim() : undefined
     const ticket = await resolveRemoteOauthTicket(baseUrl, remoteHeaders, {
-      hasNativeSession,
+      hasNativeSession: (u: string) => hasNativeSession(u, connId),
       mintGatewayWsTicket: (url, h) => mintGatewayWsTicket(url, h, connId, explicitPartition)
     })
 
@@ -17448,7 +17508,7 @@ async function fetchJsonForBackend(
     }
 
     return requestWithOauthFallback(descriptor.baseUrl, {
-      ensureNativeAccessToken,
+      ensureNativeAccessToken: u => ensureNativeAccessTokenScoped(u, options.connectionId),
       requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer }),
       requestWithCookie: () => fetchJsonViaOauthSession(url, options)
     })
@@ -17556,6 +17616,9 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
       }
 
       nativeAccessTokenCoordinator.storeTokens(baseUrl, tokens)
+      if (loginConnectionId) {
+        nativeAccessTokenCoordinator.storeTokens(scopedNativeTokenKey(baseUrl, loginConnectionId), tokens)
+      }
       // Confirmed sign-in — release the reauth latch so the next
       // startHermes() re-dials instead of replaying the stale rejection.
       remoteReauthFailure = null
@@ -17596,6 +17659,9 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
   if (connected) {
     // A confirmed cookie login supersedes any older native identity.
     nativeAccessTokenCoordinator.clearTokens(baseUrl)
+    if (loginConnectionId) {
+      nativeAccessTokenCoordinator.clearTokens(scopedNativeTokenKey(baseUrl, loginConnectionId))
+    }
     remoteReauthFailure = null
   }
 
@@ -17612,12 +17678,15 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl, r
   // Clear before awaiting cookie I/O: a pending login/refresh cannot restore
   // logout, and a later login must not be erased when cookie clearing settles.
   nativeAccessTokenCoordinator.clearTokens(baseUrl)
+  if (connectionId) {
+    nativeAccessTokenCoordinator.clearTokens(scopedNativeTokenKey(baseUrl, connectionId))
+  }
   await clearOauthSession(baseUrl, { connectionId })
 
   // Report against the SAME liveness notion the Settings indicator uses
   // (AT-or-RT cookie, or a native token) so a logout that left any session
   // behind is reflected as still-connected rather than silently signed-out.
-  const connected = (await hasLiveOauthSession(baseUrl, { connectionId })) || hasNativeSession(baseUrl)
+  const connected = (await hasLiveOauthSession(baseUrl, { connectionId })) || hasNativeSession(baseUrl, connectionId)
 
   return { ok: true, connected }
 })
