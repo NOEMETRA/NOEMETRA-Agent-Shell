@@ -1274,19 +1274,31 @@ function ensureSharedOauthPartitionPreserved(legacyUserDataDir: string, currentU
 
 function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): void {
   if (!fs.existsSync(legacyFile)) return
-  if (!fs.existsSync(currentFile)) {
-    fs.copyFileSync(legacyFile, currentFile)
-    return
-  }
+
   const currentDir = path.dirname(currentFile)
   const legacyDir = path.dirname(legacyFile)
   const currentSharedPart = path.join(currentDir, 'Partitions', 'hermes-remote-oauth')
   const legacySharedPart = path.join(legacyDir, 'Partitions', 'hermes-remote-oauth')
-  const destHasSharedSession = fs.existsSync(currentSharedPart)
-  const legacyHasSharedSession = fs.existsSync(legacySharedPart)
+  const destHasSharedSession = fs.existsSync(currentSharedPart) && hasDatabaseContent(currentSharedPart)
+  const legacyHasSharedSession = fs.existsSync(legacySharedPart) && hasDatabaseContent(legacySharedPart)
+
+  if (!fs.existsSync(currentFile)) {
+    // If destination has no connections.json and no active shared OAuth session,
+    // copying the legacy registry directly is completely safe.
+    if (!destHasSharedSession) {
+      fs.copyFileSync(legacyFile, currentFile)
+      return
+    }
+    // Destination has an active shared OAuth session on disk even though connections.json
+    // is absent (e.g. from an intervening boot or unconfigured session).
+    // Reconcile against default registry so legacy connections receive dedicated partitions
+    // and account boundaries are preserved (AGENTS.md:46-48).
+  }
 
   try {
-    const currentRegistry = JSON.parse(fs.readFileSync(currentFile, 'utf8'))
+    const currentRegistry = fs.existsSync(currentFile)
+      ? JSON.parse(fs.readFileSync(currentFile, 'utf8'))
+      : { primary: 'local', connections: [{ id: 'local', kind: 'local', label: 'Local' }] }
     const legacyRegistry = JSON.parse(fs.readFileSync(legacyFile, 'utf8'))
 
     let legacyV1RemoteUrl: string | null = null
@@ -1389,9 +1401,13 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
           if (!areConnectionsEquivalent(existing, conn) || hasPotentialOauthAccountCollision) {
             let newId = `${conn.id}-legacy`
             let counter = 1
-            while (existingIds.has(newId)) {
-              counter++
-              newId = `${conn.id}-legacy-${counter}`
+            let partDir = path.join(currentDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(newId)}`)
+            while (
+              existingIds.has(newId) ||
+              ((conn.kind === 'remote' || conn.kind === 'cloud') && fs.existsSync(partDir) && hasDatabaseContent(partDir))
+            ) {
+              newId = `${conn.id}-legacy-${counter++}`
+              partDir = path.join(currentDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(newId)}`)
             }
             let label = conn.label || conn.id
             if (existingLabels.has(label.trim().toLowerCase())) {
