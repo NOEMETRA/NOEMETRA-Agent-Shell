@@ -21,7 +21,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import { type NativeTokenSet, parseStoredTokenSet, parseTokenResponse } from './native-oauth'
-import { buildLegacyUrlToConnectionMap, loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import { buildLegacyUrlToConnectionMap, loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet, redactGatewayUrl } from './native-token-store'
 
 const GATEWAY = 'https://gw.example.com'
 
@@ -540,3 +540,20 @@ test('buildLegacyUrlToConnectionMap refuses to map URL when primary shares URL w
   // is inherently ambiguous and must NOT be attributed to the primary:
   assert.equal(map.get('https://shared-gw.example.com'), undefined)
 })
+
+test('redactGatewayUrl drops credentials while preserving scheme, host, path, and partition/connection suffix', () => {
+  assert.equal(
+    redactGatewayUrl('https://alice:supersecret@gw.example.com:8080/hermes'),
+    'https://gw.example.com:8080/hermes'
+  )
+  assert.equal(
+    redactGatewayUrl('https://alice:supersecret@gw.example.com:8080/hermes#conn=remote-1'),
+    'https://gw.example.com:8080/hermes#conn=remote-1'
+  )
+  assert.equal(
+    redactGatewayUrl('https://gw.example.com/api#conn=cloud-main'),
+    'https://gw.example.com/api#conn=cloud-main'
+  )
+  assert.equal(redactGatewayUrl('invalid url string'), '<invalid gateway URL>')
+})
+

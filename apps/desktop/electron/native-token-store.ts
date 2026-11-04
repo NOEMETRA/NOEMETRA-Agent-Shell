@@ -77,8 +77,17 @@ function readStore(io: NativeTokenStoreIo): Record<string, any> {
  * path. A value URL cannot parse never falls back to the raw input: echoing it
  * is the exact leak this guards against.
  */
-function redactGatewayUrl(baseUrl: string): string {
+export function redactGatewayUrl(baseUrl: string): string {
   try {
+    if (baseUrl.includes('#conn=')) {
+      const [urlPart, connPart] = baseUrl.split('#conn=')
+      const parsed = new URL(urlPart)
+
+      parsed.username = ''
+      parsed.password = ''
+
+      return `${parsed.protocol}//${parsed.host}${parsed.pathname}#conn=${connPart}`
+    }
     const parsed = new URL(baseUrl)
 
     parsed.username = ''

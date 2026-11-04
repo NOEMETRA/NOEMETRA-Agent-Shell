@@ -401,7 +401,7 @@ import {
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
-import { buildLegacyUrlToConnectionMap, loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import { buildLegacyUrlToConnectionMap, loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet, redactGatewayUrl } from './native-token-store'
 import { execGit, killTimedGitChildren, setNoConsoleGitRoots } from './no-console-git'
 import { registerNativeNotifications } from './notification-ipc'
 import { loginFlightKey, OauthLoginFlights } from './oauth-login-flights'
@@ -9794,7 +9794,7 @@ function _storeNativeTokens(key: string, tokens: NativeTokenSet): boolean {
     return true
   }
   console.error(
-    `[noemetra] native tokens for ${normKey} could not be confirmed on disk; retained in memory only to prevent session disruption`
+    `[noemetra] native tokens for ${redactGatewayUrl(normKey)} could not be confirmed on disk; retained in memory only to prevent session disruption`
   )
   return false
 }
