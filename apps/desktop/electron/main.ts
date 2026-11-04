@@ -17698,26 +17698,30 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, ra
         throw new NativeAuthChangedError()
       }
 
-      const tokenKey = loginConnectionId ? scopedNativeTokenKey(baseUrl, loginConnectionId) : baseUrl
+      const tokenKey = authFenceKey
       nativeAccessTokenCoordinator.storeTokens(tokenKey, tokens)
-      // When saving a scoped token for the primary connection, clear any legacy unscoped
+      // When saving a scoped token for the primary or unscoped connection, clear any legacy unscoped
       // token so only one canonical refresh-token authority exists (#P1).
-      if (loginConnectionId && isPrimaryOrUnscopedConnection(loginConnectionId)) {
+      if (tokenKey !== baseUrl && isPrimaryOrUnscopedConnection(loginConnectionId)) {
         nativeAccessTokenCoordinator.clearTokens(baseUrl)
       }
       // Confirmed sign-in — release the reauth latch so the next
       // startHermes() re-dials instead of replaying the stale rejection.
       remoteReauthFailure = null
 
-      return { ok: true, baseUrl, connected: true, connectionId: loginConnectionId || undefined }
+      const effectiveConnId = loginConnectionId || (authFenceKey.includes('#conn=') ? authFenceKey.split('#conn=')[1] : undefined)
+
+      return { ok: true, baseUrl, connected: true, connectionId: effectiveConnId }
     } catch (error) {
       rememberLog(`[native-oauth] native login failed (${error instanceof Error ? error.message : String(error)})`)
+
+      const effectiveConnId = loginConnectionId || (authFenceKey.includes('#conn=') ? authFenceKey.split('#conn=')[1] : undefined)
 
       return {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
         connected: false,
-        connectionId: loginConnectionId || undefined
+        connectionId: effectiveConnId
       }
     }
   }
