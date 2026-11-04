@@ -17,7 +17,10 @@ export interface CloudAgentSessionBridge {
   cloud?: {
     status: (opts?: { connectionId?: string; partition?: string }) => Promise<{ signedIn: boolean }>
     login: (opts?: { connectionId?: string; partition?: string }) => Promise<{ ok: boolean; signedIn: boolean }>
-    agentSignIn: (dashboardUrl: string, opts?: { connectionId?: string }) => Promise<DesktopCloudAgentSignInResult>
+    agentSignIn: (
+      dashboardUrl: string,
+      opts?: { connectionId?: string; partition?: string }
+    ) => Promise<DesktopCloudAgentSignInResult>
   }
   oauthLogoutConnectionConfig?: (url: string, options?: { connectionId?: string }) => Promise<unknown>
 }

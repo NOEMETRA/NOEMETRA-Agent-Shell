@@ -640,9 +640,18 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
     setCloudDiscover('loading')
 
     try {
+      const activeConnection = registry?.connections.find(c => c.id === activeConnectionId)
+      const activePartition =
+        activeConnection?.kind === 'cloud' && activeConnection?.partition ? activeConnection.partition : undefined
+
       const result = await desktop.cloud.discover(
         org,
-        activeConnectionId ? { connectionId: activeConnectionId } : undefined
+        activeConnectionId
+          ? {
+              connectionId: activeConnectionId,
+              ...(activePartition ? { partition: activePartition } : {})
+            }
+          : undefined
       )
 
       if (seq !== contextSeq.current) {
@@ -884,7 +893,13 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
         return
       }
 
-      const result = await desktop.cloud.agentSignIn(agent.dashboardUrl)
+      const activeConnection = registry?.connections.find(c => c.id === activeConnectionId)
+      const activePartition =
+        activeConnection?.kind === 'cloud' && activeConnection?.partition ? activeConnection.partition : undefined
+
+      const result = activePartition
+        ? await desktop.cloud.agentSignIn(agent.dashboardUrl, { partition: activePartition })
+        : await desktop.cloud.agentSignIn(agent.dashboardUrl)
 
       if (seq !== contextSeq.current) {
         return
@@ -905,7 +920,8 @@ function GatewayConnectionSettings({ embedded, standalone }: { embedded: boolean
         remoteAuthMode: 'oauth',
         remoteUrl: agent.dashboardUrl,
         cloudOrg: cloudOrgRef.current ?? undefined,
-        cloudName: agent.name
+        cloudName: agent.name,
+        ...(activePartition ? { partition: activePartition } : {})
       })
 
       if (seq !== contextSeq.current) {
