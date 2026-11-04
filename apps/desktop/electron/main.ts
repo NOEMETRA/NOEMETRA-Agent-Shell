@@ -1407,6 +1407,23 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
       )
       let modified = false
 
+      let legacyTokensJson: Record<string, any> = {}
+      let destTokensJson: Record<string, any> = {}
+      try {
+        const p = path.join(legacyDir, 'native-oauth-tokens.json')
+        if (fs.existsSync(p)) {
+          const parsed = JSON.parse(fs.readFileSync(p, 'utf8'))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) legacyTokensJson = parsed
+        }
+      } catch {}
+      try {
+        const p = path.join(currentDir, 'native-oauth-tokens.json')
+        if (fs.existsSync(p)) {
+          const parsed = JSON.parse(fs.readFileSync(p, 'utf8'))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) destTokensJson = parsed
+        }
+      } catch {}
+
       for (const conn of legacyRegistry.connections) {
         if (!existingIds.has(conn.id)) {
           let targetId = conn.id
@@ -1476,9 +1493,30 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string, i
             fs.existsSync(path.join(currentDir, 'Partitions', `hermes-remote-oauth-conn-${sanitizePartitionComponent(conn.id)}`)) ||
             (currentRegistry.primary === conn.id && fs.existsSync(path.join(currentDir, 'Partitions', 'hermes-remote-oauth')))
           )
+
+          let normUrl = ''
+          try {
+            if (conn.url) normUrl = normalizeRemoteBaseUrl(conn.url)
+          } catch {}
+
+          const legacyHasNativeToken = Boolean(
+            normUrl && (
+              legacyTokensJson[`${normUrl}#conn=${conn.id}`] ||
+              (legacyRegistry.primary === conn.id && legacyTokensJson[normUrl])
+            )
+          )
+          const currentHasNativeToken = Boolean(
+            normUrl && (
+              destTokensJson[`${normUrl}#conn=${conn.id}`] ||
+              (currentRegistry.primary === conn.id && destTokensJson[normUrl])
+            )
+          )
+          const hasNativeTokenCollision = legacyHasNativeToken && currentHasNativeToken
+
           const hasPotentialOauthAccountCollision =
             (legacyHasSession && currentHasSession) ||
-            (isCloudOauth && destHasSharedSession && legacyHasSharedSession)
+            (isCloudOauth && destHasSharedSession && legacyHasSharedSession) ||
+            hasNativeTokenCollision
 
           if (!areConnectionsEquivalent(existing, conn) || hasPotentialOauthAccountCollision) {
             let newId = `${conn.id}-legacy`
