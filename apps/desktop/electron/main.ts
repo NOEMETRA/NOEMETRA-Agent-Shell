@@ -1189,6 +1189,14 @@ function ensureSharedOauthPartitionPreserved(legacyUserDataDir: string, currentU
       if (!fs.existsSync(currentSharedPart)) {
         fs.cpSync(legacySharedPart, currentSharedPart, { recursive: true })
         console.log('[noemetra] preserved shared OAuth partition for legacy cloud connection')
+      } else {
+        // Destination already has an active cloud OAuth session: preserve legacy shared partition as a sidecar
+        // so legacy account cookies are never lost, while preserving destination's active account boundary.
+        const legacyBackupPart = path.join(currentUserDataDir, 'Partitions', 'hermes-remote-oauth.legacy')
+        if (!fs.existsSync(legacyBackupPart)) {
+          fs.cpSync(legacySharedPart, legacyBackupPart, { recursive: true })
+          console.log('[noemetra] preserved legacy shared OAuth partition sidecar to protect active account boundary')
+        }
       }
     } catch (partErr) {
       console.warn('[noemetra] failed to preserve shared OAuth partition for legacy cloud connection:', partErr)
@@ -1204,6 +1212,10 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
   }
   const currentDir = path.dirname(currentFile)
   const legacyDir = path.dirname(legacyFile)
+  const currentSharedPart = path.join(currentDir, 'Partitions', 'hermes-remote-oauth')
+  const legacySharedPart = path.join(legacyDir, 'Partitions', 'hermes-remote-oauth')
+  const destHasSharedSession = fs.existsSync(currentSharedPart)
+  const legacyHasSharedSession = fs.existsSync(legacySharedPart)
 
   try {
     const currentRegistry = JSON.parse(fs.readFileSync(currentFile, 'utf8'))
@@ -1217,6 +1229,26 @@ function reconcileConnectionsRegistry(currentFile: string, legacyFile: string): 
       let modified = false
 
       for (const conn of legacyRegistry.connections) {
+        // Preserve account boundary (AGENTS.md:45-47): if destination already has an active cloud OAuth session,
+        // a legacy cloud OAuth connection cannot ride destination's account. Quarantine it to require explicit reauth.
+        if (conn.kind === 'cloud' && (conn.authMode === 'oauth' || !conn.token) && destHasSharedSession && legacyHasSharedSession) {
+          ensureSharedOauthPartitionPreserved(legacyDir, currentDir)
+          if (!Array.isArray(currentRegistry.quarantined)) {
+            currentRegistry.quarantined = []
+          }
+          if (currentRegistry.quarantined.length < 20) {
+            const alreadyQuarantined = currentRegistry.quarantined.some((q: any) => q && q.entry && q.entry.id === conn.id)
+            if (!alreadyQuarantined) {
+              currentRegistry.quarantined.push({
+                reason: 'cloud-oauth-account-boundary-reauth-required',
+                entry: conn
+              })
+              modified = true
+            }
+          }
+          continue
+        }
+
         if (!existingIds.has(conn.id)) {
           let label = conn.label || conn.id
           if (existingLabels.has(label.trim().toLowerCase())) {
