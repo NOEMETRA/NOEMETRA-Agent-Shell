@@ -184,18 +184,13 @@ function safeNormalizeUrl(raw: unknown): string {
 
 /**
  * Map normalized gateway URLs to their owning connection ID in the legacy registry.
- * Priority: primary connection first, followed by sole connections configured for that URL.
+ * An unscoped token can only be claimed if there was unambiguously EXACTLY ONE
+ * connection configured for that URL. If multiple connections shared the URL (even
+ * including the primary), the token is ambiguous and must be quarantined (apps/desktop/AGENTS.md:46-48).
  */
 export function buildLegacyUrlToConnectionMap(legacyRegistry: any): Map<string, string> {
   const map = new Map<string, string>()
   if (!legacyRegistry || !Array.isArray(legacyRegistry.connections)) return map
-
-  const primaryId = legacyRegistry.primary
-  const primaryConn = legacyRegistry.connections.find((c: any) => c && c.id === primaryId)
-  if (primaryConn && (primaryConn.kind === 'remote' || primaryConn.kind === 'cloud') && primaryConn.url) {
-    const norm = safeNormalizeUrl(primaryConn.url)
-    if (norm) map.set(norm, primaryConn.id)
-  }
 
   const byUrl = new Map<string, any[]>()
   for (const conn of legacyRegistry.connections) {
@@ -210,7 +205,7 @@ export function buildLegacyUrlToConnectionMap(legacyRegistry: any): Map<string, 
   }
 
   for (const [norm, conns] of byUrl.entries()) {
-    if (!map.has(norm) && conns.length === 1 && conns[0]?.id) {
+    if (conns.length === 1 && conns[0]?.id) {
       map.set(norm, conns[0].id)
     }
   }

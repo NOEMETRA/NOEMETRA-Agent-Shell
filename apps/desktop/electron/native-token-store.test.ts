@@ -525,3 +525,18 @@ test('mergeNativeTokenStoreObjects preserves userinfo in gateway URLs during tok
   const expectedKey = 'https://alice:secret@gw.example.com:8080/hermes#conn=cred-conn-imported-1'
   assert.equal(merged[expectedKey]?.value, 'secret-tokens')
 })
+
+test('buildLegacyUrlToConnectionMap refuses to map URL when primary shares URL with another connection', () => {
+  const legacyRegistry = {
+    primary: 'primary-conn',
+    connections: [
+      { id: 'primary-conn', kind: 'remote', url: 'https://shared-gw.example.com' },
+      { id: 'secondary-conn', kind: 'remote', url: 'https://shared-gw.example.com' }
+    ]
+  }
+
+  const map = buildLegacyUrlToConnectionMap(legacyRegistry)
+  // When primary shares an endpoint with another connection, ownership of an unscoped token
+  // is inherently ambiguous and must NOT be attributed to the primary:
+  assert.equal(map.get('https://shared-gw.example.com'), undefined)
+})
