@@ -531,4 +531,24 @@ describe('resolveOauthPartition with connectionId (pre-save sign-in identity)', 
     })
     expect(byUrl).toBe('persist:portal-iso')
   })
+
+  it('does not inherit another connection partition when connection IDs differ and explicit partition is omitted', () => {
+    const reg = registry('local', [
+      { id: 'local', kind: 'local' },
+      { id: 'conn-isolated', kind: 'remote', url: 'https://gateway.example', authMode: 'oauth', partition: 'persist:conn-isolated' },
+      { id: 'conn-standard', kind: 'remote', url: 'https://gateway.example', authMode: 'oauth' }
+    ])
+
+    const iso = resolveOauthPartition('https://gateway.example/api/status', {
+      registry: reg,
+      connectionId: 'conn-isolated'
+    })
+    expect(iso).toBe('persist:conn-isolated')
+
+    const standard = resolveOauthPartition('https://gateway.example/api/status', {
+      registry: reg,
+      connectionId: 'conn-standard'
+    })
+    expect(standard).not.toBe('persist:conn-isolated')
+  })
 })

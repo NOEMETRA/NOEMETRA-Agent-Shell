@@ -946,6 +946,12 @@ const DATABASE_DIR_NAMES = new Set(['Local Storage', 'Session Storage', 'Indexed
 function hasDatabaseContent(dbDir: string): boolean {
   try {
     if (!fs.existsSync(dbDir)) return false
+    const rootStat = fs.statSync(dbDir)
+    if (!rootStat.isDirectory()) {
+      // Single database file (e.g. SQLite Cookies, state.db).
+      // Empty SQLite template is typically <= 4096 bytes; real stored data is larger.
+      return rootStat.size > 4096
+    }
     const files = fs.readdirSync(dbDir, { recursive: true })
     for (const file of files) {
       const filePath = path.join(dbDir, String(file))
@@ -977,6 +983,40 @@ function hasDatabaseContent(dbDir: string): boolean {
     }
   } catch {}
   return false
+}
+
+function hasActiveCookieData(dir: string): boolean {
+  try {
+    const rootCookies = path.join(dir, 'Cookies')
+    const networkCookies = path.join(dir, 'Network', 'Cookies')
+    if (hasDatabaseContent(rootCookies) || hasDatabaseContent(networkCookies)) {
+      return true
+    }
+    const partitionsDir = path.join(dir, 'Partitions')
+    if (fs.existsSync(partitionsDir)) {
+      for (const part of fs.readdirSync(partitionsDir)) {
+        if (part.endsWith('.legacy')) continue
+        const partDir = path.join(partitionsDir, part)
+        if (
+          hasDatabaseContent(path.join(partDir, 'Cookies')) ||
+          hasDatabaseContent(path.join(partDir, 'Network', 'Cookies'))
+        ) {
+          return true
+        }
+      }
+    }
+  } catch {}
+  return false
+}
+
+function readLocalStateOsCryptKey(filePath: string): string | null {
+  try {
+    if (!fs.existsSync(filePath)) return null
+    const content = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    return content?.os_crypt?.encrypted_key || null
+  } catch {
+    return null
+  }
 }
 
 const USER_CONFIG_FILE_NAMES = [
@@ -2329,6 +2369,37 @@ function maybeMigrateLegacyDesktopState(): void {
                   fs.rmSync(destPart, { recursive: true, force: true })
                   fs.cpSync(stagedPart, destPart, { recursive: true })
                 }
+              }
+            }
+          } else if (entry === 'Local State') {
+            // Chromium OS Crypt encryption key (Local State):
+            // On Windows, cookies in Partitions/ and Network/ are encrypted with the key in Local State.
+            // If migration was postponed after an initial boot, destination has a boilerplate Local State.
+            // If destination has NO active user cookies, migrate legacy Local State to match the migrated cookies.
+            // If destination DOES have active user cookies and keys differ, preserve active Local State and require reauth.
+            const destExists = fs.existsSync(destPath)
+            const destHasActiveCookies = destExists && hasActiveCookieData(currentDir)
+            if (!destExists || !destHasActiveCookies) {
+              if (destExists) {
+                try {
+                  fs.copyFileSync(destPath, path.join(currentDir, 'Local State.intervening'))
+                } catch {}
+              }
+              fs.copyFileSync(stagedPath, destPath)
+              console.log('[noemetra] migrated legacy Local State encryption key matching migrated cookie databases')
+            } else {
+              const destKey = readLocalStateOsCryptKey(destPath)
+              const stagedKey = readLocalStateOsCryptKey(stagedPath)
+              if (destKey && stagedKey && destKey !== stagedKey) {
+                try {
+                  fs.copyFileSync(stagedPath, path.join(currentDir, 'Local State.legacy'))
+                } catch {}
+                console.warn('[noemetra] active destination cookies use different Local State key than legacy; legacy sessions will require reauthentication')
+                preservedDatabases.push({
+                  name: 'Local State',
+                  legacyPreserved: 'Local State.legacy',
+                  activeRetained: 'Local State'
+                })
               }
             }
           } else {
@@ -10942,7 +11013,33 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
         ).trim()
       : ''
 
-  const partition = typeof input.partition === 'string' ? input.partition.trim() : (existingBlock.partition || '')
+  // Partition scoping: only inherit partition from existingBlock when the applied connection
+  // is verifiably the SAME connection. When switching connections or applying an unpartitioned
+  // connection, look up the selected connection's partition in the registry or leave unset.
+  let partition = ''
+  if (typeof input.partition === 'string' && input.partition.trim()) {
+    partition = input.partition.trim()
+  } else if (input.connectionId || input.id) {
+    const targetId = String(input.connectionId || input.id).trim()
+    const existingId = String(existingBlock.connectionId || existingBlock.id || '').trim()
+    if (targetId && targetId === existingId && existingBlock.partition) {
+      partition = String(existingBlock.partition).trim()
+    } else {
+      try {
+        const reg = readDesktopConnectionsRegistry()
+        const entry = (reg.connections || []).find((c: any) => c.id === targetId)
+        if (entry && typeof entry.partition === 'string' && entry.partition.trim()) {
+          partition = entry.partition.trim()
+        }
+      } catch {}
+    }
+  } else if (
+    existingBlock.url &&
+    remoteUrl &&
+    normalizeRemoteBaseUrl(remoteUrl) === normalizeRemoteBaseUrl(existingBlock.url)
+  ) {
+    partition = typeof existingBlock.partition === 'string' ? existingBlock.partition.trim() : ''
+  }
 
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
