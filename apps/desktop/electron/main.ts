@@ -8330,7 +8330,7 @@ async function gatewayAuthProviders(baseUrl, headers = {}) {
 // see the 404 that identifies a backend predating /api/health (the auth gate
 // answers before the SPA catch-all). `probeIsCredentialed` tells
 // waitForHermesReady how to read a 401 — rejected session vs gated route.
-async function buildReadinessHealthProbe(baseUrl, authMode, token, connectionId?: string) {
+async function buildReadinessHealthProbe(baseUrl, authMode, token, connectionId?: string, partition?: string) {
   if (authMode === 'oauth') {
     return {
       // fetchJson takes the bearer via `options.bearer` — a raw `headers`
@@ -8341,7 +8341,11 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token, connectionId?
           ensureNativeAccessToken: u => ensureNativeAccessTokenScoped(u, connectionId),
           requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer }),
           requestWithCookie: () =>
-            fetchJsonViaOauthSession(url, { ...options, connectionId: options?.connectionId ?? connectionId })
+            fetchJsonViaOauthSession(url, {
+              ...options,
+              connectionId: options?.connectionId ?? connectionId,
+              partition: options?.partition ?? partition
+            })
         }),
       probeIsCredentialed: true
     }
@@ -8367,14 +8371,19 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token, connectionId?
 // a manual "Use gateway" click. Run the cascade once and retry once; anything
 // that is not that exact case surfaces unchanged.
 async function waitForRemoteHermes(remote) {
+  const connectionId = remote.connectionId
+  const explicitPartition = remote.partition
   try {
-    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, { connectionId: remote.connectionId })
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, {
+      connectionId,
+      partition: explicitPartition
+    })
   } catch (error) {
     if (!shouldAttemptCloudBootCascade(remote, error)) {
       throw error
     }
 
-    const part = resolveOauthPartitionForUrl(remote.baseUrl, { connectionId: remote.connectionId })
+    const part = explicitPartition || resolveOauthPartitionForUrl(remote.baseUrl, { connectionId })
     const portalPartition = part !== OAUTH_SESSION_PARTITION ? part : undefined
 
     if (!(await hasLivePortalSession(portalPartition))) {
@@ -8386,14 +8395,21 @@ async function waitForRemoteHermes(remote) {
     try {
       // Boot re-runs on wake and renderer retries, not only on a click: keep
       // the cascade hidden and let the overlay's Sign in button own any prompt.
-      await cloudAgentSilentSignIn(remote.baseUrl, { background: true, connectionId: remote.connectionId })
+      await cloudAgentSilentSignIn(remote.baseUrl, {
+        background: true,
+        connectionId,
+        partition: explicitPartition
+      })
     } catch (cascadeError) {
       rememberLog(`[cloud] boot: silent sign-in did not complete: ${cascadeError?.message || cascadeError}`)
 
       throw error
     }
 
-    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, { connectionId: remote.connectionId })
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, {
+      connectionId,
+      partition: explicitPartition
+    })
   }
 }
 
@@ -8403,9 +8419,19 @@ async function waitForHermes(
   signal?: AbortSignal,
   authMode?: string | null,
   headers: Record<string, string> = {},
-  { alreadyBound = false, connectionId = '' }: { alreadyBound?: boolean; connectionId?: string } = {}
+  {
+    alreadyBound = false,
+    connectionId = '',
+    partition
+  }: { alreadyBound?: boolean; connectionId?: string; partition?: string } = {}
 ): Promise<void> {
-  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token, connectionId)
+  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(
+    baseUrl,
+    authMode,
+    token,
+    connectionId,
+    partition
+  )
 
   return waitForHermesReady(baseUrl, {
     token,

@@ -195,7 +195,7 @@ test('refused requests and the boot cascade sign in hidden; only user actions ma
   const bootStart = source.indexOf('async function waitForRemoteHermes(')
   const bootBody = source.slice(bootStart, source.indexOf('\n}\n', bootStart))
 
-  expect(fetchBody).toContain('openOauthLoginWindow(origin, { silent: true, background: true })')
-  expect(bootBody).toContain('cloudAgentSilentSignIn(remote.baseUrl, { background: true })')
+  expect(fetchBody).toMatch(/openOauthLoginWindow\(origin,\s*\{[\s\S]*?silent:\s*true[\s\S]*?background:\s*true/)
+  expect(bootBody).toMatch(/cloudAgentSilentSignIn\(remote\.baseUrl,\s*\{[\s\S]*?background:\s*true/)
   expect(source).toContain("unattended ? 'background' : 'foreground'")
 })
