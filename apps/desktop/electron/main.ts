@@ -9780,17 +9780,22 @@ function _storeNativeTokens(key: string, tokens: NativeTokenSet): boolean {
   const normKey = key.includes('#conn=')
     ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
     : normalizeRemoteBaseUrl(key)
+  // Retain rotated/new tokens in-memory immediately so active sessions are never lost if disk persistence fails (#P1)
+  _nativeTokens.set(normKey, tokens)
+
   _persistNativeTokens(normKey, tokens)
-  // Verify persistence actually succeeded on disk and reflects the newly written tokens before caching in-memory
+  // Verify persistence actually succeeded on disk and reflects the newly written tokens
   const readBack = loadNativeTokenSet(normKey, _nativeTokenStoreIo())
   if (
     readBack !== null &&
     readBack.accessToken === tokens.accessToken &&
     readBack.refreshToken === tokens.refreshToken
   ) {
-    _nativeTokens.set(normKey, tokens)
     return true
   }
+  console.error(
+    `[noemetra] native tokens for ${normKey} could not be confirmed on disk; retained in memory only to prevent session disruption`
+  )
   return false
 }
 
