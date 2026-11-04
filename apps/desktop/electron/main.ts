@@ -1709,7 +1709,8 @@ function mergeNativeOAuthTokenStores(
         fs.writeFileSync(quarantinePath, JSON.stringify(combined, null, 2), { mode: 0o600 })
         console.warn(`[noemetra] quarantined ${Object.keys(quarantined).length} ambiguous legacy native tokens into native-oauth-tokens.quarantine.json`)
       } catch (quarantineErr) {
-        console.warn('[noemetra] failed to write native-oauth-tokens.quarantine.json:', quarantineErr)
+        console.error('[noemetra] failed to write native-oauth-tokens.quarantine.json; aborting migration to protect recovery copy:', quarantineErr)
+        throw quarantineErr
       }
     }
 
@@ -9780,9 +9781,13 @@ function _storeNativeTokens(key: string, tokens: NativeTokenSet): boolean {
     ? `${normalizeRemoteBaseUrl(key.split('#conn=')[0])}#conn=${key.split('#conn=')[1]}`
     : normalizeRemoteBaseUrl(key)
   _persistNativeTokens(normKey, tokens)
-  // Verify persistence actually succeeded on disk before caching in-memory
+  // Verify persistence actually succeeded on disk and reflects the newly written tokens before caching in-memory
   const readBack = loadNativeTokenSet(normKey, _nativeTokenStoreIo())
-  if (readBack !== null) {
+  if (
+    readBack !== null &&
+    readBack.accessToken === tokens.accessToken &&
+    readBack.refreshToken === tokens.refreshToken
+  ) {
     _nativeTokens.set(normKey, tokens)
     return true
   }
