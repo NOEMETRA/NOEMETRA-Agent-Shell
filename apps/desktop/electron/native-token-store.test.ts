@@ -21,6 +21,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import { type NativeTokenSet, parseStoredTokenSet, parseTokenResponse } from './native-oauth'
+import { migrateV1ToRegistry } from './connection-registry'
 import { buildLegacyUrlToConnectionMap, loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet, redactGatewayUrl } from './native-token-store'
 
 const GATEWAY = 'https://gw.example.com'
@@ -556,4 +557,75 @@ test('redactGatewayUrl drops credentials while preserving scheme, host, path, an
   )
   assert.equal(redactGatewayUrl('invalid url string'), '<invalid gateway URL>')
 })
+
+test('buildLegacyUrlToConnectionMap resolves URL for legacy v1 connection config', () => {
+  const v1Config = {
+    mode: 'remote',
+    remote: {
+      url: 'https://v1-gw.example.com',
+      authMode: 'oauth'
+    }
+  }
+
+  const convertedRegistry = migrateV1ToRegistry(v1Config)
+  const map = buildLegacyUrlToConnectionMap(convertedRegistry)
+
+  assert.equal(map.get('https://v1-gw.example.com'), 'v1-gw-example-com')
+})
+
+test('mergeNativeTokenStoreObjects scopes unscoped tokens for legacy v1-only installations without quarantine', () => {
+  const v1Config = {
+    mode: 'remote',
+    remote: {
+      url: 'https://v1-gw.example.com',
+      authMode: 'oauth'
+    }
+  }
+
+  const convertedRegistry = migrateV1ToRegistry(v1Config)
+  const legacyUrlToConnId = buildLegacyUrlToConnectionMap(convertedRegistry)
+
+  const legacyStore = {
+    'https://v1-gw.example.com': { encoding: 'safeStorage', value: 'token-bytes' }
+  }
+  const currentStore = {}
+  const idRemap = new Map<string, string>([
+    ['v1-gw-example-com', 'v1-gw-example-com-imported-1']
+  ])
+
+  const { merged, quarantined, modified } = mergeNativeTokenStoreObjects(
+    legacyStore,
+    currentStore,
+    idRemap,
+    legacyUrlToConnId
+  )
+
+  assert.equal(modified, true)
+  assert.deepEqual(quarantined, {})
+  assert.equal(merged['https://v1-gw.example.com#conn=v1-gw-example-com-imported-1']?.value, 'token-bytes')
+})
+
+test('buildLegacyUrlToConnectionMap handles legacy v1 config with per-profile overrides', () => {
+  const v1Config = {
+    mode: 'remote',
+    remote: {
+      url: 'https://global-gw.example.com',
+      authMode: 'oauth'
+    },
+    profiles: {
+      research: {
+        mode: 'remote',
+        url: 'https://research-gw.example.com',
+        authMode: 'oauth'
+      }
+    }
+  }
+
+  const convertedRegistry = migrateV1ToRegistry(v1Config)
+  const map = buildLegacyUrlToConnectionMap(convertedRegistry)
+
+  assert.equal(map.get('https://global-gw.example.com'), 'global-gw-example-com')
+  assert.equal(map.get('https://research-gw.example.com'), 'research-gw-example-com')
+})
+
 
