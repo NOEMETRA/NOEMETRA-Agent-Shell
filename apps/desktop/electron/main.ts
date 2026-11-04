@@ -401,7 +401,7 @@ import {
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
-import { loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import { buildLegacyUrlToConnectionMap, loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { execGit, killTimedGitChildren, setNoConsoleGitRoots } from './no-console-git'
 import { registerNativeNotifications } from './notification-ipc'
 import { loginFlightKey, OauthLoginFlights } from './oauth-login-flights'
@@ -1619,7 +1619,21 @@ function mergeNativeOAuthTokenStores(
       } catch {}
     }
 
-    const { merged, modified } = mergeNativeTokenStoreObjects(legacyJson, currentJson, idRemap)
+    let legacyUrlToConnId = new Map<string, string>()
+    const legacyConnFile = path.join(legacyDir, 'connections.json')
+    if (fs.existsSync(legacyConnFile)) {
+      try {
+        const legacyReg = JSON.parse(fs.readFileSync(legacyConnFile, 'utf8'))
+        legacyUrlToConnId = buildLegacyUrlToConnectionMap(legacyReg)
+      } catch {}
+    }
+
+    const { merged, modified } = mergeNativeTokenStoreObjects(
+      legacyJson,
+      currentJson,
+      idRemap,
+      legacyUrlToConnId
+    )
 
     if (modified || !destExisted) {
       fs.mkdirSync(path.dirname(currentStorePath), { recursive: true })

@@ -21,7 +21,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import { type NativeTokenSet, parseStoredTokenSet, parseTokenResponse } from './native-oauth'
-import { loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import { buildLegacyUrlToConnectionMap, loadNativeTokenSet, mergeNativeTokenStoreObjects, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 
 const GATEWAY = 'https://gw.example.com'
 
@@ -411,6 +411,50 @@ test('mergeNativeTokenStoreObjects preserves destination tokens on key collision
   assert.equal(merged['https://other.example.com#conn=conn-3-legacy'].value, 'legacy-other-3')
   // Legacy unscoped token is imported when destination has no collision:
   assert.equal(merged['https://gw.example.com'].value, 'legacy-unscoped')
+})
+
+test('mergeNativeTokenStoreObjects scopes unscoped legacy tokens to imported connection and prevents collision', () => {
+  const legacyRegistry = {
+    primary: 'legacy-primary',
+    connections: [
+      { id: 'legacy-primary', kind: 'remote', url: 'https://gw.example.com' },
+      { id: 'legacy-other', kind: 'remote', url: 'https://other.example.com' }
+    ]
+  }
+
+  const legacyStore = {
+    'https://gw.example.com': { encoding: 'safeStorage', value: 'legacy-gw-unscoped' },
+    'https://other.example.com': { encoding: 'safeStorage', value: 'legacy-other-unscoped' }
+  }
+
+  // Destination already has a connection to the same gateway with its own unscoped token
+  const currentStore = {
+    'https://gw.example.com': { encoding: 'safeStorage', value: 'destination-active-gw' }
+  }
+
+  const legacyUrlToConnId = buildLegacyUrlToConnectionMap(legacyRegistry)
+  assert.equal(legacyUrlToConnId.get('https://gw.example.com'), 'legacy-primary')
+  assert.equal(legacyUrlToConnId.get('https://other.example.com'), 'legacy-other')
+
+  // Destination reconciled legacy-primary to legacy-primary-imported-1 because of collision
+  const idRemap = new Map<string, string>([
+    ['legacy-primary', 'legacy-primary-imported-1']
+  ])
+
+  const { merged, modified } = mergeNativeTokenStoreObjects(
+    legacyStore,
+    currentStore,
+    idRemap,
+    legacyUrlToConnId
+  )
+
+  assert.equal(modified, true)
+  // Active destination token remains untouched:
+  assert.equal(merged['https://gw.example.com'].value, 'destination-active-gw')
+  // Legacy token is scoped to its imported connection rather than dropped or stealing destination's primary:
+  assert.equal(merged['https://gw.example.com#conn=legacy-primary-imported-1'].value, 'legacy-gw-unscoped')
+  // Other legacy token is scoped to legacy-other:
+  assert.equal(merged['https://other.example.com#conn=legacy-other'].value, 'legacy-other-unscoped')
 })
 
 test('mergeNativeTokenStoreObjects reports modified false when all legacy keys already exist in destination', () => {
