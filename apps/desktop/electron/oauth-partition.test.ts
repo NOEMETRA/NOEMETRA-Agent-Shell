@@ -388,4 +388,51 @@ describe('resolveOauthPartition with connectionId (pre-save sign-in identity)', 
     })
     expect(byUrl).toBe('persist:hermes-remote-oauth-conn-imported-conn')
   })
+
+  it('resolves an explicit partition when a migrated connection is primary (both by ID and by URL) (AGENTS.md:46-48)', () => {
+    const reg = registry('imported-primary', [
+      {
+        id: 'imported-primary',
+        kind: 'remote',
+        authMode: 'oauth',
+        url: 'https://gw-a.example.com',
+        partition: 'persist:hermes-remote-oauth-conn-imported-primary'
+      }
+    ])
+
+    const byId = resolveOauthPartition('https://gw-a.example.com', {
+      registry: reg,
+      connectionId: 'imported-primary'
+    })
+    expect(byId).toBe('persist:hermes-remote-oauth-conn-imported-primary')
+
+    const byUrl = resolveOauthPartition('https://gw-a.example.com/api/test', {
+      registry: reg
+    })
+    expect(byUrl).toBe('persist:hermes-remote-oauth-conn-imported-primary')
+  })
+
+  it('resolves an explicit partition for an isolated cloud connection (both by ID and by URL) (AGENTS.md:46-48, 86-91)', () => {
+    const reg = registry('local', [
+      { id: 'local', kind: 'local' },
+      {
+        id: 'cloud-isolated',
+        kind: 'cloud',
+        authMode: 'oauth',
+        url: 'https://gateway.isolated.cloud',
+        partition: 'persist:hermes-remote-oauth-conn-cloud-isolated'
+      }
+    ])
+
+    const byId = resolveOauthPartition('https://gateway.isolated.cloud', {
+      registry: reg,
+      connectionId: 'cloud-isolated'
+    })
+    expect(byId).toBe('persist:hermes-remote-oauth-conn-cloud-isolated')
+
+    const byUrl = resolveOauthPartition('https://gateway.isolated.cloud/api/test', {
+      registry: reg
+    })
+    expect(byUrl).toBe('persist:hermes-remote-oauth-conn-cloud-isolated')
+  })
 })

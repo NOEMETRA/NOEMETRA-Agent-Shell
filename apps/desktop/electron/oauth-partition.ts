@@ -215,21 +215,33 @@ export function resolveOauthPartition(requestUrl: unknown, opts: ResolveOauthPar
     }
 
     const id = typeof (entry as any).id === 'string' ? (entry as any).id.trim() : ''
-
-    // Only NON-primary v2 `remote` entries with cookie-flow auth get their own
-    // jar. Cloud entries need the shared portal jar; token entries never use
-    // cookies; the primary (and the v1 remote it migrated from) keeps the
-    // legacy jar so an upgrade does not sign the user out.
-    if (!id || id === primaryId) {
+    if (!id) {
       continue
     }
 
-    if ((entry as any).kind !== 'remote' || (entry as any).authMode !== 'oauth') {
+    const hasExplicitPart = typeof (entry as any).partition === 'string' && (entry as any).partition.trim().length > 0
+
+    // Only NON-primary v2 `remote` entries with cookie-flow auth get their own
+    // jar, UNLESS the entry declares an explicit partition (AGENTS.md:46-48).
+    // Cloud entries normally share the portal jar and token entries never use
+    // cookies; an unpartitioned primary (and the v1 remote it migrated from)
+    // keeps the legacy jar so an upgrade does not sign the user out.
+    if (id === primaryId && !hasExplicitPart) {
+      continue
+    }
+
+    const kind = (entry as any).kind
+    const authMode = (entry as any).authMode
+
+    const isEligibleOauth =
+      (kind === 'remote' && authMode === 'oauth') ||
+      (hasExplicitPart && (authMode === 'oauth' || kind === 'cloud'))
+
+    if (!isEligibleOauth) {
       continue
     }
 
     const baseNorm = normalizeForMatch((entry as any).url)
-    const hasExplicitPart = typeof (entry as any).partition === 'string' && (entry as any).partition.trim().length > 0
 
     if (!baseNorm || (v1Norm && baseNorm === v1Norm && !hasExplicitPart)) {
       continue
