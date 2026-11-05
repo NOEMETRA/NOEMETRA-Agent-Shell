@@ -170,6 +170,12 @@ class SeekRequest(BaseModel):
     page_number: Optional[int] = None
 
 
+class PlaybackAckRequest(BaseModel):
+    sentence_index: int
+    event: str = "started"  # "started" | "ended" | "progress"
+    offset_seconds: Optional[float] = None
+
+
 class ConfigRequest(BaseModel):
     tts_model: Optional[str] = None
     speed: Optional[float] = None
@@ -399,6 +405,18 @@ async def seek_playback(req: SeekRequest, request: Request):
     except Exception as e:
         logger.error(f"Errore seek: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/playback/ack")
+async def ack_playback(req: PlaybackAckRequest, request: Request):
+    """Client playback acknowledgement to synchronize server-side bookmarks and sentence transitions."""
+    assistant = _req_assistant(request)
+    assistant.player.handle_client_ack(
+        sentence_index=req.sentence_index,
+        event=req.event,
+        offset_seconds=req.offset_seconds,
+    )
+    return {"status": "success", "bookmark": assistant.player.get_bookmark().model_dump()}
 
 
 @router.get("/audio/sentence/{sentence_idx}")

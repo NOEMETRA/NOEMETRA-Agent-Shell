@@ -342,3 +342,32 @@ def test_client_playback_mode_selection():
     assert assistant.player.client_playback is True
     assistant.player.stop()
 
+
+def test_client_playback_ack_synchronization():
+    """Verify that /playback/ack updates server-side synchronization events."""
+    assistant = get_assistant()
+    if not assistant.current_document:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "doc.pdf"
+            create_sample_italian_pdf(pdf_path)
+            assistant.load_document(pdf_path)
+
+    res_start = client.post(
+        "/api/plugins/voice-document-assistant/playback/ack",
+        json={"sentence_index": 0, "event": "started"},
+    )
+    assert res_start.status_code == 200
+    assert assistant.player.client_playback is True
+
+    res_progress = client.post(
+        "/api/plugins/voice-document-assistant/playback/ack",
+        json={"sentence_index": 0, "event": "progress", "offset_seconds": 1.5},
+    )
+    assert res_progress.status_code == 200
+
+    res_end = client.post(
+        "/api/plugins/voice-document-assistant/playback/ack",
+        json={"sentence_index": 0, "event": "ended"},
+    )
+    assert res_end.status_code == 200
+

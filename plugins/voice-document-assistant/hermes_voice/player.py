@@ -53,6 +53,9 @@ class DocumentPlayer:
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
+        self._client_started_event = threading.Event()
+        self._client_ended_event = threading.Event()
+        self._audio_fetched_sent_idx: int = -1
 
     @property
     def state(self) -> PlayerState:
@@ -162,6 +165,8 @@ class DocumentPlayer:
 
             self._stop_event.clear()
             self._pause_event.clear()
+            self._client_started_event.clear()
+            self._client_ended_event.clear()
             self._state = PlayerState.PLAYING
 
             if self.virtual_playback or self.client_playback:
@@ -252,6 +257,9 @@ class DocumentPlayer:
             self._current_sent_idx = max(0, min(sentence_index, len(self._document.all_sentences) - 1))
             self._sample_offset = 0
             self._current_audio = None
+            self._client_started_event.clear()
+            self._client_ended_event.clear()
+            self._audio_fetched_sent_idx = -1
             self._state = PlayerState.PAUSED
             self._save_bookmark()
 
@@ -308,6 +316,10 @@ class DocumentPlayer:
             if not self._document or sentence_index < 0 or sentence_index >= len(self._document.all_sentences):
                 return b""
             sentence = self._document.all_sentences[sentence_index]
+            self._audio_fetched_sent_idx = sentence_index
+            self.client_playback = True
+            if sentence_index == self._current_sent_idx:
+                self._client_started_event.set()
 
         # Synthesize audio using Pocket TTS
         audio_data, sr = self.tts.synthesize(sentence.text)
@@ -316,6 +328,20 @@ class DocumentPlayer:
         buffer = io.BytesIO()
         sf.write(buffer, audio_data, sr, format="WAV")
         return buffer.getvalue()
+
+    def handle_client_ack(self, sentence_index: int, event: str, offset_seconds: Optional[float] = None) -> None:
+        """Process client playback progress and completion events."""
+        with self._lock:
+            self.client_playback = True
+            if sentence_index == self._current_sent_idx:
+                if event == "started":
+                    self._audio_fetched_sent_idx = sentence_index
+                    self._client_started_event.set()
+                elif event == "ended":
+                    self._client_ended_event.set()
+                elif event == "progress" and offset_seconds is not None and self._current_audio is not None:
+                    sr = self._current_sr or 24000
+                    self._sample_offset = min(len(self._current_audio), int(offset_seconds * sr))
 
     def _save_bookmark(self) -> ReadingBookmark:
         """Persist current bookmark to JSON file, preserving per-document reading positions."""
@@ -503,6 +529,18 @@ class DocumentPlayer:
                         sr = 24000
                         fallback_duration = max(0.4, (len(words) * 0.25) / effective_speed)
 
+                # In client playback mode, wait for client to start each sentence before advancing timeline
+                if getattr(self, "client_playback", False):
+                    wait_start = time.time()
+                    while not self._stop_event.is_set() and not self._pause_event.is_set():
+                        with self._lock:
+                            if self._client_started_event.is_set() or self._audio_fetched_sent_idx == self._current_sent_idx:
+                                break
+                        # Timeout after 15s to allow for slow remote downloads without hanging indefinitely
+                        if time.time() - wait_start > 15.0:
+                            break
+                        time.sleep(0.05)
+
                 if self._stop_event.is_set() or self._pause_event.is_set():
                     break
 
@@ -513,6 +551,11 @@ class DocumentPlayer:
                     step_samples = int(sr * 0.1 * effective_speed)
                     while self._sample_offset < total_samples:
                         if self._stop_event.is_set() or self._pause_event.is_set():
+                            break
+                        if self._client_ended_event.is_set():
+                            # Client finished playing sentence audio
+                            with self._lock:
+                                self._sample_offset = total_samples
                             break
                         time.sleep(0.1)
                         with self._lock:
@@ -534,6 +577,8 @@ class DocumentPlayer:
                     self._current_sent_idx += 1
                     self._sample_offset = 0
                     self._current_audio = None
+                    self._client_started_event.clear()
+                    self._client_ended_event.clear()
                     self._save_bookmark()
         finally:
             with self._lock:
