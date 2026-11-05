@@ -148,3 +148,56 @@ def test_api_get_document_does_not_switch_active():
 
         # Verify active document is still B
         assert assistant.current_document.doc_id == active_doc_id
+
+
+def test_cross_profile_access_rejected_with_403():
+    """Verify that attempting to access a different profile than the gateway-bound scope returns 403."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_voice.profile import resolve_voice_profile_dir
+
+    prof_dir = resolve_voice_profile_dir("alpha_profile")
+    token = set_hermes_home_override(str(prof_dir.parent.parent / "profiles" / "alpha_profile"))
+    try:
+        # Request specifying beta_profile when bound to alpha_profile must be rejected
+        res = client.get(
+            "/api/plugins/voice-document-assistant/status",
+            headers={"X-Hermes-Profile": "beta_profile"},
+        )
+        assert res.status_code == 403
+        assert "Access denied" in res.json()["detail"]
+
+        # Request matching authorized profile succeeds
+        res_ok = client.get(
+            "/api/plugins/voice-document-assistant/status",
+            headers={"X-Hermes-Profile": "alpha_profile"},
+        )
+        assert res_ok.status_code == 200
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_audio_sentence_stream_endpoint():
+    """Verify generated sentence audio is delivered to desktop client as standard WAV."""
+    assistant = get_assistant()
+    if not assistant.current_document:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "doc.pdf"
+            create_sample_italian_pdf(pdf_path)
+            assistant.load_document(pdf_path)
+
+    res = client.get("/api/plugins/voice-document-assistant/audio/sentence/0")
+    assert res.status_code == 200
+    assert "audio/wav" in res.headers["content-type"]
+    assert res.content.startswith(b"RIFF")
+    assert b"WAVE" in res.content[:16]
+
+
+def test_api_playback_config_llm_model():
+    """Verify playback config supports selecting the LLM model."""
+    res = client.post(
+        "/api/plugins/voice-document-assistant/playback/config",
+        json={"llm_model": "custom-model:latest"},
+    )
+    assert res.status_code == 200
+    assert res.json()["llm_model"] == "custom-model:latest"
+

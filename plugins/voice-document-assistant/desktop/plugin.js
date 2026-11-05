@@ -420,8 +420,10 @@ function VoiceDocumentPage({ ctx }) {
   const [isAsking, setIsAsking] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
   const fileInputRef = useRef(null)
+  const clientAudioRef = useRef(null)
+  const lastPlayedSentenceRef = useRef(-1)
 
-  // Poll backend status
+  // Poll backend status and synchronize client-side audio playback
   useEffect(() => {
     let timer = null
     const poll = async () => {
@@ -433,6 +435,24 @@ function VoiceDocumentPage({ ctx }) {
           if (!docData || isPlaying) {
             setViewPage(s.current_page)
           }
+
+          // Client-side local audio streaming for desktop playback
+          if (isPlaying && s.current_sentence_index !== lastPlayedSentenceRef.current) {
+            lastPlayedSentenceRef.current = s.current_sentence_index
+            try {
+              if (clientAudioRef.current) {
+                clientAudioRef.current.pause()
+              }
+              const audioUrl = `/api/plugins/voice-document-assistant/audio/sentence/${s.current_sentence_index}`
+              const audio = new Audio(audioUrl)
+              clientAudioRef.current = audio
+              audio.play().catch(() => {})
+            } catch (e) {
+              // audio play fallback
+            }
+          } else if (!isPlaying && clientAudioRef.current) {
+            clientAudioRef.current.pause()
+          }
         }
       } catch (err) {
         // backend loading
@@ -440,7 +460,12 @@ function VoiceDocumentPage({ ctx }) {
       timer = setTimeout(poll, 600)
     }
     poll()
-    return () => clearTimeout(timer)
+    return () => {
+      clearTimeout(timer)
+      if (clientAudioRef.current) {
+        clientAudioRef.current.pause()
+      }
+    }
   }, [ctx, docData])
 
   // Load library
@@ -481,6 +506,7 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handlePause = async () => {
+    if (clientAudioRef.current) clientAudioRef.current.pause()
     try {
       await ctx.rest('/playback/pause', { method: 'POST' })
     } catch (err) {
@@ -497,6 +523,7 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleStop = async () => {
+    if (clientAudioRef.current) clientAudioRef.current.pause()
     try {
       await ctx.rest('/playback/stop', { method: 'POST' })
     } catch (err) {
