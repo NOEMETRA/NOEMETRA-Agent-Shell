@@ -18,18 +18,28 @@
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const clientAudioRef = useRef(null);
-    const lastPlayedSentRef = useRef(-1);
+    const lastPlayedTargetRef = useRef("");
+    const pollGenRef = useRef(0);
 
     const refreshStatus = useCallback(async () => {
       try {
+        const currentGen = ++pollGenRef.current;
         const data = await fetchJSON("/api/plugins/voice-document-assistant/status");
+        if (currentGen !== pollGenRef.current) return;
         setStatus(data);
         // Client-side desktop audio stream
         if (data && data.player_state === "PLAYING") {
-          if (data.current_sentence_index !== lastPlayedSentRef.current) {
-            lastPlayedSentRef.current = data.current_sentence_index;
-            if (clientAudioRef.current) clientAudioRef.current.pause();
-            const audio = new Audio("/api/plugins/voice-document-assistant/audio/sentence/" + data.current_sentence_index);
+          const targetDocId = data.doc_id || "";
+          const playTargetKey = `${targetDocId}:${data.current_sentence_index}`;
+          if (playTargetKey !== lastPlayedTargetRef.current) {
+            lastPlayedTargetRef.current = playTargetKey;
+            if (clientAudioRef.current) {
+              clientAudioRef.current.pause();
+              clientAudioRef.current = null;
+            }
+            const currentSentIdx = data.current_sentence_index;
+            const audio = new Audio("/api/plugins/voice-document-assistant/audio/sentence/" + currentSentIdx);
+            if (currentGen !== pollGenRef.current || lastPlayedTargetRef.current !== playTargetKey) return;
             if (data.speed) audio.playbackRate = data.speed;
             const startOffset = data.audio_seconds_offset || 0;
             if (startOffset > 0.05) {
@@ -41,7 +51,6 @@
               if (audio.readyState >= 1) setOffset();
               else audio.addEventListener("loadedmetadata", setOffset, { once: true });
             }
-            const currentSentIdx = data.current_sentence_index;
             audio.addEventListener("play", () => {
               fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
                 method: "POST",
@@ -49,6 +58,18 @@
                 body: JSON.stringify({ sentence_index: currentSentIdx, event: "started" })
               }).catch(() => {});
             }, { once: true });
+            let lastProgressAck = 0;
+            audio.addEventListener("timeupdate", () => {
+              const now = Date.now();
+              if (now - lastProgressAck > 300) {
+                lastProgressAck = now;
+                fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ sentence_index: currentSentIdx, event: "progress", offset_seconds: audio.currentTime })
+                }).catch(() => {});
+              }
+            });
             audio.addEventListener("ended", () => {
               fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
                 method: "POST",
@@ -56,6 +77,7 @@
                 body: JSON.stringify({ sentence_index: currentSentIdx, event: "ended" })
               }).catch(() => {});
             }, { once: true });
+            if (currentGen !== pollGenRef.current || lastPlayedTargetRef.current !== playTargetKey) return;
             clientAudioRef.current = audio;
             audio.play().catch(() => {});
           } else if (clientAudioRef.current) {
@@ -76,7 +98,7 @@
             clientAudioRef.current.pause();
           }
           if (data && (data.player_state === "STOPPED" || data.player_state === "FINISHED")) {
-            lastPlayedSentRef.current = -1;
+            lastPlayedTargetRef.current = "";
             clientAudioRef.current = null;
           }
         }
