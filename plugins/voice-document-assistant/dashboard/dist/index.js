@@ -19,6 +19,7 @@
     const [error, setError] = useState(null);
     const clientAudioRef = useRef(null);
     const lastPlayedTargetRef = useRef("");
+    const fetchingTargetRef = useRef("");
     const pollGenRef = useRef(0);
 
     const refreshStatus = useCallback(async () => {
@@ -31,15 +32,24 @@
         if (data && data.player_state === "PLAYING") {
           const targetDocId = data.doc_id || "";
           const playTargetKey = `${targetDocId}:${data.current_sentence_index}`;
-          if (playTargetKey !== lastPlayedTargetRef.current) {
-            lastPlayedTargetRef.current = playTargetKey;
+          if (playTargetKey !== lastPlayedTargetRef.current && fetchingTargetRef.current !== playTargetKey) {
+            fetchingTargetRef.current = playTargetKey;
             if (clientAudioRef.current) {
               clientAudioRef.current.pause();
               clientAudioRef.current = null;
             }
             const currentSentIdx = data.current_sentence_index;
             const audio = new Audio("/api/plugins/voice-document-assistant/audio/sentence/" + currentSentIdx);
-            if (currentGen !== pollGenRef.current || lastPlayedTargetRef.current !== playTargetKey) return;
+            audio.addEventListener("error", () => {
+              fetchingTargetRef.current = "";
+              if (lastPlayedTargetRef.current === playTargetKey) {
+                lastPlayedTargetRef.current = "";
+              }
+            }, { once: true });
+            if (currentGen !== pollGenRef.current) {
+              fetchingTargetRef.current = "";
+              return;
+            }
             if (data.speed) audio.playbackRate = data.speed;
             const startOffset = data.audio_seconds_offset || 0;
             if (startOffset > 0.05) {
@@ -77,8 +87,13 @@
                 body: JSON.stringify({ sentence_index: currentSentIdx, event: "ended" })
               }).catch(() => {});
             }, { once: true });
-            if (currentGen !== pollGenRef.current || lastPlayedTargetRef.current !== playTargetKey) return;
+            if (currentGen !== pollGenRef.current) {
+              fetchingTargetRef.current = "";
+              return;
+            }
             clientAudioRef.current = audio;
+            lastPlayedTargetRef.current = playTargetKey;
+            fetchingTargetRef.current = "";
             audio.play().catch(() => {});
           } else if (clientAudioRef.current) {
             if (data.speed && clientAudioRef.current.playbackRate !== data.speed) {
@@ -99,6 +114,7 @@
           }
           if (data && (data.player_state === "STOPPED" || data.player_state === "FINISHED")) {
             lastPlayedTargetRef.current = "";
+            fetchingTargetRef.current = "";
             clientAudioRef.current = null;
           }
         }
@@ -122,6 +138,8 @@
       const interval = setInterval(refreshStatus, 3000);
       return () => {
         clearInterval(interval);
+        fetchingTargetRef.current = "";
+        lastPlayedTargetRef.current = "";
         if (clientAudioRef.current) clientAudioRef.current.pause();
       };
     }, [refreshStatus, refreshLibrary]);
@@ -130,7 +148,9 @@
       const normalizedEndpoint = (endpoint === "play" || endpoint === "pause" || endpoint === "resume" || endpoint === "stop" || endpoint === "seek" || endpoint === "config")
         ? `playback/${endpoint}`
         : endpoint;
-      if (normalizedEndpoint === "playback/pause" || normalizedEndpoint === "playback/stop") {
+      if (normalizedEndpoint === "playback/pause" || normalizedEndpoint === "playback/stop" || normalizedEndpoint === "playback/seek") {
+        lastPlayedTargetRef.current = "";
+        fetchingTargetRef.current = "";
         if (clientAudioRef.current) clientAudioRef.current.pause();
       }
       const finalBody = (normalizedEndpoint === "playback/play" || normalizedEndpoint === "playback/resume")

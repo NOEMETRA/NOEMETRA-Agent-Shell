@@ -353,7 +353,7 @@ async def play_playback(request: Request):
             client_playback = False
 
     try:
-        bm = assistant.play(client_playback=client_playback)
+        bm = await asyncio.to_thread(assistant.play, client_playback=client_playback)
         return {"status": "success", "bookmark": bm.model_dump()}
     except Exception as e:
         logger.error(f"Errore play: {e}")
@@ -364,8 +364,12 @@ async def play_playback(request: Request):
 async def pause_playback(request: Request):
     """Pause audio playback and save exact bookmark."""
     assistant = _req_assistant(request)
-    bm = assistant.pause()
-    return {"status": "success", "bookmark": bm.model_dump()}
+    try:
+        bm = await asyncio.to_thread(assistant.pause)
+        return {"status": "success", "bookmark": bm.model_dump()}
+    except Exception as e:
+        logger.error(f"Errore pause: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/playback/resume")
@@ -392,7 +396,7 @@ async def resume_playback(request: Request):
             client_playback = False
 
     try:
-        bm = assistant.resume(client_playback=client_playback)
+        bm = await asyncio.to_thread(assistant.resume, client_playback=client_playback)
         return {"status": "success", "bookmark": bm.model_dump()}
     except Exception as e:
         logger.error(f"Errore resume: {e}")
@@ -403,8 +407,12 @@ async def resume_playback(request: Request):
 async def stop_playback(request: Request):
     """Stop audio playback."""
     assistant = _req_assistant(request)
-    bm = assistant.stop()
-    return {"status": "success", "bookmark": bm.model_dump()}
+    try:
+        bm = await asyncio.to_thread(assistant.stop)
+        return {"status": "success", "bookmark": bm.model_dump()}
+    except Exception as e:
+        logger.error(f"Errore stop: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/playback/seek")
@@ -413,9 +421,9 @@ async def seek_playback(req: SeekRequest, request: Request):
     assistant = _req_assistant(request)
     try:
         if req.sentence_index is not None:
-            bm = assistant.seek_sentence(req.sentence_index)
+            bm = await asyncio.to_thread(assistant.seek_sentence, req.sentence_index)
         elif req.page_number is not None:
-            bm = assistant.seek_page(req.page_number)
+            bm = await asyncio.to_thread(assistant.seek_page, req.page_number)
         else:
             raise ValueError("Specificare 'sentence_index' oppure 'page_number'.")
         return {"status": "success", "bookmark": bm.model_dump()}

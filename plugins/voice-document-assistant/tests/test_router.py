@@ -89,3 +89,51 @@ def test_model_router_resolves_and_switches_model(monkeypatch):
     assert selected == "gemma4:12b"
     assert router.ollama_model == "gemma4:12b"
 
+
+def test_model_router_honors_configured_custom_local_endpoint(monkeypatch):
+    """Verify ModelRouter honors custom local OpenAI-compatible endpoints (LM Studio, vLLM)."""
+    fake_config = {
+        "model": {
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "name": "qwen2.5:14b",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    router = ModelRouter()
+    assert router.default_provider == "openai_compatible"
+    assert router.codex_base_url == "http://127.0.0.1:1234/v1"
+    assert router.ollama_model == "qwen2.5:14b"
+    assert router.select_installed_model() == "qwen2.5:14b"
+
+    captured_call = {}
+
+    def mock_openai_compatible(**kwargs):
+        captured_call.update(kwargs)
+        return "LM Studio Answer"
+
+    monkeypatch.setattr(router, "_call_openai_compatible", mock_openai_compatible)
+    res = router.generate(prompt="Document question")
+    assert res == "LM Studio Answer"
+    assert captured_call["base_url"] == "http://127.0.0.1:1234/v1"
+    assert captured_call["model"] == "qwen2.5:14b"
+
+
+def test_model_router_honors_configured_custom_ollama_port(monkeypatch):
+    """Verify ModelRouter honors custom Ollama server ports configured in setup."""
+    fake_config = {
+        "model": {
+            "provider": "ollama",
+            "base_url": "http://127.0.0.1:11435",
+            "name": "mistral:latest",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    router = ModelRouter()
+    assert router.default_provider == "ollama"
+    assert router.ollama_base_url == "http://127.0.0.1:11435"
+    assert router.ollama_model == "mistral:latest"
+
+

@@ -32,8 +32,8 @@ class ModelRouter:
 
     def __init__(
         self,
-        default_provider: str = "ollama",
-        ollama_base_url: str = "http://127.0.0.1:11434",
+        default_provider: Optional[str] = None,
+        ollama_base_url: Optional[str] = None,
         ollama_model: Optional[str] = None,
         codex_base_url: Optional[str] = None,
         codex_api_key: Optional[str] = None,
@@ -41,26 +41,64 @@ class ModelRouter:
         remote_api_key: Optional[str] = None,
         allow_remote: bool = False,
     ):
-        self.default_provider = default_provider.lower()
-        self.ollama_base_url = ollama_base_url.rstrip("/")
+        # Resolve model, provider and endpoint from hermes config if not explicitly provided
+        cfg_model = None
+        cfg_provider = None
+        cfg_base_url = None
+        cfg_api_key = None
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            model_cfg = cfg.get("model")
+            if isinstance(model_cfg, dict):
+                cfg_model = model_cfg.get("default") or model_cfg.get("name") or ""
+                cfg_provider = model_cfg.get("provider")
+                cfg_base_url = model_cfg.get("base_url") or model_cfg.get("endpoint") or model_cfg.get("api_base")
+                cfg_api_key = model_cfg.get("api_key")
+            elif isinstance(model_cfg, str):
+                cfg_model = model_cfg
+        except Exception:
+            pass
 
-        # Initialize from configured profile model or fallback to gemma4:12b
-        resolved_model = (ollama_model or "").strip()
-        if not resolved_model:
-            try:
-                from hermes_cli.config import load_config
-                cfg = load_config()
-                model_cfg = cfg.get("model")
-                if isinstance(model_cfg, dict):
-                    resolved_model = model_cfg.get("default") or model_cfg.get("name") or ""
-                elif isinstance(model_cfg, str):
-                    resolved_model = model_cfg
-            except Exception:
-                pass
+        # Resolve provider
+        if default_provider is not None:
+            resolved_provider = default_provider.lower().strip()
+        elif cfg_provider and cfg_provider.lower().strip() not in ("auto", "default", ""):
+            resolved_provider = cfg_provider.lower().strip()
+        else:
+            resolved_provider = "ollama"
 
+        if resolved_provider in ("custom", "lmstudio", "vllm", "openai_compatible", "codex"):
+            resolved_provider = "openai_compatible"
+        elif resolved_provider not in ("remote", "api", "openai", "anthropic"):
+            resolved_provider = "ollama"
+
+        self.default_provider = resolved_provider
+
+        # Resolve Ollama endpoint
+        if ollama_base_url is not None:
+            self.ollama_base_url = ollama_base_url.rstrip("/")
+        elif cfg_base_url and self.default_provider == "ollama" and is_local_endpoint(cfg_base_url):
+            endpoint = cfg_base_url
+            if endpoint.endswith("/v1"):
+                endpoint = endpoint[:-3]
+            self.ollama_base_url = endpoint.rstrip("/")
+        else:
+            self.ollama_base_url = "http://127.0.0.1:11434"
+
+        # Resolve model name
+        resolved_model = (ollama_model or cfg_model or "").strip()
         self.ollama_model = resolved_model or "gemma4:12b"
-        self.codex_base_url = codex_base_url
-        self.codex_api_key = codex_api_key
+
+        # Resolve OpenAI-compatible / local server endpoint (LM Studio, vLLM, Codex)
+        if codex_base_url is not None:
+            self.codex_base_url = codex_base_url
+        elif cfg_base_url and self.default_provider in ("openai_compatible", "codex"):
+            self.codex_base_url = cfg_base_url
+        else:
+            self.codex_base_url = "http://127.0.0.1:8000/v1"
+
+        self.codex_api_key = codex_api_key or cfg_api_key or "local"
         self.remote_base_url = remote_base_url
         self.remote_api_key = remote_api_key
         self.allow_remote = allow_remote
@@ -78,6 +116,9 @@ class ModelRouter:
 
     def select_installed_model(self) -> str:
         """Autodetect and select an installed Ollama model if the configured target model is missing."""
+        if self.default_provider != "ollama":
+            return self.ollama_model
+
         health = self.check_ollama_health()
         if health.get("status") == "online":
             available = health.get("available_models", [])
@@ -169,11 +210,11 @@ class ModelRouter:
                 max_tokens=max_tokens,
             )
 
-        elif selected_provider in ("codex", "openai_compatible"):
+        elif selected_provider in ("codex", "openai_compatible", "custom", "lmstudio", "vllm"):
             target_url = self.codex_base_url or "http://127.0.0.1:8000/v1"
             if not is_local_endpoint(target_url) and not self.allow_remote:
                 raise PermissionError(
-                    f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint Codex '{target_url}' è remoto. "
+                    f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint '{target_url}' è remoto. "
                     "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita. "
                     "Abilitare esplicitamente allow_remote con il consenso dell'utente."
                 )
@@ -181,7 +222,7 @@ class ModelRouter:
             return self._call_openai_compatible(
                 base_url=target_url,
                 api_key=self.codex_api_key or "local",
-                model=model or "codex",
+                model=model or self.ollama_model or "local-model",
                 prompt=prompt,
                 system_prompt=system_prompt,
                 temperature=temperature,
