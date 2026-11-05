@@ -103,51 +103,63 @@ class AnalystAgent:
         answer_text: str,
         excerpts: List[RetrievedExcerpt],
     ) -> List[Citation]:
-        """Parse [Pagina X] references and extract the actual cited claims or quotes from the answer.
+        """Parse [Pagina X] references and extract every cited claim from the answer.
 
-        Strict constraint: Do not fabricate evidence for uncited answers.
-        Preserve missing citations so VerifierAgent can reject ungrounded claims.
+        Strict constraint: Do not deduplicate by page. Every distinct cited statement
+        must be retained so VerifierAgent can independently verify each claim.
         """
-        matches = list(re.finditer(r'\[Pagina\s*(\d+)\]', answer_text, re.IGNORECASE))
         citations: List[Citation] = []
-        seen_pages = set()
+        seen_claim_keys = set()
 
         # Split answer into sentence blocks to associate each citation with its specific claim
         sentence_spans = [
             s.strip() for s in re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!|\n)\s+', answer_text) if s.strip()
         ]
 
-        for match in matches:
-            page_num = int(match.group(1))
-            if page_num in seen_pages:
+        for s in sentence_spans:
+            matches = list(re.finditer(r'\[Pagina\s*(\d+)\]', s, re.IGNORECASE))
+            if not matches:
                 continue
-            seen_pages.add(page_num)
 
-            # Find the sentence in the answer that contains this citation
-            claim_text = ""
-            for s in sentence_spans:
-                if match.group(0) in s:
-                    # Check for explicit quotation marks inside this claim first
-                    quoted = re.findall(r'["«\']([^"»\']{8,})["»\']', s)
-                    if quoted:
-                        claim_text = quoted[0].strip()
-                    else:
-                        # Strip the citation marker from the claim sentence
-                        cleaned = re.sub(r'\[Pagina\s*\d+\]', '', s, flags=re.IGNORECASE).strip()
-                        claim_text = cleaned
-                    break
+            # Check for explicit quotation marks inside this claim first
+            quoted = re.findall(r'["«\']([^"»\']{8,})["»\']', s)
+            if quoted:
+                claim_text = quoted[0].strip()
+            else:
+                # Strip the citation marker from the claim sentence
+                claim_text = re.sub(r'\[Pagina\s*\d+\]', '', s, flags=re.IGNORECASE).strip()
 
             if not claim_text:
-                # Fallback: strip citation markers from answer to use substantive answer text
-                claim_text = re.sub(r'\[Pagina\s*\d+\]', '', answer_text, flags=re.IGNORECASE).strip()
+                continue
 
-            citations.append(
-                Citation(
-                    page_number=page_num,
-                    verbatim_quote=claim_text,
-                    confidence=1.0,
+            for match in matches:
+                page_num = int(match.group(1))
+                claim_key = (page_num, claim_text.lower())
+                if claim_key in seen_claim_keys:
+                    continue
+                seen_claim_keys.add(claim_key)
+
+                citations.append(
+                    Citation(
+                        page_number=page_num,
+                        verbatim_quote=claim_text,
+                        confidence=1.0,
+                    )
                 )
-            )
+
+        # Fallback if citations matched in raw answer but were not captured by sentence splitting
+        if not citations:
+            matches = list(re.finditer(r'\[Pagina\s*(\d+)\]', answer_text, re.IGNORECASE))
+            for match in matches:
+                page_num = int(match.group(1))
+                claim_text = re.sub(r'\[Pagina\s*\d+\]', '', answer_text, flags=re.IGNORECASE).strip()
+                citations.append(
+                    Citation(
+                        page_number=page_num,
+                        verbatim_quote=claim_text,
+                        confidence=1.0,
+                    )
+                )
 
         # Do NOT fabricate evidence for uncited answers: preserve empty citations list
         # so that VerifierAgent properly flags ungrounded answers.
