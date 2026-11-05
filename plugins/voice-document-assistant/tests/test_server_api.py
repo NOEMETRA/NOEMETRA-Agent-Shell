@@ -385,7 +385,7 @@ def test_upload_cross_profile_file_path_rejected_with_403():
             json={"file_path": str(foreign_pdf.resolve())},
         )
         assert res.status_code == 403
-        assert "belongs to another profile" in res.json()["detail"]
+        assert "belongs to profile" in res.json()["detail"]
     finally:
         if foreign_pdf.exists():
             foreign_pdf.unlink()

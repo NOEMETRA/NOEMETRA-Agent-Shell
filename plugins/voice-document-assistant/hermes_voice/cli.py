@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
+
+
+def is_pid_alive(pid: int) -> bool:
+    """Check if process with given PID is currently active."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, SystemError, PermissionError):
+        return False
 
 from hermes_voice.extractor import create_sample_italian_pdf
 from hermes_voice.models import PlayerState
@@ -68,18 +80,82 @@ def main() -> None:
     elif args.command == "play":
         bookmark = assistant.play()
         print(f"Riproduzione avviata: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
+        ctrl_file = assistant.player.bookmark_path.parent / "player_control.json"
+        ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "playing"}), encoding="utf-8")
         try:
             print("Riproduzione in corso (premere Ctrl+C per mettere in pausa)...")
             while assistant.player.state == PlayerState.PLAYING:
                 time.sleep(0.2)
+                if ctrl_file.exists():
+                    try:
+                        cdata = json.loads(ctrl_file.read_text(encoding="utf-8"))
+                        cmd = cdata.get("command")
+                        if cmd == "pause":
+                            bookmark = assistant.pause()
+                            ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "paused"}), encoding="utf-8")
+                            print(f"\nRicevuto comando di pausa dall'esterno su frase {bookmark.current_sentence_index + 1}.")
+                            break
+                        elif cmd == "stop":
+                            bookmark = assistant.stop()
+                            ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "stopped"}), encoding="utf-8")
+                            print("\nRicevuto comando di stop dall'esterno.")
+                            break
+                    except Exception:
+                        pass
             if assistant.player.state == PlayerState.FINISHED:
                 print("Lettura del documento completata.")
         except KeyboardInterrupt:
             bookmark = assistant.pause()
             print(f"\nRiproduzione interrotta su frase {bookmark.current_sentence_index + 1}.")
+        finally:
+            if ctrl_file.exists():
+                try:
+                    ctrl_file.unlink()
+                except Exception:
+                    pass
 
     elif args.command == "pause":
-        bookmark = assistant.pause()
+        # Check if another running player process exists for this profile
+        ctrl_file = assistant.player.bookmark_path.parent / "player_control.json"
+        routed = False
+        if ctrl_file.exists():
+            try:
+                cdata = json.loads(ctrl_file.read_text(encoding="utf-8"))
+                active_pid = cdata.get("pid")
+                if active_pid and is_pid_alive(active_pid) and active_pid != os.getpid():
+                    cdata["command"] = "pause"
+                    ctrl_file.write_text(json.dumps(cdata), encoding="utf-8")
+                    for _ in range(25):
+                        time.sleep(0.1)
+                        if not ctrl_file.exists():
+                            break
+                        fresh = json.loads(ctrl_file.read_text(encoding="utf-8"))
+                        if fresh.get("status") == "paused":
+                            break
+                    routed = True
+            except Exception:
+                pass
+
+        if not routed:
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    "http://127.0.0.1:8000/api/plugins/voice-document-assistant/playback/pause",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    if resp.status == 200:
+                        routed = True
+            except Exception:
+                pass
+
+        if not routed:
+            bookmark = assistant.pause()
+        else:
+            bookmark = assistant.player.get_bookmark()
+
         print(f"Riproduzione in pausa: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
         print(f"Offset temporale: {bookmark.audio_seconds_offset:.2f}s")
         print(f"Testo: '{bookmark.current_sentence_text}'")
@@ -87,15 +163,39 @@ def main() -> None:
     elif args.command == "resume":
         bookmark = assistant.resume()
         print(f"Riproduzione ripresa: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
+        ctrl_file = assistant.player.bookmark_path.parent / "player_control.json"
+        ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "playing"}), encoding="utf-8")
         try:
             print("Riproduzione in corso (premere Ctrl+C per mettere in pausa)...")
             while assistant.player.state == PlayerState.PLAYING:
                 time.sleep(0.2)
+                if ctrl_file.exists():
+                    try:
+                        cdata = json.loads(ctrl_file.read_text(encoding="utf-8"))
+                        cmd = cdata.get("command")
+                        if cmd == "pause":
+                            bookmark = assistant.pause()
+                            ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "paused"}), encoding="utf-8")
+                            print(f"\nRicevuto comando di pausa dall'esterno su frase {bookmark.current_sentence_index + 1}.")
+                            break
+                        elif cmd == "stop":
+                            bookmark = assistant.stop()
+                            ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "stopped"}), encoding="utf-8")
+                            print("\nRicevuto comando di stop dall'esterno.")
+                            break
+                    except Exception:
+                        pass
             if assistant.player.state == PlayerState.FINISHED:
                 print("Lettura del documento completata.")
         except KeyboardInterrupt:
             bookmark = assistant.pause()
             print(f"\nRiproduzione interrotta su frase {bookmark.current_sentence_index + 1}.")
+        finally:
+            if ctrl_file.exists():
+                try:
+                    ctrl_file.unlink()
+                except Exception:
+                    pass
 
     elif args.command == "ask":
         # Ensure document is loaded

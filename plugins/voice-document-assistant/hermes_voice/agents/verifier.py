@@ -74,15 +74,33 @@ class VerifierAgent:
             "in riferimento a", "ecco la risposta", "in sintesi", "per riassumere",
             "sulla base del", "in base a", "come indicato",
         )
+        # Collect text from cited pages for grounding check
+        all_cited_text = " ".join(
+            self._normalize_text(self.document.get_page(c.page_number).text)
+            for c in citations
+            if self.document.get_page(c.page_number)
+        )
+        if not all_cited_text:
+            all_cited_text = " ".join(
+                self._normalize_text(p.text) for p in self.document.pages
+            )
+
         for s in sentence_spans:
             if not re.search(r'\[Pagina\s*\d+\]', s, re.IGNORECASE):
                 cleaned_span = self._normalize_text(s)
-                is_framing = any(cleaned_span.startswith(self._normalize_text(prefix)) for prefix in framing_prefixes)
+                is_framing = (
+                    s.strip().endswith(":")
+                    or bool(re.match(r'^(?:\d+[\.\)]|[-•*])\s+', s.strip()))
+                    or any(cleaned_span.startswith(self._normalize_text(prefix)) for prefix in framing_prefixes)
+                )
                 substantive_words = [w for w in cleaned_span.split() if len(w) > 3]
                 if not is_framing and len(substantive_words) >= 4:
-                    unsupported_claims.append(
-                        f"Affermazione nel testo priva di citazione o riscontro della fonte: '{s}'"
-                    )
+                    present_words = [w for w in substantive_words if w in all_cited_text]
+                    grounded_ratio = len(present_words) / len(substantive_words) if substantive_words else 1.0
+                    if grounded_ratio < 0.6:
+                        unsupported_claims.append(
+                            f"Affermazione nel testo priva di citazione o riscontro della fonte: '{s}'"
+                        )
 
         for cit in citations:
             page = self.document.get_page(cit.page_number)
