@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusResponse, ReadingBookmark
+from hermes_voice.profile import resolve_voice_profile_dir
 from hermes_voice.server.state import get_assistant
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,14 @@ def _sanitize_filename(name: str) -> str:
     if not cleaned.lower().endswith(".pdf"):
         cleaned += ".pdf"
     return cleaned
+
+
+def _req_profile(request: Request) -> Optional[str]:
+    return request.headers.get("X-Hermes-Profile") or request.query_params.get("profile") or None
+
+
+def _req_assistant(request: Request) -> HermesVoiceAssistant:
+    return get_assistant(_req_profile(request))
 
 
 class SelectDocRequest(BaseModel):
@@ -58,24 +67,24 @@ class PrivacyRequest(BaseModel):
 
 
 @router.get("/status", response_model=PlayerStatusResponse)
-async def get_status():
+async def get_status(request: Request):
     """Return complete live state snapshot for GUI."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     return assistant.get_full_status()
 
 
 @router.get("/library")
-async def list_library():
+async def list_library(request: Request):
     """Return list of documents in the persistent library."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     docs = assistant.get_library()
     return {"documents": [d.model_dump() for d in docs]}
 
 
 @router.post("/select_document")
-async def select_document(req: SelectDocRequest):
+async def select_document(req: SelectDocRequest, request: Request):
     """Switch active document from library."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     try:
         bm = await asyncio.to_thread(assistant.select_document, req.doc_id)
         return {
@@ -94,8 +103,9 @@ async def upload_document(request: Request):
     Supports both application/json and multipart/form-data.
     Validates PDF format, prevents directory traversal, and ensures collision-free storage.
     """
-    assistant = get_assistant()
-    upload_dir = (Path.home() / ".hermes" / "uploaded_pdfs").resolve()
+    profile = _req_profile(request)
+    assistant = get_assistant(profile)
+    upload_dir = (resolve_voice_profile_dir(profile) / "uploaded_pdfs").resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     target_path: Optional[Path] = None
@@ -164,9 +174,9 @@ async def upload_document(request: Request):
 
 
 @router.get("/document/{doc_id}")
-async def get_document(doc_id: str):
+async def get_document(doc_id: str, request: Request):
     """Return full document data including text and sentence bounding boxes without changing active document or playback."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     doc = await asyncio.to_thread(assistant.get_document_by_id, doc_id)
     if doc:
         return doc.model_dump()
@@ -175,9 +185,9 @@ async def get_document(doc_id: str):
 
 
 @router.post("/playback/play")
-async def play_playback():
+async def play_playback(request: Request):
     """Start audio playback."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     try:
         bm = assistant.play()
         return {"status": "success", "bookmark": bm.model_dump()}
@@ -187,17 +197,17 @@ async def play_playback():
 
 
 @router.post("/playback/pause")
-async def pause_playback():
+async def pause_playback(request: Request):
     """Pause audio playback and save exact bookmark."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     bm = assistant.pause()
     return {"status": "success", "bookmark": bm.model_dump()}
 
 
 @router.post("/playback/resume")
-async def resume_playback():
+async def resume_playback(request: Request):
     """Resume playback from exact point."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     try:
         bm = assistant.resume()
         return {"status": "success", "bookmark": bm.model_dump()}
@@ -207,17 +217,17 @@ async def resume_playback():
 
 
 @router.post("/playback/stop")
-async def stop_playback():
+async def stop_playback(request: Request):
     """Stop audio playback."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     bm = assistant.stop()
     return {"status": "success", "bookmark": bm.model_dump()}
 
 
 @router.post("/playback/seek")
-async def seek_playback(req: SeekRequest):
+async def seek_playback(req: SeekRequest, request: Request):
     """Seek to specific page or sentence."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     try:
         if req.sentence_index is not None:
             bm = assistant.seek_sentence(req.sentence_index)
@@ -232,9 +242,9 @@ async def seek_playback(req: SeekRequest):
 
 
 @router.post("/playback/config")
-async def configure_playback(req: ConfigRequest):
+async def configure_playback(req: ConfigRequest, request: Request):
     """Update TTS model, playback speed, or privacy settings."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     if req.tts_model:
         await asyncio.to_thread(assistant.set_tts_model, req.tts_model)
     if req.speed is not None:
@@ -251,11 +261,11 @@ async def configure_playback(req: ConfigRequest):
 
 
 @router.post("/ask")
-async def ask_question(req: AskRequest):
+async def ask_question(req: AskRequest, request: Request):
     """Ask question to document using Bibliotecario, Analista, and Verificatore.
     Dispatched off the event loop via asyncio.to_thread and pinned to active document context.
     """
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     if not assistant.current_document:
         raise HTTPException(status_code=400, detail="Nessun documento attivo. Caricare un PDF prima di interrogare gli agenti.")
 
@@ -269,15 +279,15 @@ async def ask_question(req: AskRequest):
 
 
 @router.get("/models")
-async def get_models():
+async def get_models(request: Request):
     """Return local and remote model provider statuses."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     return assistant.router.get_providers_status()
 
 
 @router.post("/config/privacy")
-async def set_privacy(req: PrivacyRequest):
+async def set_privacy(req: PrivacyRequest, request: Request):
     """Explicitly toggle remote provider authorization."""
-    assistant = get_assistant()
+    assistant = _req_assistant(request)
     assistant.set_allow_remote(req.allow_remote)
     return {"status": "success", "allow_remote": assistant.router.allow_remote}

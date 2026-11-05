@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +36,7 @@ from hermes_voice.models import (
 )
 from hermes_voice.model_router import ModelRouter
 from hermes_voice.player import DocumentPlayer
+from hermes_voice.profile import resolve_voice_profile_dir
 from hermes_voice.tts_engine import PocketTTSEngine
 
 logger = logging.getLogger(__name__)
@@ -48,19 +51,27 @@ class HermesVoiceAssistant:
         model_router: Optional[ModelRouter] = None,
         bookmark_path: Optional[Union[str, Path]] = None,
         library_path: Optional[Union[str, Path]] = None,
+        cache_dir: Optional[Union[str, Path]] = None,
         virtual_playback: bool = False,
         on_sentence_change: Optional[Callable[[SentenceSpan], None]] = None,
+        profile: Optional[str] = None,
     ):
-        self.tts = tts_engine or PocketTTSEngine(lazy_load=True)
+        prof_dir = resolve_voice_profile_dir(profile)
+        self.profile = profile
+
+        self.library_path = Path(library_path or prof_dir / "voice_library.json")
+        self.library_path.parent.mkdir(parents=True, exist_ok=True)
+
+        bm_path = Path(bookmark_path or prof_dir / "reading_state.json")
+        c_dir = Path(cache_dir or prof_dir / "audio_cache")
+
+        self.tts = tts_engine or PocketTTSEngine(cache_dir=c_dir, lazy_load=True)
         self.router = model_router or ModelRouter()
         self.extractor = DocumentExtractor()
 
-        self.library_path = Path(library_path or Path.home() / ".hermes" / "voice_library.json")
-        self.library_path.parent.mkdir(parents=True, exist_ok=True)
-
         self.player = DocumentPlayer(
             tts_engine=self.tts,
-            bookmark_path=bookmark_path,
+            bookmark_path=bm_path,
             virtual_playback=virtual_playback,
             on_sentence_change=on_sentence_change,
         )

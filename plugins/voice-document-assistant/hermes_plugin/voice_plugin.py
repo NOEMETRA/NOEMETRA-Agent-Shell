@@ -14,8 +14,22 @@ from typing import Any, Callable, Dict, Optional
 from hermes_voice.server.state import get_assistant
 
 
-def voice_load_document(pdf_path: str) -> str:
+def _extract_arg(args: Any, kwargs: dict, key: str, default: Any = None) -> Any:
+    """Extract named argument from either dictionary args or keyword arguments."""
+    if isinstance(args, dict):
+        if key in args:
+            return args[key]
+    elif args is not None and not isinstance(args, dict):
+        return args
+    return kwargs.get(key, default)
+
+
+def voice_load_document(args: Any = None, **kwargs) -> str:
     """Carica un documento PDF, ne estrae il testo in modo deterministico e prepara la lettura vocale."""
+    pdf_path = str(_extract_arg(args, kwargs, "pdf_path", "") or "")
+    if not pdf_path:
+        return json.dumps({"error": "Parametro 'pdf_path' mancante o non valido."})
+
     assistant = get_assistant()
     bookmark = assistant.load_document(pdf_path)
     return json.dumps({
@@ -29,7 +43,7 @@ def voice_load_document(pdf_path: str) -> str:
     }, indent=2)
 
 
-def voice_play_document() -> str:
+def voice_play_document(args: Any = None, **kwargs) -> str:
     """Avvia o riprende la riproduzione vocale deterministica del documento caricato con Pocket TTS."""
     assistant = get_assistant()
     bookmark = assistant.play()
@@ -41,7 +55,7 @@ def voice_play_document() -> str:
     }, indent=2)
 
 
-def voice_pause_document() -> str:
+def voice_pause_document(args: Any = None, **kwargs) -> str:
     """Mette in pausa la lettura vocale e memorizza il punto esatto (frase e millisecondo)."""
     assistant = get_assistant()
     bookmark = assistant.pause()
@@ -54,7 +68,7 @@ def voice_pause_document() -> str:
     }, indent=2)
 
 
-def voice_resume_document() -> str:
+def voice_resume_document(args: Any = None, **kwargs) -> str:
     """Riprende la lettura vocale esattamente dal punto in cui era stata sospesa."""
     assistant = get_assistant()
     bookmark = assistant.resume()
@@ -66,7 +80,7 @@ def voice_resume_document() -> str:
     }, indent=2)
 
 
-def voice_stop_document() -> str:
+def voice_stop_document(args: Any = None, **kwargs) -> str:
     """Interrompe completamente la riproduzione vocale."""
     assistant = get_assistant()
     bookmark = assistant.stop()
@@ -77,13 +91,17 @@ def voice_stop_document() -> str:
     }, indent=2)
 
 
-def voice_seek_document(page: Optional[int] = None, sentence_index: Optional[int] = None) -> str:
+def voice_seek_document(args: Any = None, **kwargs) -> str:
     """Salta a una pagina o frase specifica del documento."""
+    args_dict = args if isinstance(args, dict) else kwargs
+    page = args_dict.get("page") if isinstance(args_dict, dict) else kwargs.get("page")
+    sentence_index = args_dict.get("sentence_index") if isinstance(args_dict, dict) else kwargs.get("sentence_index")
+
     assistant = get_assistant()
     if sentence_index is not None:
-        bookmark = assistant.seek_sentence(sentence_index)
+        bookmark = assistant.seek_sentence(int(sentence_index))
     elif page is not None:
-        bookmark = assistant.seek_page(page)
+        bookmark = assistant.seek_page(int(page))
     else:
         return json.dumps({"error": "Specificare 'page' o 'sentence_index'."})
 
@@ -95,8 +113,12 @@ def voice_seek_document(page: Optional[int] = None, sentence_index: Optional[int
     }, indent=2)
 
 
-def voice_ask_document(question: str) -> str:
+def voice_ask_document(args: Any = None, **kwargs) -> str:
     """Interroga il documento: il Bibliotecario estrae le evidenze, l'Analista risponde con numeri di pagina e il Verificatore convalida la citazione."""
+    question = str(_extract_arg(args, kwargs, "question", "") or "")
+    if not question:
+        return json.dumps({"error": "Parametro 'question' mancante o non valido."})
+
     assistant = get_assistant()
     answer = assistant.ask(question)
     return json.dumps({
@@ -109,31 +131,28 @@ def voice_ask_document(question: str) -> str:
     }, indent=2)
 
 
-def voice_get_status() -> str:
+def voice_get_status(args: Any = None, **kwargs) -> str:
     """Restituisce lo stato attuale del lettore vocale e il bookmark registrato."""
     assistant = get_assistant()
     status = assistant.get_full_status()
     return json.dumps(status.model_dump(), indent=2)
 
 
-# Official tool definitions with schema and signatures
+# Official tool definitions with unwrapped function schemas adhering to Hermes Tool Registry contract
 TOOLS = [
     {
         "name": "voice_load_document",
         "description": "Carica un documento PDF nella memoria locale, estrae il testo in modo deterministico e lo predispone per la lettura vocale.",
         "handler": voice_load_document,
         "schema": {
-            "type": "function",
-            "function": {
-                "name": "voice_load_document",
-                "description": "Carica un PDF locale ed estrae le frasi originali.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pdf_path": {"type": "string", "description": "Percorso assoluto o relativo del file PDF"}
-                    },
-                    "required": ["pdf_path"],
+            "name": "voice_load_document",
+            "description": "Carica un PDF locale ed estrae le frasi originali.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pdf_path": {"type": "string", "description": "Percorso assoluto o relativo del file PDF"}
                 },
+                "required": ["pdf_path"],
             },
         },
     },
@@ -142,12 +161,9 @@ TOOLS = [
         "description": "Avvia la lettura ad alta voce del documento caricato usando Pocket TTS con la voce italiana selezionata.",
         "handler": voice_play_document,
         "schema": {
-            "type": "function",
-            "function": {
-                "name": "voice_play_document",
-                "description": "Avvia la riproduzione vocale deterministica con Pocket TTS.",
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "voice_play_document",
+            "description": "Avvia la riproduzione vocale deterministica con Pocket TTS.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -155,12 +171,9 @@ TOOLS = [
         "description": "Mette in pausa la lettura audio del documento e memorizza il punto esatto di lettura.",
         "handler": voice_pause_document,
         "schema": {
-            "type": "function",
-            "function": {
-                "name": "voice_pause_document",
-                "description": "Mette in pausa la riproduzione vocale e registra il bookmark esatto.",
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "voice_pause_document",
+            "description": "Mette in pausa la riproduzione vocale e registra il bookmark esatto.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -168,12 +181,9 @@ TOOLS = [
         "description": "Riprende la lettura vocale del documento dal punto esatto in cui era stata interrotta.",
         "handler": voice_resume_document,
         "schema": {
-            "type": "function",
-            "function": {
-                "name": "voice_resume_document",
-                "description": "Riprende la riproduzione dal punto esatto memorizzato.",
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "voice_resume_document",
+            "description": "Riprende la riproduzione dal punto esatto memorizzato.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -181,12 +191,9 @@ TOOLS = [
         "description": "Interrompe completamente la riproduzione vocale in corso.",
         "handler": voice_stop_document,
         "schema": {
-            "type": "function",
-            "function": {
-                "name": "voice_stop_document",
-                "description": "Interrompe la riproduzione audio.",
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "voice_stop_document",
+            "description": "Interrompe la riproduzione audio.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -194,16 +201,13 @@ TOOLS = [
         "description": "Sposta il punto di lettura alla pagina o alla frase indicata.",
         "handler": voice_seek_document,
         "schema": {
-            "type": "function",
-            "function": {
-                "name": "voice_seek_document",
-                "description": "Sposta il cursore di lettura a una specifica pagina o frase.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "page": {"type": "integer", "description": "Numero di pagina a cui saltare (1-based)"},
-                        "sentence_index": {"type": "integer", "description": "Indice frase a cui saltare (0-based)"},
-                    },
+            "name": "voice_seek_document",
+            "description": "Sposta il cursore di lettura a una specifica pagina o frase.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "integer", "description": "Numero di pagina a cui saltare (1-based)"},
+                    "sentence_index": {"type": "integer", "description": "Indice frase a cui saltare (0-based)"},
                 },
             },
         },
@@ -213,17 +217,14 @@ TOOLS = [
         "description": "Interroga il documento corrente: Bibliotecario estrae evidenze, Analista risponde con numeri di pagina, Verificatore valida la fedeltà delle citazioni.",
         "handler": voice_ask_document,
         "schema": {
-            "type": "function",
-            "function": {
-                "name": "voice_ask_document",
-                "description": "Interroga il documento con la Triade di Agenti e ricevi una risposta verificata con citazioni esplicite.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {"type": "string", "description": "Domanda sul contenuto del documento"}
-                    },
-                    "required": ["question"],
+            "name": "voice_ask_document",
+            "description": "Interroga il documento con la Triade di Agenti e ricevi una risposta verificata con citazioni esplicite.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Domanda sul contenuto del documento"}
                 },
+                "required": ["question"],
             },
         },
     },
@@ -232,12 +233,9 @@ TOOLS = [
         "description": "Ottiene lo stato live del lettore (in riproduzione, in pausa, stopped), frase corrente, tempo e stato degli agenti.",
         "handler": voice_get_status,
         "schema": {
-            "type": "function",
-            "function": {
-                "name": "voice_get_status",
-                "description": "Restituisce lo stato live della riproduzione vocale e degli agenti.",
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "voice_get_status",
+            "description": "Restituisce lo stato live della riproduzione vocale e degli agenti.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
