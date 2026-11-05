@@ -422,6 +422,7 @@ function VoiceDocumentPage({ ctx }) {
   const fileInputRef = useRef(null)
   const clientAudioRef = useRef(null)
   const lastPlayedTargetRef = useRef('')
+  const fetchingTargetRef = useRef('')
 
   // Poll backend status and synchronize client-side audio playback
   useEffect(() => {
@@ -447,8 +448,8 @@ function VoiceDocumentPage({ ctx }) {
 
           // Client-side local audio streaming for desktop playback via profile-aware ctx.rest gateway bridge
           if (isPlaying) {
-            if (playTargetKey !== lastPlayedTargetRef.current) {
-              lastPlayedTargetRef.current = playTargetKey
+            if (playTargetKey !== lastPlayedTargetRef.current && fetchingTargetRef.current !== playTargetKey) {
+              fetchingTargetRef.current = playTargetKey
               if (clientAudioRef.current) {
                 clientAudioRef.current.pause()
                 clientAudioRef.current = null
@@ -458,7 +459,8 @@ function VoiceDocumentPage({ ctx }) {
                 const audioData = await ctx.rest(`/audio/sentence/${currentSentIdx}?format=json`)
 
                 // Discard audio fetched for an obsolete playback state or unmounted view (AGENTS.md:59-62)
-                if (disposed || currentGen !== pollGen || lastPlayedTargetRef.current !== playTargetKey) {
+                if (disposed || currentGen !== pollGen) {
+                  fetchingTargetRef.current = ''
                   return
                 }
 
@@ -511,14 +513,23 @@ function VoiceDocumentPage({ ctx }) {
                   }, { once: true })
 
                   // Re-verify freshness before initiating audio playback
-                  if (disposed || currentGen !== pollGen || lastPlayedTargetRef.current !== playTargetKey) {
+                  if (disposed || currentGen !== pollGen) {
+                    fetchingTargetRef.current = ''
                     return
                   }
                   clientAudioRef.current = audio
+                  lastPlayedTargetRef.current = playTargetKey
+                  fetchingTargetRef.current = ''
                   audio.play().catch(() => {})
+                } else {
+                  fetchingTargetRef.current = ''
                 }
               } catch (e) {
-                // audio fetch fallback
+                // Audio fetch failed or was aborted: clear fetching target to allow retry on next poll
+                fetchingTargetRef.current = ''
+                if (lastPlayedTargetRef.current === playTargetKey) {
+                  lastPlayedTargetRef.current = ''
+                }
               }
             } else if (clientAudioRef.current) {
               // Synchronize speed if changed
@@ -541,6 +552,7 @@ function VoiceDocumentPage({ ctx }) {
             }
             if (s.state === 'stopped' || s.state === 'finished') {
               lastPlayedTargetRef.current = ''
+              fetchingTargetRef.current = ''
               if (clientAudioRef.current) {
                 clientAudioRef.current = null
               }
@@ -559,6 +571,8 @@ function VoiceDocumentPage({ ctx }) {
     return () => {
       disposed = true
       ++pollGen
+      fetchingTargetRef.current = ''
+      lastPlayedTargetRef.current = ''
       if (timer) clearTimeout(timer)
       if (clientAudioRef.current) {
         clientAudioRef.current.pause()
@@ -635,6 +649,7 @@ function VoiceDocumentPage({ ctx }) {
       clientAudioRef.current = null
     }
     lastPlayedTargetRef.current = ''
+    fetchingTargetRef.current = ''
     try {
       await ctx.rest('/playback/stop', { method: 'POST' })
     } catch (err) {
@@ -648,6 +663,7 @@ function VoiceDocumentPage({ ctx }) {
       clientAudioRef.current = null
     }
     lastPlayedTargetRef.current = ''
+    fetchingTargetRef.current = ''
     try {
       await ctx.rest('/playback/seek', {
         method: 'POST',
@@ -664,6 +680,7 @@ function VoiceDocumentPage({ ctx }) {
       clientAudioRef.current = null
     }
     lastPlayedTargetRef.current = ''
+    fetchingTargetRef.current = ''
     setViewPage(page)
     try {
       await ctx.rest('/playback/seek', {
@@ -683,6 +700,7 @@ function VoiceDocumentPage({ ctx }) {
           clientAudioRef.current = null
         }
         lastPlayedTargetRef.current = ''
+        fetchingTargetRef.current = ''
         await ctx.rest('/select_document', {
           method: 'POST',
           body: { doc_id: docId }
@@ -765,6 +783,7 @@ function VoiceDocumentPage({ ctx }) {
             clientAudioRef.current = null
           }
           lastPlayedTargetRef.current = ''
+          fetchingTargetRef.current = ''
           setDocData(res.document)
           setViewPage(1)
           refreshLibrary()
@@ -785,6 +804,7 @@ function VoiceDocumentPage({ ctx }) {
       clientAudioRef.current = null
     }
     lastPlayedTargetRef.current = ''
+    fetchingTargetRef.current = ''
     try {
       const res = await ctx.rest('/select_document', {
         method: 'POST',
