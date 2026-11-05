@@ -48,6 +48,7 @@ def test_tool_handlers_accept_registry_argument_dict():
         res_load = json.loads(voice_load_document({"pdf_path": str(pdf_path)}))
         assert res_load["status"] == "success"
         assert res_load["total_pages"] == 3
+        get_assistant().player.virtual_playback = True
 
         # 2. zero-argument tools receiving empty dict
         res_play = json.loads(voice_play_document({}))
@@ -118,3 +119,78 @@ def test_uncited_answer_preserves_empty_citations_and_fails_verification():
         res = verifier.verify(answer)
         assert res.is_valid is False
         assert "Nessuna citazione formale fornita" in res.unsupported_claims[0]
+
+
+def test_profile_validation_rejects_directory_traversal():
+    """Verify profile validation rejects path traversal, slashes, and illegal symbols with ValueError."""
+    for bad in ["..", "../etc", "foo/bar", "foo\\bar", ".hidden", "bad spaces", "a" * 65]:
+        with pytest.raises(ValueError, match="Invalid profile name"):
+            resolve_voice_profile_dir(bad)
+
+    # Valid names should resolve cleanly
+    for good in ["default", "agent_1", "profile-a", "user123"]:
+        resolved = resolve_voice_profile_dir(good)
+        assert resolved.exists() or resolved.parent.exists()
+
+
+def test_player_tts_synthesis_error_sets_paused_state():
+    """Verify that an unexpected exception during TTS synthesis sets state to PAUSED without crashing."""
+    from hermes_voice.extractor import DocumentExtractor
+    from hermes_voice.models import PlayerState
+    from hermes_voice.player import DocumentPlayer
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc.pdf"
+        bm_path = Path(tmpdir) / "state.json"
+        create_sample_italian_pdf(pdf_path)
+        doc = DocumentExtractor().extract(pdf_path)
+
+        player = DocumentPlayer(bookmark_path=bm_path, virtual_playback=False)
+        player.load_document(doc)
+
+        class BrokenTTS:
+            def synthesize(self, text):
+                raise RuntimeError("Simulated TTS synthesis failure")
+
+        player.tts = BrokenTTS()
+        player.play()
+        if player._worker_thread:
+            player._worker_thread.join(timeout=3.0)
+
+        assert player.state == PlayerState.PAUSED
+        assert player.current_sentence_index == 0
+
+
+def test_player_audio_stream_failure_preserves_sentence_index():
+    """Verify that an audio output device error pauses playback without skipping the sentence."""
+    from hermes_voice.extractor import DocumentExtractor
+    from hermes_voice.models import PlayerState
+    from hermes_voice.player import DocumentPlayer
+    import numpy as np
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc.pdf"
+        bm_path = Path(tmpdir) / "state.json"
+        create_sample_italian_pdf(pdf_path)
+        doc = DocumentExtractor().extract(pdf_path)
+
+        player = DocumentPlayer(bookmark_path=bm_path, virtual_playback=False)
+        player.load_document(doc)
+
+        class DummyTTS:
+            def synthesize(self, text):
+                # Return 0.5s of silent audio
+                return np.zeros(12000, dtype=np.float32), 24000
+
+        player.tts = DummyTTS()
+
+        import unittest.mock as mock
+        with mock.patch("sounddevice.OutputStream", side_effect=RuntimeError("Audio hardware busy")):
+            player.play()
+            if player._worker_thread:
+                player._worker_thread.join(timeout=3.0)
+
+            assert player.state == PlayerState.PAUSED
+            # Verify sentence index was NOT advanced
+            assert player.current_sentence_index == 0
+

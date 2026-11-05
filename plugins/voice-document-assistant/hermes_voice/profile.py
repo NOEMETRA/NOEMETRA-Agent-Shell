@@ -7,12 +7,15 @@ import re
 from pathlib import Path
 from typing import Optional
 
+PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
 
 def resolve_voice_profile_dir(profile: Optional[str] = None) -> Path:
     """Resolve the storage directory for the given or current Hermes profile.
 
     Guarantees strict isolation of persisted assistant files, reading states,
     and voice libraries across multiple Hermes profiles (AGENTS.md:13).
+    Rejects invalid profile names (e.g. traversal tokens like '..').
     """
     prof = (profile or "").strip()
     if not prof:
@@ -22,16 +25,22 @@ def resolve_voice_profile_dir(profile: Optional[str] = None) -> Path:
         except Exception:
             prof = os.environ.get("HERMES_PROFILE_NAME") or os.environ.get("HERMES_PROFILE") or "default"
 
-    clean_prof = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", prof)
+    prof = prof.strip().lower()
+    if not PROFILE_ID_RE.match(prof):
+        raise ValueError(
+            f"Invalid profile name {profile!r}: must match ^[a-z0-9][a-z0-9_-]{{0,63}}$"
+        )
+
+    # Use canonical get_profile_dir when available
     try:
         from hermes_cli.profiles import get_profile_dir
-        base_dir = get_profile_dir(clean_prof)
-    except Exception:
+        base_dir = get_profile_dir(prof)
+    except (ImportError, ModuleNotFoundError):
         hermes_home = os.environ.get("HERMES_HOME")
-        if hermes_home and (clean_prof == "default" or not clean_prof):
+        if hermes_home and prof == "default":
             base_dir = Path(hermes_home)
-        elif clean_prof and clean_prof != "default":
-            base_dir = Path.home() / ".hermes" / "profiles" / clean_prof
+        elif prof != "default":
+            base_dir = Path.home() / ".hermes" / "profiles" / prof
         else:
             base_dir = Path.home() / ".hermes"
 

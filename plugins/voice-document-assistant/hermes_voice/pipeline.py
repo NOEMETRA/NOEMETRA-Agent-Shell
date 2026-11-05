@@ -65,6 +65,8 @@ class HermesVoiceAssistant:
         bm_path = Path(bookmark_path or prof_dir / "reading_state.json")
         c_dir = Path(cache_dir or prof_dir / "audio_cache")
 
+        is_virtual = virtual_playback or os.environ.get("HERMES_VOICE_VIRTUAL", "").lower() in ("1", "true", "yes")
+
         self.tts = tts_engine or PocketTTSEngine(cache_dir=c_dir, lazy_load=True)
         self.router = model_router or ModelRouter()
         self.extractor = DocumentExtractor()
@@ -72,7 +74,7 @@ class HermesVoiceAssistant:
         self.player = DocumentPlayer(
             tts_engine=self.tts,
             bookmark_path=bm_path,
-            virtual_playback=virtual_playback,
+            virtual_playback=is_virtual,
             on_sentence_change=on_sentence_change,
         )
 

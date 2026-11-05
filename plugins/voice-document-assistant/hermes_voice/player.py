@@ -108,6 +108,7 @@ class DocumentPlayer:
 
     def play(self) -> ReadingBookmark:
         """Start or resume playback from current position."""
+        worker_to_join = None
         with self._lock:
             if not self._document or not self._document.all_sentences:
                 raise ValueError("Nessun documento caricato per la riproduzione.")
@@ -115,11 +116,29 @@ class DocumentPlayer:
             if self._state == PlayerState.PLAYING:
                 return self.get_bookmark()
 
-            # Ensure previous worker thread is finished
+            # Ensure previous worker thread is finished and wait for it
             if self._worker_thread and self._worker_thread.is_alive():
                 self._stop_event.set()
                 self._pause_event.set()
-                self._worker_thread.join(timeout=1.0)
+                if self._stream is not None:
+                    try:
+                        self._stream.stop()
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+                worker_to_join = self._worker_thread
+
+        # Join previous worker cleanly outside lock to avoid deadlock with worker's internal lock acquisitions
+        if worker_to_join and worker_to_join != threading.current_thread():
+            worker_to_join.join(timeout=3.0)
+            if worker_to_join.is_alive():
+                logger.error("Impossibile avviare riproduzione: il worker precedente è ancora attivo.")
+                raise RuntimeError("Il worker di riproduzione precedente è ancora attivo. Riprovare.")
+
+        with self._lock:
+            if not self._document or not self._document.all_sentences:
+                raise ValueError("Nessun documento caricato per la riproduzione.")
 
             self._stop_event.clear()
             self._pause_event.clear()
@@ -204,15 +223,21 @@ class DocumentPlayer:
             if not self._document:
                 raise ValueError("Nessun documento caricato.")
             was_playing = (self._state == PlayerState.PLAYING)
-            self.stop()
+
+        self.stop()
+
+        with self._lock:
+            if not self._document:
+                raise ValueError("Nessun documento caricato.")
             self._current_sent_idx = max(0, min(sentence_index, len(self._document.all_sentences) - 1))
             self._sample_offset = 0
             self._current_audio = None
             self._state = PlayerState.PAUSED
             self._save_bookmark()
-            if was_playing:
-                self.play()
-            return self.get_bookmark()
+
+        if was_playing:
+            self.play()
+        return self.get_bookmark()
 
     def seek_to_page(self, page_number: int) -> ReadingBookmark:
         """Jump to the first sentence of the given page."""
@@ -224,7 +249,7 @@ class DocumentPlayer:
                 if sent.page_number == page_number:
                     target_idx = sent.sentence_index
                     break
-            return self.seek_to_sentence(target_idx)
+        return self.seek_to_sentence(target_idx)
 
     def get_bookmark(self) -> ReadingBookmark:
         """Get current playback state snapshot."""
@@ -277,112 +302,146 @@ class DocumentPlayer:
             self._run_virtual_playback()
             return
 
-        while not self._stop_event.is_set() and not self._pause_event.is_set():
-            with self._lock:
-                if not self._document or self._current_sent_idx >= len(self._document.all_sentences):
-                    self._state = PlayerState.FINISHED
-                    self._save_bookmark()
+        try:
+            while not self._stop_event.is_set() and not self._pause_event.is_set():
+                with self._lock:
+                    if not self._document or self._current_sent_idx >= len(self._document.all_sentences):
+                        self._state = PlayerState.FINISHED
+                        self._save_bookmark()
+                        break
+
+                    sentence = self._document.all_sentences[self._current_sent_idx]
+                    effective_speed = self._speed
+
+                if self.on_sentence_change:
+                    try:
+                        self.on_sentence_change(sentence)
+                    except Exception:
+                        pass
+
+                # Synthesize sentence if not already cached in memory
+                if self._current_audio is None:
+                    try:
+                        audio_data, sr = self.tts.synthesize(sentence.text)
+                        with self._lock:
+                            self._current_audio = audio_data
+                            self._current_sr = sr
+                    except Exception as e:
+                        logger.error(f"Errore sintesi TTS per la frase {self._current_sent_idx}: {e}")
+                        with self._lock:
+                            self._state = PlayerState.PAUSED
+                            self._save_bookmark()
+                        break
+
+                if self._stop_event.is_set() or self._pause_event.is_set():
                     break
 
-                sentence = self._document.all_sentences[self._current_sent_idx]
-                effective_speed = self._speed
+                # Prepare audio slice starting from sample_offset
+                audio_to_play = self._current_audio[self._sample_offset:]
+                if len(audio_to_play) == 0:
+                    with self._lock:
+                        self._current_sent_idx += 1
+                        self._sample_offset = 0
+                        self._current_audio = None
+                    continue
 
-            if self.on_sentence_change:
+                # Play using sounddevice stream with chunk progress tracking
+                playback_sr = int(self._current_sr * effective_speed)
+                chunk_size = int(self._current_sr * 0.1)  # 100ms chunks for responsive pause
+                chunk_idx = 0
+                device_failed = False
+
                 try:
-                    self.on_sentence_change(sentence)
-                except Exception:
-                    pass
+                    with sd.OutputStream(samplerate=playback_sr, channels=1, dtype="float32") as stream:
+                        self._stream = stream
+                        while chunk_idx < len(audio_to_play):
+                            if self._stop_event.is_set() or self._pause_event.is_set():
+                                break
 
-            # Synthesize sentence if not already cached in memory
-            if self._current_audio is None:
-                audio_data, sr = self.tts.synthesize(sentence.text)
-                with self._lock:
-                    self._current_audio = audio_data
-                    self._current_sr = sr
+                            end_chunk = min(chunk_idx + chunk_size, len(audio_to_play))
+                            slice_chunk = audio_to_play[chunk_idx:end_chunk]
+                            stream.write(slice_chunk)
 
-            # Prepare audio slice starting from sample_offset
-            audio_to_play = self._current_audio[self._sample_offset:]
-            if len(audio_to_play) == 0:
+                            with self._lock:
+                                self._sample_offset += len(slice_chunk)
+
+                            chunk_idx = end_chunk
+
+                        self._stream = None
+
+                except Exception as e:
+                    logger.error(f"Errore hardware audio in riproduzione: {e}")
+                    device_failed = True
+                    with self._lock:
+                        self._state = PlayerState.PAUSED
+                        self._save_bookmark()
+                    break
+
+                if device_failed or self._pause_event.is_set() or self._stop_event.is_set():
+                    break
+
+                # Sentence finished naturally
                 with self._lock:
                     self._current_sent_idx += 1
                     self._sample_offset = 0
                     self._current_audio = None
-                continue
-
-            # Play using sounddevice stream with chunk progress tracking
-            playback_sr = int(self._current_sr * effective_speed)
-            chunk_size = int(self._current_sr * 0.1)  # 100ms chunks for responsive pause
-            chunk_idx = 0
-
-            try:
-                with sd.OutputStream(samplerate=playback_sr, channels=1, dtype="float32") as stream:
-                    self._stream = stream
-                    while chunk_idx < len(audio_to_play):
-                        if self._stop_event.is_set() or self._pause_event.is_set():
-                            break
-
-                        end_chunk = min(chunk_idx + chunk_size, len(audio_to_play))
-                        slice_chunk = audio_to_play[chunk_idx:end_chunk]
-                        stream.write(slice_chunk)
-
-                        with self._lock:
-                            self._sample_offset += len(slice_chunk)
-
-                        chunk_idx = end_chunk
-
-                    self._stream = None
-
-            except Exception as e:
-                logger.error(f"Errore hardware audio in riproduzione: {e}")
-                time.sleep(0.1)
-
-            if self._pause_event.is_set() or self._stop_event.is_set():
-                break
-
-            # Sentence finished naturally
+                    self._save_bookmark()
+        finally:
             with self._lock:
-                self._current_sent_idx += 1
-                self._sample_offset = 0
-                self._current_audio = None
+                self._stream = None
+                if self._state == PlayerState.PLAYING:
+                    if self._document and self._current_sent_idx >= len(self._document.all_sentences):
+                        self._state = PlayerState.FINISHED
+                    else:
+                        self._state = PlayerState.PAUSED
                 self._save_bookmark()
 
     def _run_virtual_playback(self) -> None:
         """Simulated playback loop for headless execution, automated tests and CI."""
-        while not self._stop_event.is_set() and not self._pause_event.is_set():
-            with self._lock:
-                if not self._document or self._current_sent_idx >= len(self._document.all_sentences):
-                    self._state = PlayerState.FINISHED
-                    self._save_bookmark()
-                    break
-
-                sentence = self._document.all_sentences[self._current_sent_idx]
-                effective_speed = self._speed
-
-            if self.on_sentence_change:
-                try:
-                    self.on_sentence_change(sentence)
-                except Exception:
-                    pass
-
-            words = sentence.text.split()
-            estimated_duration = max(0.4, (len(words) * 0.25) / effective_speed)
-            step_duration = 0.05
-            elapsed = self._sample_offset / self._current_sr if self._current_sr else 0.0
-
-            while elapsed < estimated_duration:
-                if self._stop_event.is_set() or self._pause_event.is_set():
-                    break
-                time.sleep(step_duration)
-                elapsed += step_duration
+        try:
+            while not self._stop_event.is_set() and not self._pause_event.is_set():
                 with self._lock:
-                    self._sample_offset = int(elapsed * self._current_sr)
+                    if not self._document or self._current_sent_idx >= len(self._document.all_sentences):
+                        self._state = PlayerState.FINISHED
+                        self._save_bookmark()
+                        break
 
-            if self._pause_event.is_set() or self._stop_event.is_set():
-                break
+                    sentence = self._document.all_sentences[self._current_sent_idx]
+                    effective_speed = self._speed
 
-            # Sentence finished
+                if self.on_sentence_change:
+                    try:
+                        self.on_sentence_change(sentence)
+                    except Exception:
+                        pass
+
+                words = sentence.text.split()
+                estimated_duration = max(0.4, (len(words) * 0.25) / effective_speed)
+                step_duration = 0.05
+                elapsed = self._sample_offset / self._current_sr if self._current_sr else 0.0
+
+                while elapsed < estimated_duration:
+                    if self._stop_event.is_set() or self._pause_event.is_set():
+                        break
+                    time.sleep(step_duration)
+                    elapsed += step_duration
+                    with self._lock:
+                        self._sample_offset = int(elapsed * self._current_sr)
+
+                if self._pause_event.is_set() or self._stop_event.is_set():
+                    break
+
+                # Sentence finished
+                with self._lock:
+                    self._current_sent_idx += 1
+                    self._sample_offset = 0
+                    self._current_audio = None
+                    self._save_bookmark()
+        finally:
             with self._lock:
-                self._current_sent_idx += 1
-                self._sample_offset = 0
-                self._current_audio = None
+                if self._state == PlayerState.PLAYING:
+                    if self._document and self._current_sent_idx >= len(self._document.all_sentences):
+                        self._state = PlayerState.FINISHED
+                    else:
+                        self._state = PlayerState.PAUSED
                 self._save_bookmark()

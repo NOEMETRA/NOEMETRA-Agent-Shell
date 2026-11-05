@@ -4,6 +4,8 @@
   "description": "Assistente vocale documentale multi-agente con sintesi deterministica Pocket TTS, evidenziazione del testo e verifica delle citazioni.",
   "version": "1.0.0",
   "api": "plugin_api.py",
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
   "tab": {
     "path": "/voice-document",
     "position": "after:skills"
