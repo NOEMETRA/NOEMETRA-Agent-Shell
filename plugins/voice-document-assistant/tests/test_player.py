@@ -79,3 +79,65 @@ def test_player_rapid_pause_join_no_deadlock():
         # Should finish fast (< 0.6s) without timing out at 1.5s
         assert duration < 1.0, f"pause() took {duration:.2f}s (deadlock/timeout detected)"
         assert not player._worker_thread.is_alive()
+
+
+def test_player_switching_documents_preserves_independent_bookmarks():
+    """Verify switching between library documents preserves each document's reading bookmark."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path_a = Path(tmpdir) / "doc_a.pdf"
+        pdf_path_b = Path(tmpdir) / "doc_b.pdf"
+        bookmark_path = Path(tmpdir) / "state_multi.json"
+        create_sample_italian_pdf(pdf_path_a)
+        create_sample_italian_pdf(pdf_path_b)
+
+        extractor = DocumentExtractor()
+        doc_a = extractor.extract(pdf_path_a)
+        doc_b = extractor.extract(pdf_path_b)
+
+        player = DocumentPlayer(bookmark_path=bookmark_path, virtual_playback=True)
+
+        # 1. Load Doc A, seek to sentence 3, save bookmark
+        player.load_document(doc_a)
+        player.seek_to_sentence(3)
+        player.pause()
+        assert player.current_sentence_index == 3
+
+        # 2. Load Doc B, seek to sentence 5, save bookmark
+        player.load_document(doc_b)
+        player.seek_to_sentence(5)
+        player.pause()
+        assert player.current_sentence_index == 5
+
+        # 3. Switch back to Doc A, verify bookmark restores sentence 3
+        player.load_document(doc_a, resume_from_bookmark=True)
+        assert player.current_sentence_index == 3
+
+        # 4. Switch back to Doc B, verify bookmark restores sentence 5
+        player.load_document(doc_b, resume_from_bookmark=True)
+        assert player.current_sentence_index == 5
+
+
+def test_player_load_document_waits_for_previous_worker_without_audio_leak():
+    """Verify that load_document waits for the previous worker and does not inherit stale audio."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path_a = Path(tmpdir) / "doc_a.pdf"
+        pdf_path_b = Path(tmpdir) / "doc_b.pdf"
+        bm_path = Path(tmpdir) / "state_leak.json"
+        create_sample_italian_pdf(pdf_path_a)
+        create_sample_italian_pdf(pdf_path_b)
+
+        extractor = DocumentExtractor()
+        doc_a = extractor.extract(pdf_path_a)
+        doc_b = extractor.extract(pdf_path_b)
+
+        player = DocumentPlayer(bookmark_path=bm_path, virtual_playback=True)
+        player.load_document(doc_a)
+        player.play()
+
+        # Switch to Doc B while Doc A worker is running
+        player.load_document(doc_b)
+        assert player.document.doc_id == doc_b.doc_id
+        assert player.state == PlayerState.IDLE
+        assert player._current_audio is None
+        assert player._current_sent_idx == 0
+

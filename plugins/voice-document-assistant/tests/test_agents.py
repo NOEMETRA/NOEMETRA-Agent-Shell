@@ -107,7 +107,7 @@ def test_verifier_negative_hallucinated_quote():
         res = verifier.verify(hallucinated_answer)
         assert res.is_valid is False
         assert len(res.unsupported_claims) > 0
-        assert "non contiene il testo citato" in res.unsupported_claims[0]
+        assert any("non contiene il testo citato" in c or "non riscontrata nel testo" in c for c in res.unsupported_claims)
 
 
 def test_verifier_negative_model_error():
@@ -150,3 +150,32 @@ def test_verifier_negative_empty_citations():
         res = verifier.verify(uncited_answer)
         assert res.is_valid is False
         assert "Nessuna citazione formale fornita" in res.unsupported_claims[0]
+
+
+def test_verifier_rejects_unsupported_conclusion_appended_to_real_ngram():
+    """Verify that a fabricated claim appended to a real 4-word phrase is rejected by the verifier."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "test.pdf"
+        create_sample_italian_pdf(pdf_path)
+
+        extractor = DocumentExtractor()
+        doc = extractor.extract(pdf_path)
+        verifier = VerifierAgent(doc)
+
+        # "raggiunge una velocità di generazione" is real on page 2, but "ma produce allucinazioni quantistiche" is completely fabricated
+        poisoned_answer = GroundedAnswer(
+            question="Qual è la velocità?",
+            answer="Il modello raggiunge una velocità di generazione ma produce allucinazioni quantistiche [Pagina 2].",
+            citations=[
+                Citation(
+                    page_number=2,
+                    verbatim_quote="raggiunge una velocità di generazione ma produce allucinazioni quantistiche",
+                )
+            ],
+        )
+
+        res = verifier.verify(poisoned_answer)
+        assert res.is_valid is False
+        assert len(res.unsupported_claims) > 0
+        assert any("affermazione non riscontrata" in c or "non contiene il testo citato" in c for c in res.unsupported_claims)
+
