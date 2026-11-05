@@ -145,7 +145,7 @@ class DocumentPlayer:
 
         # Join previous worker cleanly outside lock to avoid deadlock with worker's internal lock acquisitions
         if worker_to_join and worker_to_join != threading.current_thread():
-            worker_to_join.join(timeout=3.0)
+            worker_to_join.join(timeout=10.0)
             if worker_to_join.is_alive():
                 logger.error("Impossibile avviare riproduzione: il worker precedente è ancora attivo.")
                 raise RuntimeError("Il worker di riproduzione precedente è ancora attivo. Riprovare.")
@@ -190,7 +190,7 @@ class DocumentPlayer:
 
         # Join worker thread cleanly outside the lock to prevent deadlock with worker's sample_offset lock
         if worker_to_join and worker_to_join != threading.current_thread():
-            worker_to_join.join(timeout=1.5)
+            worker_to_join.join(timeout=10.0)
 
         with self._lock:
             bookmark = self._save_bookmark()
@@ -226,7 +226,7 @@ class DocumentPlayer:
 
         # Join worker thread cleanly outside the lock
         if worker_to_join and worker_to_join != threading.current_thread():
-            worker_to_join.join(timeout=3.0)
+            worker_to_join.join(timeout=10.0)
 
         with self._lock:
             return self._save_bookmark()
@@ -482,18 +482,43 @@ class DocumentPlayer:
                     except Exception:
                         pass
 
-                words = sentence.text.split()
-                estimated_duration = max(0.4, (len(words) * 0.25) / effective_speed)
-                step_duration = 0.05
-                elapsed = self._sample_offset / self._current_sr if self._current_sr else 0.0
+                # Synthesize sentence to get exact audio duration and cache for client streaming
+                if self._current_audio is None:
+                    try:
+                        audio_data, sr = self.tts.synthesize(sentence.text)
+                        with self._lock:
+                            if self._document and self._document.doc_id == sentence.doc_id:
+                                self._current_audio = audio_data
+                                self._current_sr = sr
+                    except Exception as e:
+                        logger.warning(f"Errore sintesi TTS in virtual playback: {e}")
+                        words = sentence.text.split()
+                        audio_data = None
+                        sr = 24000
+                        fallback_duration = max(0.4, (len(words) * 0.25) / effective_speed)
 
-                while elapsed < estimated_duration:
-                    if self._stop_event.is_set() or self._pause_event.is_set():
-                        break
-                    time.sleep(step_duration)
-                    elapsed += step_duration
-                    with self._lock:
-                        self._sample_offset = int(elapsed * self._current_sr)
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+
+                if self._current_audio is not None and len(self._current_audio) > 0:
+                    sr = self._current_sr or 24000
+                    total_samples = len(self._current_audio)
+                    # Step every 100ms of audio playback
+                    step_samples = int(sr * 0.1 * effective_speed)
+                    while self._sample_offset < total_samples:
+                        if self._stop_event.is_set() or self._pause_event.is_set():
+                            break
+                        time.sleep(0.1)
+                        with self._lock:
+                            self._sample_offset = min(total_samples, self._sample_offset + step_samples)
+                else:
+                    step_duration = 0.05
+                    elapsed = 0.0
+                    while elapsed < fallback_duration:
+                        if self._stop_event.is_set() or self._pause_event.is_set():
+                            break
+                        time.sleep(step_duration)
+                        elapsed += step_duration
 
                 if self._pause_event.is_set() or self._stop_event.is_set():
                     break

@@ -436,22 +436,38 @@ function VoiceDocumentPage({ ctx }) {
             setViewPage(s.current_page)
           }
 
-          // Client-side local audio streaming for desktop playback
-          if (isPlaying && s.current_sentence_index !== lastPlayedSentenceRef.current) {
-            lastPlayedSentenceRef.current = s.current_sentence_index
-            try {
+          // Client-side local audio streaming for desktop playback via profile-aware ctx.rest gateway bridge
+          if (isPlaying) {
+            if (s.current_sentence_index !== lastPlayedSentenceRef.current) {
+              lastPlayedSentenceRef.current = s.current_sentence_index
               if (clientAudioRef.current) {
                 clientAudioRef.current.pause()
+                clientAudioRef.current = null
               }
-              const audioUrl = `/api/plugins/voice-document-assistant/audio/sentence/${s.current_sentence_index}`
-              const audio = new Audio(audioUrl)
-              clientAudioRef.current = audio
-              audio.play().catch(() => {})
-            } catch (e) {
-              // audio play fallback
+              try {
+                const audioData = await ctx.rest(`/audio/sentence/${s.current_sentence_index}?format=json`)
+                if (audioData && audioData.audio_base64) {
+                  const audio = new Audio(`data:audio/wav;base64,${audioData.audio_base64}`)
+                  clientAudioRef.current = audio
+                  audio.play().catch(() => {})
+                }
+              } catch (e) {
+                // audio fetch fallback
+              }
+            } else if (clientAudioRef.current && clientAudioRef.current.paused) {
+              // Resume playback of existing audio within the same sentence
+              clientAudioRef.current.play().catch(() => {})
             }
-          } else if (!isPlaying && clientAudioRef.current) {
-            clientAudioRef.current.pause()
+          } else {
+            if (clientAudioRef.current && !clientAudioRef.current.paused) {
+              clientAudioRef.current.pause()
+            }
+            if (s.state === 'stopped' || s.state === 'finished') {
+              lastPlayedSentenceRef.current = -1
+              if (clientAudioRef.current) {
+                clientAudioRef.current = null
+              }
+            }
           }
         }
       } catch (err) {

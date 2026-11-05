@@ -32,9 +32,17 @@
             const audio = new Audio("/api/plugins/voice-document-assistant/audio/sentence/" + data.current_sentence_index);
             clientAudioRef.current = audio;
             audio.play().catch(() => {});
+          } else if (clientAudioRef.current && clientAudioRef.current.paused) {
+            clientAudioRef.current.play().catch(() => {});
           }
-        } else if (clientAudioRef.current) {
-          clientAudioRef.current.pause();
+        } else {
+          if (clientAudioRef.current && !clientAudioRef.current.paused) {
+            clientAudioRef.current.pause();
+          }
+          if (data && (data.player_state === "STOPPED" || data.player_state === "FINISHED")) {
+            lastPlayedSentRef.current = -1;
+            clientAudioRef.current = null;
+          }
         }
       } catch (err) {
         // silent on background polling
