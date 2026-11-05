@@ -137,3 +137,84 @@ def test_model_router_honors_configured_custom_ollama_port(monkeypatch):
     assert router.ollama_model == "mistral:latest"
 
 
+def test_privacy_guard_blocks_remote_redirect_from_local_ollama(monkeypatch):
+    """Verify that requests.post redirect to remote host is intercepted and blocked."""
+    router = ModelRouter(allow_remote=False)
+
+    class MockRedirectResponse:
+        is_redirect = True
+        status_code = 307
+        headers = {"Location": "https://malicious-external-sink.com/api/steal"}
+
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: MockRedirectResponse())
+
+    with pytest.raises(PermissionError) as exc_info:
+        router._call_ollama(
+            prompt="Sensitive document text",
+            system_prompt=None,
+            model="gemma4:12b",
+            temperature=0.2,
+        )
+    assert "VIOLAZIONE VINCOLO PRIVACY" in str(exc_info.value)
+    assert "reindirizzamento remoto" in str(exc_info.value)
+
+
+def test_privacy_guard_blocks_remote_redirect_from_local_openai_compatible(monkeypatch):
+    """Verify that OpenAI-compatible endpoint redirect to remote host is intercepted and blocked."""
+    router = ModelRouter(allow_remote=False)
+
+    class MockRedirectResponse:
+        is_redirect = True
+        status_code = 308
+        headers = {"Location": "https://malicious-external-sink.com/chat/completions"}
+
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: MockRedirectResponse())
+
+    with pytest.raises(PermissionError) as exc_info:
+        router._call_openai_compatible(
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="local",
+            model="local-model",
+            prompt="Sensitive text",
+            system_prompt=None,
+            temperature=0.2,
+        )
+    assert "VIOLAZIONE VINCOLO PRIVACY" in str(exc_info.value)
+    assert "reindirizzamento remoto" in str(exc_info.value)
+
+
+def test_remote_provider_settings_populated_from_config(monkeypatch):
+    """Verify ModelRouter populates and uses configured remote endpoint, credentials and model."""
+    fake_config = {
+        "model": {
+            "provider": "anthropic",
+            "base_url": "https://api.custom-anthropic.com/v1",
+            "api_key": "sk-ant-test-key-12345",
+            "name": "claude-3-5-sonnet-20241022",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    router = ModelRouter(allow_remote=True)
+    assert router.default_provider == "anthropic"
+    assert router.remote_base_url == "https://api.custom-anthropic.com/v1"
+    assert router.remote_api_key == "sk-ant-test-key-12345"
+
+    captured = {}
+
+    def mock_call(base_url, api_key, model, prompt, **kwargs):
+        captured["base_url"] = base_url
+        captured["api_key"] = api_key
+        captured["model"] = model
+        captured["prompt"] = prompt
+        return "Anthropic Response"
+
+    monkeypatch.setattr(router, "_call_openai_compatible", mock_call)
+    res = router.generate(prompt="What is the summary?")
+    assert res == "Anthropic Response"
+    assert captured["base_url"] == "https://api.custom-anthropic.com/v1"
+    assert captured["api_key"] == "sk-ant-test-key-12345"
+    assert captured["model"] == "claude-3-5-sonnet-20241022"
+
+
+
