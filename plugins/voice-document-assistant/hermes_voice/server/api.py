@@ -18,7 +18,12 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusResponse, ReadingBookmark
-from hermes_voice.profile import PROFILE_ID_RE, resolve_voice_profile_dir, validate_path_profile_ownership
+from hermes_voice.profile import (
+    PROFILE_ID_RE,
+    register_served_profile_home,
+    resolve_voice_profile_dir,
+    validate_path_profile_ownership,
+)
 from hermes_voice.server.state import get_assistant
 
 logger = logging.getLogger(__name__)
@@ -169,6 +174,8 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
             )
 
     resolved_profile = bound_profile or (authorized_home.name if authorized_home else "default")
+    if authorized_home:
+        register_served_profile_home(authorized_home, resolved_profile)
     return resolved_profile, authorized_home
 
 
@@ -294,9 +301,33 @@ async def upload_document(request: Request):
 
         if file_path:
             p = Path(file_path).resolve()
-            # Enforce AGENTS.md:13 profile isolation: validate path ownership against authorized vs foreign profile homes
+            # Enforce AGENTS.md:13 profile isolation: validate path ownership against all served and foreign profile homes
+            served_homes: list[Path] = []
             try:
-                validate_path_profile_ownership(p, profile=profile_name, home_dir=authorized_home)
+                app_state = getattr(getattr(request, "app", None), "state", None)
+                runner = getattr(app_state, "gateway_runner", None)
+                if runner:
+                    reg = getattr(runner, "session_authorities", None)
+                    if reg:
+                        for auth in reg.serving():
+                            pid = getattr(auth, "profile_id", None)
+                            if pid:
+                                served_homes.append(Path(pid).resolve())
+                    cfg = getattr(runner, "config", None)
+                    r_homes = getattr(cfg, "_runtime_profile_homes", None)
+                    if r_homes:
+                        for _, h in r_homes:
+                            served_homes.append(Path(h).resolve())
+            except Exception:
+                pass
+
+            try:
+                validate_path_profile_ownership(
+                    p,
+                    profile=profile_name,
+                    home_dir=authorized_home,
+                    served_homes=served_homes,
+                )
             except PermissionError as e:
                 logger.warning(
                     "Cross-profile file path rejected in upload: %s (caller is %r at %s)",
@@ -539,9 +570,9 @@ async def ask_question(req: AskRequest, request: Request):
 
 @router.get("/models")
 async def get_models(request: Request):
-    """Return local and remote model provider statuses."""
+    """Return local and remote model provider statuses dispatched to a worker thread."""
     assistant = _req_assistant(request)
-    return assistant.router.get_providers_status()
+    return await asyncio.to_thread(assistant.router.get_providers_status)
 
 
 @router.post("/config/privacy")

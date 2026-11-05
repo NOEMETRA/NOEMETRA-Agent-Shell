@@ -476,4 +476,60 @@ def test_standalone_allows_trusted_loopback_and_safe_requests():
     assert res_get.status_code == 200
 
 
+def test_custom_home_cannot_access_another_custom_home_files():
+    """Verify that a session in one custom HERMES_HOME cannot upload/access files from another custom HERMES_HOME."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        home_a = Path(tmpdir) / "custom_home_a"
+        home_b = Path(tmpdir) / "custom_home_b"
+        home_a.mkdir(parents=True, exist_ok=True)
+        home_b.mkdir(parents=True, exist_ok=True)
+
+        victim_pdf = home_a / "confidential_a.pdf"
+        create_sample_italian_pdf(victim_pdf)
+
+        from hermes_voice.profile import (
+            clear_registered_served_profile_homes,
+            register_served_profile_home,
+            validate_path_profile_ownership,
+        )
+
+        clear_registered_served_profile_homes()
+        # Register home_a as a served profile home
+        register_served_profile_home(home_a, "custom_a")
+
+        # Session in home_b attempts to validate ownership of home_a's PDF
+        with pytest.raises(PermissionError) as exc_info:
+            validate_path_profile_ownership(
+                victim_pdf,
+                profile="custom_b",
+                home_dir=home_b,
+            )
+        assert "outside the authorized home directory" in str(exc_info.value)
+
+        # Also test structural voice_assistant isolation without prior registration
+        clear_registered_served_profile_homes()
+        voice_pdf = home_a / "voice_assistant" / "uploaded_pdfs" / "stored.pdf"
+        voice_pdf.parent.mkdir(parents=True, exist_ok=True)
+        create_sample_italian_pdf(voice_pdf)
+
+        with pytest.raises(PermissionError) as exc_info2:
+            validate_path_profile_ownership(
+                voice_pdf,
+                profile="custom_b",
+                home_dir=home_b,
+            )
+        assert "outside the authorized home directory" in str(exc_info2.value)
+
+
+def test_models_endpoint_dispatched():
+    """Verify that GET /models executes and returns provider status structure."""
+    res = client.get("/api/plugins/voice-document-assistant/models")
+    assert res.status_code == 200
+    data = res.json()
+    assert "default_provider" in data
+    assert "ollama" in data
+    assert "allow_remote" in data
+
+
+
 
