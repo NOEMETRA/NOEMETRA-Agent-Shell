@@ -29,12 +29,14 @@ class DocumentPlayer:
         tts_engine: Optional[PocketTTSEngine] = None,
         bookmark_path: Optional[str | Path] = None,
         virtual_playback: bool = False,
+        client_playback: bool = False,
         on_sentence_change: Optional[Callable[[SentenceSpan], None]] = None,
     ):
         self.tts = tts_engine or PocketTTSEngine(lazy_load=True)
         self.bookmark_path = Path(bookmark_path or resolve_voice_profile_dir() / "reading_state.json")
         self.bookmark_path.parent.mkdir(parents=True, exist_ok=True)
         self.virtual_playback = virtual_playback
+        self.client_playback = client_playback
         self.on_sentence_change = on_sentence_change
 
         self._document: Optional[ExtractedDocument] = None
@@ -120,8 +122,12 @@ class DocumentPlayer:
 
             return self.get_bookmark()
 
-    def play(self) -> ReadingBookmark:
+    def play(self, client_playback: Optional[bool] = None) -> ReadingBookmark:
         """Start or resume playback from current position."""
+        if client_playback is not None:
+            with self._lock:
+                self.client_playback = client_playback
+
         worker_to_join = None
         with self._lock:
             if not self._document or not self._document.all_sentences:
@@ -158,7 +164,7 @@ class DocumentPlayer:
             self._pause_event.clear()
             self._state = PlayerState.PLAYING
 
-            if self.virtual_playback:
+            if self.virtual_playback or self.client_playback:
                 self._worker_thread = threading.Thread(target=self._run_virtual_playback, daemon=True)
             else:
                 self._worker_thread = threading.Thread(target=self._run_audio_playback, daemon=True)
@@ -200,9 +206,9 @@ class DocumentPlayer:
             )
             return bookmark
 
-    def resume(self) -> ReadingBookmark:
+    def resume(self, client_playback: Optional[bool] = None) -> ReadingBookmark:
         """Resume playback from exactly where paused."""
-        return self.play()
+        return self.play(client_playback=client_playback)
 
     def stop(self) -> ReadingBookmark:
         """Stop playback completely."""

@@ -35,6 +35,16 @@ def _sanitize_filename(name: str) -> str:
     return cleaned
 
 
+def _resolve_profile_home(prof_name: str) -> Path:
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        return get_profile_dir(prof_name).resolve()
+    except Exception:
+        if prof_name == "default":
+            return (Path.home() / ".hermes").resolve()
+        return (Path.home() / ".hermes" / "profiles" / prof_name).resolve()
+
+
 def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
     """Resolve the profile name and authorized home directory bound to this request's gateway scope.
 
@@ -110,25 +120,24 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
             )
 
         # Strictly reject profile selection that does not match authorized scope
-        if bound_profile and untrusted_profile != bound_profile.lower():
+        is_authorized = False
+        if bound_profile and untrusted_profile == bound_profile.lower():
+            is_authorized = True
+        elif authorized_home:
+            untrusted_home = _resolve_profile_home(untrusted_profile)
+            if untrusted_home == authorized_home.resolve() or untrusted_profile == authorized_home.name.lower():
+                is_authorized = True
+
+        if not is_authorized:
+            expected = bound_profile or (authorized_home.name if authorized_home else "default")
             logger.warning(
-                "Cross-profile access attempt blocked: caller requested %r but gateway is bound to %r",
+                "Cross-profile access attempt blocked: caller requested %r but authorized scope is %r",
                 untrusted_profile,
-                bound_profile,
+                expected,
             )
             raise HTTPException(
                 status_code=403,
-                detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized profile {bound_profile!r}",
-            )
-        elif authorized_home and untrusted_profile != authorized_home.name.lower():
-            logger.warning(
-                "Cross-profile access attempt blocked: caller requested profile %r on custom home %r",
-                untrusted_profile,
-                str(authorized_home),
-            )
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized home {authorized_home.name!r}",
+                detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized scope {expected!r}",
             )
 
     resolved_profile = bound_profile or (authorized_home.name if authorized_home else "default")
@@ -301,8 +310,27 @@ async def get_document(doc_id: str, request: Request):
 async def play_playback(request: Request):
     """Start audio playback."""
     assistant = _req_assistant(request)
+    client_playback = None
     try:
-        bm = assistant.play()
+        body = await request.json()
+        if isinstance(body, dict):
+            out = body.get("output")
+            if out == "client":
+                client_playback = True
+            elif out == "server":
+                client_playback = False
+    except Exception:
+        pass
+
+    if client_playback is None:
+        q_out = request.query_params.get("output")
+        if q_out == "client":
+            client_playback = True
+        elif q_out == "server":
+            client_playback = False
+
+    try:
+        bm = assistant.play(client_playback=client_playback)
         return {"status": "success", "bookmark": bm.model_dump()}
     except Exception as e:
         logger.error(f"Errore play: {e}")
@@ -321,8 +349,27 @@ async def pause_playback(request: Request):
 async def resume_playback(request: Request):
     """Resume playback from exact point."""
     assistant = _req_assistant(request)
+    client_playback = None
     try:
-        bm = assistant.resume()
+        body = await request.json()
+        if isinstance(body, dict):
+            out = body.get("output")
+            if out == "client":
+                client_playback = True
+            elif out == "server":
+                client_playback = False
+    except Exception:
+        pass
+
+    if client_playback is None:
+        q_out = request.query_params.get("output")
+        if q_out == "client":
+            client_playback = True
+        elif q_out == "server":
+            client_playback = False
+
+    try:
+        bm = assistant.resume(client_playback=client_playback)
         return {"status": "success", "bookmark": bm.model_dump()}
     except Exception as e:
         logger.error(f"Errore resume: {e}")
@@ -358,6 +405,8 @@ async def seek_playback(req: SeekRequest, request: Request):
 async def get_sentence_audio(sentence_idx: int, request: Request):
     """Deliver generated audio for sentence to the desktop client for local playback."""
     assistant = _req_assistant(request)
+    # When a client fetches sentence audio via HTTP, ensure client playback is active to avoid double output
+    assistant.player.client_playback = True
     wav_bytes = await asyncio.to_thread(assistant.player.get_sentence_audio_wav, sentence_idx)
     if not wav_bytes:
         raise HTTPException(status_code=404, detail="Audio non disponibile per la frase richiesta.")
