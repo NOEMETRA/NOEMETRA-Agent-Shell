@@ -156,7 +156,7 @@ def test_cross_profile_access_rejected_with_403():
     from hermes_voice.profile import resolve_voice_profile_dir
 
     prof_dir = resolve_voice_profile_dir("alpha_profile")
-    token = set_hermes_home_override(str(prof_dir.parent.parent / "profiles" / "alpha_profile"))
+    token = set_hermes_home_override(str(prof_dir.parent))
     try:
         # Request specifying beta_profile when bound to alpha_profile must be rejected
         res = client.get(
@@ -389,4 +389,31 @@ def test_upload_cross_profile_file_path_rejected_with_403():
     finally:
         if foreign_pdf.exists():
             foreign_pdf.unlink()
+
+
+def test_custom_home_matching_profile_basename_cannot_access_named_profile_files(monkeypatch):
+    """Verify that a session using a custom home whose basename matches a named profile cannot access that profile's files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        custom_home = Path(tmpdir) / "noemetra"
+        custom_home.mkdir(parents=True, exist_ok=True)
+
+        fake_profiles_root = Path(tmpdir) / "standard_profiles"
+        named_profile_dir = fake_profiles_root / "noemetra"
+        named_profile_dir.mkdir(parents=True, exist_ok=True)
+        victim_pdf = named_profile_dir / "confidential.pdf"
+        victim_pdf.write_bytes(b"%PDF-1.4 dummy")
+
+        monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: fake_profiles_root)
+        monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: fake_profiles_root / name)
+        monkeypatch.setattr("hermes_cli.profiles.list_profile_names", lambda: ["noemetra"])
+
+        from hermes_voice.profile import validate_path_profile_ownership
+        with pytest.raises(PermissionError) as exc_info:
+            validate_path_profile_ownership(
+                victim_pdf,
+                profile="noemetra",
+                home_dir=custom_home,
+            )
+        assert "belongs to profile 'noemetra' and is outside the authorized home directory" in str(exc_info.value)
+
 

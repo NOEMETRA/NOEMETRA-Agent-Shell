@@ -70,7 +70,21 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
         if p.is_absolute() or "\\" in prof_id or "/" in prof_id or p.exists():
             resolved = p.resolve()
             authorized_home = resolved
-            bound_profile = resolved.name if PROFILE_ID_RE.match(resolved.name.lower()) else "default"
+            try:
+                from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root
+                default_h = _get_default_hermes_home().resolve()
+                prof_root = _get_profiles_root().resolve()
+                if resolved == default_h:
+                    bound_profile = "default"
+                elif resolved.parent == prof_root and PROFILE_ID_RE.match(resolved.name.lower()):
+                    bound_profile = resolved.name.lower()
+                elif resolved.is_relative_to(prof_root):
+                    rel = resolved.relative_to(prof_root)
+                    bound_profile = rel.parts[0].lower() if rel.parts else "default"
+                else:
+                    bound_profile = None
+            except Exception:
+                bound_profile = None
         elif PROFILE_ID_RE.match(prof_id.lower()):
             bound_profile = prof_id.lower()
             try:
@@ -86,7 +100,21 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
             if home_override:
                 resolved = Path(home_override).resolve()
                 authorized_home = resolved
-                bound_profile = resolved.name if PROFILE_ID_RE.match(resolved.name.lower()) else "default"
+                try:
+                    from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root
+                    default_h = _get_default_hermes_home().resolve()
+                    prof_root = _get_profiles_root().resolve()
+                    if resolved == default_h:
+                        bound_profile = "default"
+                    elif resolved.parent == prof_root and PROFILE_ID_RE.match(resolved.name.lower()):
+                        bound_profile = resolved.name.lower()
+                    elif resolved.is_relative_to(prof_root):
+                        rel = resolved.relative_to(prof_root)
+                        bound_profile = rel.parts[0].lower() if rel.parts else "default"
+                    else:
+                        bound_profile = None
+                except Exception:
+                    bound_profile = None
         except Exception:
             pass
 
@@ -125,7 +153,7 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
             is_authorized = True
         elif authorized_home:
             untrusted_home = _resolve_profile_home(untrusted_profile)
-            if untrusted_home == authorized_home.resolve() or untrusted_profile == authorized_home.name.lower():
+            if untrusted_home and untrusted_home == authorized_home.resolve():
                 is_authorized = True
 
         if not is_authorized:

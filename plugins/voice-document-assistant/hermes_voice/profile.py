@@ -99,7 +99,12 @@ def validate_path_profile_ownership(
         profiles_root = (default_home / "profiles").resolve()
         all_profile_homes = {"default": default_home}
 
-    caller_home = Path(home_dir).resolve() if home_dir else all_profile_homes.get(prof_name, default_home)
+    if home_dir:
+        caller_home = Path(home_dir).resolve()
+    elif prof_name == "default":
+        caller_home = default_home
+    else:
+        caller_home = all_profile_homes.get(prof_name, (profiles_root / prof_name).resolve())
 
     is_cross_profile = False
     conflicting_profile = None
@@ -110,22 +115,35 @@ def validate_path_profile_ownership(
             rel = p.relative_to(profiles_root)
             if rel.parts:
                 owner_profile = rel.parts[0].lower()
-                if owner_profile != prof_name:
+                expected_home = all_profile_homes.get(owner_profile, (profiles_root / owner_profile).resolve())
+                if caller_home:
+                    if caller_home != expected_home:
+                        is_cross_profile = True
+                        conflicting_profile = owner_profile
+                elif owner_profile != prof_name:
                     is_cross_profile = True
                     conflicting_profile = owner_profile
     except AttributeError:
         if str(p).startswith(str(profiles_root)):
             rel_parts = p.relative_to(profiles_root).parts
-            if rel_parts and rel_parts[0].lower() != prof_name:
-                is_cross_profile = True
-                conflicting_profile = rel_parts[0].lower()
+            if rel_parts:
+                owner_profile = rel_parts[0].lower()
+                expected_home = all_profile_homes.get(owner_profile, (profiles_root / owner_profile).resolve())
+                if caller_home:
+                    if caller_home != expected_home:
+                        is_cross_profile = True
+                        conflicting_profile = owner_profile
+                elif owner_profile != prof_name:
+                    is_cross_profile = True
+                    conflicting_profile = owner_profile
 
-    # 2. Check if caller is a named profile attempting to access default profile home (outside profiles_root)
-    if not is_cross_profile and prof_name != "default":
+    # 2. Check if caller is not the default profile home and attempting to access default profile home (outside profiles_root)
+    if not is_cross_profile:
         try:
             if p.is_relative_to(default_home) and not p.is_relative_to(profiles_root):
-                is_cross_profile = True
-                conflicting_profile = "default"
+                if caller_home != default_home:
+                    is_cross_profile = True
+                    conflicting_profile = "default"
         except Exception:
             pass
 

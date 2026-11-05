@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 import requests
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ class ModelRouter:
 
         if resolved_provider in ("custom", "lmstudio", "vllm", "openai_compatible", "codex"):
             resolved_provider = "openai_compatible"
-        elif resolved_provider not in ("remote", "api", "openai", "anthropic"):
+        elif resolved_provider not in ("remote", "api", "openai", "anthropic", "openrouter"):
             resolved_provider = "ollama"
 
         self.default_provider = resolved_provider
@@ -99,8 +100,34 @@ class ModelRouter:
             self.codex_base_url = "http://127.0.0.1:8000/v1"
 
         self.codex_api_key = codex_api_key or cfg_api_key or "local"
-        self.remote_base_url = remote_base_url
-        self.remote_api_key = remote_api_key
+
+        # Resolve remote provider settings (OpenAI, Anthropic, OpenRouter, Remote)
+        if remote_base_url is not None:
+            self.remote_base_url = remote_base_url
+        elif cfg_base_url and self.default_provider in ("remote", "api", "openai", "anthropic", "openrouter"):
+            self.remote_base_url = cfg_base_url
+        elif self.default_provider == "openrouter":
+            self.remote_base_url = os.environ.get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
+        elif self.default_provider == "anthropic":
+            self.remote_base_url = os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1"
+        elif self.default_provider in ("openai", "remote", "api"):
+            self.remote_base_url = os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        else:
+            self.remote_base_url = None
+
+        if remote_api_key is not None:
+            self.remote_api_key = remote_api_key
+        elif cfg_api_key:
+            self.remote_api_key = cfg_api_key
+        else:
+            self.remote_api_key = (
+                os.environ.get(f"{self.default_provider.upper()}_API_KEY")
+                or os.environ.get("OPENROUTER_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+                or os.environ.get("ANTHROPIC_API_KEY")
+                or ""
+            )
+
         self.allow_remote = allow_remote
 
     def set_allow_remote(self, allowed: bool) -> None:
@@ -228,17 +255,46 @@ class ModelRouter:
                 temperature=temperature,
             )
 
-        elif selected_provider in ("remote", "api", "openai", "anthropic"):
+        elif selected_provider in ("remote", "api", "openai", "anthropic", "openrouter"):
             if not self.allow_remote:
                 raise PermissionError(
                     "VIOLAZIONE VINCOLO PRIVACY: L'invio di dati documentali a provider remoti "
                     "è bloccato per impostazione predefinita. Per abilitarlo, impostare esplicitamente "
                     "allow_remote=True con il consenso dell'utente."
                 )
+
+            target_url = self.remote_base_url
+            if not target_url:
+                if selected_provider == "openrouter":
+                    target_url = "https://openrouter.ai/api/v1"
+                elif selected_provider == "anthropic":
+                    target_url = "https://api.anthropic.com/v1"
+                else:
+                    target_url = "https://api.openai.com/v1"
+
+            target_key = self.remote_api_key
+            if not target_key:
+                target_key = (
+                    os.environ.get(f"{selected_provider.upper()}_API_KEY")
+                    or os.environ.get("OPENROUTER_API_KEY")
+                    or os.environ.get("OPENAI_API_KEY")
+                    or os.environ.get("ANTHROPIC_API_KEY")
+                    or ""
+                )
+
+            target_model = model or self.ollama_model
+            if not target_model or target_model == "gemma4:12b":
+                if selected_provider == "anthropic":
+                    target_model = "claude-3-5-sonnet-20241022"
+                elif selected_provider == "openrouter":
+                    target_model = "anthropic/claude-3.5-sonnet"
+                else:
+                    target_model = "gpt-4o-mini"
+
             return self._call_openai_compatible(
-                base_url=self.remote_base_url or "https://api.openai.com/v1",
-                api_key=self.remote_api_key or "",
-                model=model or "gpt-4o-mini",
+                base_url=target_url,
+                api_key=target_key,
+                model=target_model,
                 prompt=prompt,
                 system_prompt=system_prompt,
                 temperature=temperature,
@@ -272,7 +328,19 @@ class ModelRouter:
         url = f"{self.ollama_base_url}/api/generate"
         try:
             t0 = time.perf_counter()
-            resp = requests.post(url, json=payload, timeout=180.0)
+            resp = requests.post(url, json=payload, timeout=180.0, allow_redirects=False)
+            if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                redirect_target = urljoin(url, resp.headers.get("Location", ""))
+                if not is_local_endpoint(redirect_target) and not self.allow_remote:
+                    raise PermissionError(
+                        f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint Ollama ha tentato un reindirizzamento remoto verso '{redirect_target}'. "
+                        "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
+                    )
+                if is_local_endpoint(redirect_target) or self.allow_remote:
+                    resp = requests.post(redirect_target, json=payload, timeout=180.0, allow_redirects=False)
+                else:
+                    raise RuntimeError(f"Reindirizzamento non consentito verso {redirect_target}")
+
             elapsed = time.perf_counter() - t0
 
             if resp.status_code != 200:
@@ -330,7 +398,18 @@ class ModelRouter:
             "temperature": temperature,
         }
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=60.0)
+        resp = requests.post(url, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
+        if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+            redirect_target = urljoin(url, resp.headers.get("Location", ""))
+            if not is_local_endpoint(redirect_target) and not self.allow_remote:
+                raise PermissionError(
+                    f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint ha tentato un reindirizzamento remoto verso '{redirect_target}'. "
+                    "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
+                )
+            if is_local_endpoint(redirect_target) or self.allow_remote:
+                resp = requests.post(redirect_target, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
+            else:
+                raise RuntimeError(f"Reindirizzamento non consentito verso {redirect_target}")
         if resp.status_code != 200:
             raise RuntimeError(f"API Error {resp.status_code}: {resp.text}")
 
