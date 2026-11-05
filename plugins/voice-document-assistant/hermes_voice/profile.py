@@ -10,15 +10,40 @@ from typing import Optional
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
-def resolve_voice_profile_dir(profile: Optional[str] = None) -> Path:
-    """Resolve the storage directory for the given or current Hermes profile.
+def resolve_voice_profile_dir(
+    profile: Optional[str] = None,
+    home_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Resolve the storage directory for the given profile or authorized home directory.
 
     Guarantees strict isolation of persisted assistant files, reading states,
-    and voice libraries across multiple Hermes profiles (AGENTS.md:13).
+    and voice libraries across multiple Hermes profiles and custom HERMES_HOME locations (AGENTS.md:13).
+    When home_dir is specified (e.g. from an authorized native ticket or home override),
+    it is preserved directly as the storage identity rather than routing through the profiles root.
     Rejects invalid profile names (e.g. traversal tokens like '..').
     """
+    if home_dir is not None:
+        base_dir = Path(home_dir).resolve()
+        target_dir = base_dir / "voice_assistant"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir
+
     prof = (profile or "").strip()
     if not prof:
+        try:
+            from hermes_constants import get_hermes_home_override
+            home_override = get_hermes_home_override()
+            if home_override:
+                ov_path = Path(home_override).resolve()
+                if "profiles" in ov_path.parts:
+                    prof = ov_path.name
+                else:
+                    target_dir = ov_path / "voice_assistant"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    return target_dir
+        except Exception:
+            pass
+
         try:
             from hermes_cli.profiles import current_profile_name
             prof = current_profile_name() or "default"

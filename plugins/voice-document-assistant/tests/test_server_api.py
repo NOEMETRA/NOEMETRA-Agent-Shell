@@ -201,3 +201,58 @@ def test_api_playback_config_llm_model():
     assert res.status_code == 200
     assert res.json()["llm_model"] == "custom-model:latest"
 
+
+def test_native_ticket_custom_home_preserves_home_storage_identity():
+    """Verify that a native principal for a custom HERMES_HOME resolves directly to that home directory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        custom_home = Path(tmpdir) / "custom_deployment_home"
+        custom_home.mkdir(parents=True, exist_ok=True)
+
+        from fastapi import Request
+        from starlette.datastructures import Headers
+
+        # Mock request with state.native_http_principal pointing to custom_home
+        mock_scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/status",
+            "headers": [],
+            "query_string": b"",
+        }
+        req = Request(mock_scope)
+        req.state.native_http_principal = {"profile_id": str(custom_home)}
+
+        from hermes_voice.server.api import _req_assistant, _resolve_authorized_context
+        prof_name, auth_home = _resolve_authorized_context(req)
+        assert auth_home == custom_home.resolve()
+
+        ast = _req_assistant(req)
+        # Ensure the assistant uses the custom home as its storage identity
+        assert (custom_home / "voice_assistant").exists()
+        assert ast.library_path == custom_home / "voice_assistant" / "voice_library.json"
+
+
+def test_missing_dependencies_status_endpoint_returns_json():
+    """Verify dashboard/plugin_api.py fallback handler returns structured guidance without NameError."""
+    from fastapi import APIRouter
+    _import_err_msg = "No module named 'pymupdf'"
+    router = APIRouter()
+
+    @router.get("/status")
+    async def _missing_deps():
+        return {
+            "error": "missing_dependencies",
+            "detail": f"Dipendenze Python mancanti ({_import_err_msg}). Eseguire: hermes plugins install voice-document-assistant",
+        }
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    test_app = FastAPI()
+    test_app.include_router(router)
+    tc = TestClient(test_app)
+    res = tc.get("/status")
+    assert res.status_code == 200
+    assert res.json()["error"] == "missing_dependencies"
+    assert "pymupdf" in res.json()["detail"]
+

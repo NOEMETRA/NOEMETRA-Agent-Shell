@@ -13,12 +13,12 @@ import hashlib
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusResponse, ReadingBookmark
-from hermes_voice.profile import resolve_voice_profile_dir
+from hermes_voice.profile import PROFILE_ID_RE, resolve_voice_profile_dir
 from hermes_voice.server.state import get_assistant
 
 logger = logging.getLogger(__name__)
@@ -35,54 +35,107 @@ def _sanitize_filename(name: str) -> str:
     return cleaned
 
 
-def _resolve_authorized_profile(request: Request) -> str:
-    """Resolve the profile bound to this request's authorized gateway scope.
+def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
+    """Resolve the profile name and authorized home directory bound to this request's gateway scope.
 
     Strictly enforces AGENTS.md:13 profile isolation:
-    - If a native HTTP principal grant is present on request.state, the profile is bound to it.
-    - If the context has an active hermes_home_override, the profile is bound to it.
-    - An unauthenticated caller cannot supply X-Hermes-Profile to bypass or escape the gateway-scoped profile.
-    - If an explicit profile is requested, it must strictly match the authorized scope.
+    - If a native HTTP principal grant is present on request.state:
+      - If it points to a standard profile under profiles/, the profile name is extracted.
+      - If it points to a custom HERMES_HOME, the authorized home directory is preserved directly
+        as the storage identity so that custom-home sessions do not collide with or resolve under profiles/.
+    - If a context-local hermes_home_override is active:
+      - If under profiles/, bound to that profile name.
+      - Else, preserved as the authorized custom home directory.
+    - If an explicit X-Hermes-Profile header or ?profile= query is provided:
+      - It must match the authorized profile (or the basename of the authorized custom home if matching).
+      - Cross-profile switching on a scoped session returns HTTP 403 Forbidden.
     """
     grant = getattr(request.state, "native_http_principal", None)
     bound_profile: Optional[str] = None
-    if isinstance(grant, dict) and grant.get("profile_id"):
-        prof_id = str(grant["profile_id"])
-        prof_path = Path(prof_id)
-        if "profiles" in prof_path.parts:
-            bound_profile = prof_path.name
-        else:
-            bound_profile = "default" if prof_path.resolve() == (Path.home() / ".hermes").resolve() else prof_path.name
+    authorized_home: Optional[Path] = None
 
-    try:
-        from hermes_constants import get_hermes_home_override
-        home_override = get_hermes_home_override()
-        if not bound_profile and home_override:
-            ov_path = Path(home_override)
-            if "profiles" in ov_path.parts:
-                bound_profile = ov_path.name
+    if isinstance(grant, dict) and grant.get("profile_id"):
+        prof_id = str(grant["profile_id"]).strip()
+        p = Path(prof_id)
+        if p.is_absolute() or "\\" in prof_id or "/" in prof_id or p.exists():
+            resolved = p.resolve()
+            if "profiles" in resolved.parts:
+                bound_profile = resolved.name
+                authorized_home = resolved
             else:
-                bound_profile = "default"
-    except Exception:
-        pass
+                try:
+                    from hermes_cli.profiles import _get_default_hermes_home
+                    if resolved == _get_default_hermes_home().resolve():
+                        bound_profile = "default"
+                except Exception:
+                    pass
+                authorized_home = resolved
+        elif PROFILE_ID_RE.match(prof_id.lower()):
+            bound_profile = prof_id.lower()
+
+    if not authorized_home and not bound_profile:
+        try:
+            from hermes_constants import get_hermes_home_override
+            home_override = get_hermes_home_override()
+            if home_override:
+                resolved = Path(home_override).resolve()
+                if "profiles" in resolved.parts:
+                    bound_profile = resolved.name
+                    authorized_home = resolved
+                else:
+                    try:
+                        from hermes_cli.profiles import _get_default_hermes_home
+                        if resolved == _get_default_hermes_home().resolve():
+                            bound_profile = "default"
+                    except Exception:
+                        pass
+                    authorized_home = resolved
+        except Exception:
+            pass
 
     untrusted_profile = request.headers.get("X-Hermes-Profile") or request.query_params.get("profile") or None
     if untrusted_profile:
         untrusted_profile = untrusted_profile.strip().lower()
-        if bound_profile and untrusted_profile != bound_profile.lower():
-            logger.warning(
-                "Cross-profile access attempt blocked: caller requested %r but gateway is bound to %r",
-                untrusted_profile,
-                bound_profile,
-            )
+        if not PROFILE_ID_RE.match(untrusted_profile):
             raise HTTPException(
-                status_code=403,
-                detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized profile {bound_profile!r}",
+                status_code=400,
+                detail=f"Invalid profile name {untrusted_profile!r}: must match ^[a-z0-9][a-z0-9_-]{{0,63}}$",
             )
-        if not bound_profile:
+
+        # Check against authorized scope
+        if bound_profile:
+            if untrusted_profile != bound_profile.lower():
+                logger.warning(
+                    "Cross-profile access attempt blocked: caller requested %r but gateway is bound to %r",
+                    untrusted_profile,
+                    bound_profile,
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized profile {bound_profile!r}",
+                )
+        elif authorized_home:
+            # Custom home without a standard named profile
+            if untrusted_profile != authorized_home.name.lower():
+                logger.warning(
+                    "Cross-profile access attempt blocked: caller requested profile %r on custom home %r",
+                    untrusted_profile,
+                    str(authorized_home),
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized home {authorized_home.name!r}",
+                )
+        else:
             bound_profile = untrusted_profile
 
-    return bound_profile or "default"
+    resolved_profile = bound_profile or (authorized_home.name if authorized_home else "default")
+    return resolved_profile, authorized_home
+
+
+def _resolve_authorized_profile(request: Request) -> str:
+    prof, _ = _resolve_authorized_context(request)
+    return prof
 
 
 def _req_profile(request: Request) -> str:
@@ -90,9 +143,9 @@ def _req_profile(request: Request) -> str:
 
 
 def _req_assistant(request: Request) -> HermesVoiceAssistant:
-    profile = _resolve_authorized_profile(request)
+    profile_name, authorized_home = _resolve_authorized_context(request)
     try:
-        return get_assistant(profile)
+        return get_assistant(profile=profile_name, home_dir=authorized_home)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -158,10 +211,10 @@ async def upload_document(request: Request):
     Supports both application/json and multipart/form-data.
     Validates PDF format, prevents directory traversal, and ensures collision-free storage.
     """
-    profile = _req_profile(request)
+    profile_name, authorized_home = _resolve_authorized_context(request)
     try:
-        assistant = get_assistant(profile)
-        upload_dir = (resolve_voice_profile_dir(profile) / "uploaded_pdfs").resolve()
+        assistant = get_assistant(profile=profile_name, home_dir=authorized_home)
+        upload_dir = (resolve_voice_profile_dir(profile=profile_name, home_dir=authorized_home) / "uploaded_pdfs").resolve()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     upload_dir.mkdir(parents=True, exist_ok=True)
