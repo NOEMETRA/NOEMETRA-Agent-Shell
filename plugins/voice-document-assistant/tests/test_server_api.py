@@ -417,3 +417,63 @@ def test_custom_home_matching_profile_basename_cannot_access_named_profile_files
         assert "belongs to profile 'noemetra' and is outside the authorized home directory" in str(exc_info.value)
 
 
+def test_standalone_rejects_untrusted_cross_origin_requests():
+    """Verify that standalone mutating requests from untrusted origins or cross-site contexts are blocked."""
+    # Untrusted Origin header
+    res_origin = client.post(
+        "/api/plugins/voice-document-assistant/playback/stop",
+        headers={"Origin": "https://evil.com"},
+    )
+    assert res_origin.status_code == 403
+    assert "Untrusted origin forbidden" in res_origin.text
+
+    # Null Origin header (sandboxed iframe / data URI)
+    res_null = client.post(
+        "/api/plugins/voice-document-assistant/playback/stop",
+        headers={"Origin": "null"},
+    )
+    assert res_null.status_code == 403
+    assert "Untrusted origin forbidden" in res_null.text
+
+    # Untrusted Referer header when Origin is absent
+    res_ref = client.post(
+        "/api/plugins/voice-document-assistant/playback/stop",
+        headers={"Referer": "https://attacker.org/exploit.html"},
+    )
+    assert res_ref.status_code == 403
+    assert "Untrusted referer forbidden" in res_ref.text
+
+    # Cross-site Sec-Fetch-Site without verified loopback origin
+    res_sec = client.post(
+        "/api/plugins/voice-document-assistant/playback/stop",
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    assert res_sec.status_code == 403
+    assert "Cross-origin request forbidden" in res_sec.text
+
+
+def test_standalone_allows_trusted_loopback_and_safe_requests():
+    """Verify that loopback origins and read-only GET requests pass through."""
+    # Loopback origin on 127.0.0.1
+    res_loopback = client.post(
+        "/api/plugins/voice-document-assistant/playback/stop",
+        headers={"Origin": "http://127.0.0.1:8080"},
+    )
+    assert res_loopback.status_code == 200
+
+    # Loopback origin on localhost:3000 (desktop dev server)
+    res_dev = client.post(
+        "/api/plugins/voice-document-assistant/playback/stop",
+        headers={"Origin": "http://localhost:3000"},
+    )
+    assert res_dev.status_code == 200
+
+    # GET requests are safe and not blocked by mutating CSRF guard
+    res_get = client.get(
+        "/api/plugins/voice-document-assistant/status",
+        headers={"Origin": "https://evil.com"},
+    )
+    assert res_get.status_code == 200
+
+
+
