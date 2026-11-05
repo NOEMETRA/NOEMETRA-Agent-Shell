@@ -29,7 +29,8 @@
         if (currentGen !== pollGenRef.current) return;
         setStatus(data);
         // Client-side desktop audio stream
-        if (data && data.player_state === "PLAYING") {
+        const isPlaying = data && (data.state === "playing" || data.player_state === "PLAYING");
+        if (isPlaying) {
           const targetDocId = data.doc_id || "";
           const playTargetKey = `${targetDocId}:${data.current_sentence_index}`;
           if (playTargetKey !== lastPlayedTargetRef.current && fetchingTargetRef.current !== playTargetKey) {
@@ -39,7 +40,21 @@
               clientAudioRef.current = null;
             }
             const currentSentIdx = data.current_sentence_index;
-            const audio = new Audio("/api/plugins/voice-document-assistant/audio/sentence/" + currentSentIdx);
+            let audioData = null;
+            try {
+              audioData = await fetchJSON(`/api/plugins/voice-document-assistant/audio/sentence/${currentSentIdx}?format=json`);
+            } catch (err) {
+              fetchingTargetRef.current = "";
+              if (lastPlayedTargetRef.current === playTargetKey) {
+                lastPlayedTargetRef.current = "";
+              }
+              return;
+            }
+            if (currentGen !== pollGenRef.current || !audioData || !audioData.audio_base64) {
+              fetchingTargetRef.current = "";
+              return;
+            }
+            const audio = new Audio(`data:audio/wav;base64,${audioData.audio_base64}`);
             audio.addEventListener("error", () => {
               fetchingTargetRef.current = "";
               if (lastPlayedTargetRef.current === playTargetKey) {
@@ -112,7 +127,7 @@
           if (clientAudioRef.current && !clientAudioRef.current.paused) {
             clientAudioRef.current.pause();
           }
-          if (data && (data.player_state === "STOPPED" || data.player_state === "FINISHED")) {
+          if (data && (data.state === "stopped" || data.state === "finished" || data.player_state === "STOPPED" || data.player_state === "FINISHED")) {
             lastPlayedTargetRef.current = "";
             fetchingTargetRef.current = "";
             clientAudioRef.current = null;
@@ -197,7 +212,7 @@
           "div",
           { className: "hv-dash-title" },
           "NOEMETRA Voice Assistant",
-          h("span", { className: "hv-dash-badge" }, status?.player_state || "READY")
+          h("span", { className: "hv-dash-badge" }, (status?.state || status?.player_state || "READY").toUpperCase())
         ),
         h(
           "p",
@@ -231,7 +246,7 @@
             "div",
             { className: "hv-dash-status-row" },
             h("span", null, "Documento attivo:"),
-            h("strong", null, status?.current_doc_title || "Nessun documento selezionato")
+            h("strong", null, status?.doc_title || status?.current_doc_title || "Nessun documento selezionato")
           ),
           h(
             "div",
@@ -251,11 +266,11 @@
             h("span", null, "Velocità:"),
             h("span", null, `${status?.speed || 1.0}x`)
           ),
-          status?.highlight_text &&
+          (status?.current_sentence_text || status?.highlight_text) &&
             h(
               "div",
               { className: "hv-dash-quote" },
-              `"${status.highlight_text}"`
+              `"${status?.current_sentence_text || status?.highlight_text}"`
             ),
           h(
             "div",
@@ -299,18 +314,18 @@
                   h(
                     "div",
                     {
-                      key: doc.id,
+                      key: doc.doc_id || doc.id,
                       className: "hv-dash-status-row",
                       style: { alignItems: "center" },
                     },
                     h(
                       "div",
                       null,
-                      h("div", { style: { fontWeight: 500 } }, doc.title || doc.filename),
+                      h("div", { style: { fontWeight: 500 } }, doc.doc_title || doc.title || doc.filename || doc.doc_id),
                       h(
                         "div",
                         { style: { fontSize: "0.75rem", color: "var(--ui-text-secondary, #71717a)" } },
-                        `${doc.page_count} pag. | Pag. corrente: ${doc.last_page}`
+                        `${doc.total_pages || doc.page_count || 1} pag. | Ultima pag.: ${doc.last_page || 1}`
                       )
                     ),
                     h(
@@ -318,7 +333,7 @@
                       {
                         className: "hv-dash-btn",
                         style: { padding: "0.25rem 0.6rem", fontSize: "0.75rem" },
-                        onClick: () => handleAction("select_document", { doc_id: doc.id }),
+                        onClick: () => handleAction("select_document", { doc_id: doc.doc_id || doc.id }),
                       },
                       "Seleziona"
                     )
