@@ -40,7 +40,11 @@ def _req_profile(request: Request) -> Optional[str]:
 
 
 def _req_assistant(request: Request) -> HermesVoiceAssistant:
-    return get_assistant(_req_profile(request))
+    profile = _req_profile(request)
+    try:
+        return get_assistant(profile)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 class SelectDocRequest(BaseModel):
@@ -104,8 +108,11 @@ async def upload_document(request: Request):
     Validates PDF format, prevents directory traversal, and ensures collision-free storage.
     """
     profile = _req_profile(request)
-    assistant = get_assistant(profile)
-    upload_dir = (resolve_voice_profile_dir(profile) / "uploaded_pdfs").resolve()
+    try:
+        assistant = get_assistant(profile)
+        upload_dir = (resolve_voice_profile_dir(profile) / "uploaded_pdfs").resolve()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     target_path: Optional[Path] = None
