@@ -17,13 +17,14 @@ try:
 except (ImportError, ModuleNotFoundError) as err:
     import logging
     from fastapi import APIRouter
-    logging.getLogger("hermes.plugins.voice").warning("Dipendenze del plugin voice non ancora installate: %s", err)
+    _missing_err_msg = str(err)
+    logging.getLogger("hermes.plugins.voice").warning("Dipendenze del plugin voice non ancora installate: %s", _missing_err_msg)
     router = APIRouter()
     @router.get("/status")
     async def _missing_deps():
         return {
             "error": "missing_dependencies",
-            "detail": f"Dipendenze Python mancanti ({err}). Eseguire: hermes plugins install voice-document-assistant",
+            "detail": f"Dipendenze Python mancanti ({_missing_err_msg}). Eseguire: hermes plugins install voice-document-assistant",
         }
 
 __all__ = ["router"]

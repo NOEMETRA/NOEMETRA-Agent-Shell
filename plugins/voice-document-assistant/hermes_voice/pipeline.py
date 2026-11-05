@@ -55,9 +55,11 @@ class HermesVoiceAssistant:
         virtual_playback: bool = False,
         on_sentence_change: Optional[Callable[[SentenceSpan], None]] = None,
         profile: Optional[str] = None,
+        home_dir: Optional[Union[str, Path]] = None,
     ):
-        prof_dir = resolve_voice_profile_dir(profile)
+        prof_dir = resolve_voice_profile_dir(profile=profile, home_dir=home_dir)
         self.profile = profile
+        self.home_dir = Path(home_dir).resolve() if home_dir else None
 
         self.library_path = Path(library_path or prof_dir / "voice_library.json")
         self.library_path.parent.mkdir(parents=True, exist_ok=True)
