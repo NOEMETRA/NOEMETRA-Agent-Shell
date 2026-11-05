@@ -335,10 +335,14 @@ class DocumentPlayer:
                     self._audio_fetched_sent_idx = sentence_index
                     self._client_started_event.set()
                 elif event == "ended":
+                    if self._current_audio is not None:
+                        self._sample_offset = len(self._current_audio)
                     self._client_ended_event.set()
-                elif event == "progress" and offset_seconds is not None and self._current_audio is not None:
+                elif event == "progress" and offset_seconds is not None:
                     sr = self._current_sr or 24000
-                    self._sample_offset = min(len(self._current_audio), int(offset_seconds * sr))
+                    if self._current_audio is not None:
+                        self._sample_offset = min(len(self._current_audio), int(offset_seconds * sr))
+                    self._save_bookmark()
 
     def _save_bookmark(self) -> ReadingBookmark:
         """Persist current bookmark to JSON file, preserving per-document reading positions."""
@@ -528,33 +532,21 @@ class DocumentPlayer:
                         sr = 24000
                         fallback_duration = max(0.4, (len(words) * 0.25) / effective_speed)
 
-                # In client playback mode, wait for client to start each sentence before advancing timeline
+                # In client playback mode, progress and sentence completion are driven
+                # STRICTLY by client acknowledgements, never advancing past unheard audio on a simulated timer.
                 if getattr(self, "client_playback", False):
-                    wait_start = time.time()
                     while not self._stop_event.is_set() and not self._pause_event.is_set():
                         with self._lock:
-                            if self._client_started_event.is_set():
+                            if self._client_ended_event.is_set():
                                 break
-                        # Timeout after 15s to allow for slow remote downloads without hanging indefinitely
-                        if time.time() - wait_start > 15.0:
-                            break
                         time.sleep(0.05)
-
-                if self._stop_event.is_set() or self._pause_event.is_set():
-                    break
-
-                if self._current_audio is not None and len(self._current_audio) > 0:
+                elif self._current_audio is not None and len(self._current_audio) > 0:
                     sr = self._current_sr or 24000
                     total_samples = len(self._current_audio)
                     # Step every 100ms of audio playback
                     step_samples = int(sr * 0.1 * effective_speed)
                     while self._sample_offset < total_samples:
                         if self._stop_event.is_set() or self._pause_event.is_set():
-                            break
-                        if self._client_ended_event.is_set():
-                            # Client finished playing sentence audio
-                            with self._lock:
-                                self._sample_offset = total_samples
                             break
                         time.sleep(0.1)
                         with self._lock:

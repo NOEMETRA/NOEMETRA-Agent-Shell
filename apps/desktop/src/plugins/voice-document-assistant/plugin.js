@@ -421,14 +421,19 @@ function VoiceDocumentPage({ ctx }) {
   const [isRecording, setIsRecording] = useState(false)
   const fileInputRef = useRef(null)
   const clientAudioRef = useRef(null)
-  const lastPlayedSentenceRef = useRef(-1)
+  const lastPlayedTargetRef = useRef('')
 
   // Poll backend status and synchronize client-side audio playback
   useEffect(() => {
+    let disposed = false
     let timer = null
+    let pollGen = 0
+
     const poll = async () => {
       try {
+        const currentGen = ++pollGen
         const s = await ctx.rest('/status')
+        if (disposed || currentGen !== pollGen) return
         setStatus(s)
         if (s && s.current_page) {
           const isPlaying = s.state === 'playing'
@@ -436,16 +441,27 @@ function VoiceDocumentPage({ ctx }) {
             setViewPage(s.current_page)
           }
 
+          // Composite key tracking both document ID and sentence index to prevent cross-document audio leakage
+          const targetDocId = s.doc_id || (docData ? docData.doc_id : '')
+          const playTargetKey = `${targetDocId}:${s.current_sentence_index}`
+
           // Client-side local audio streaming for desktop playback via profile-aware ctx.rest gateway bridge
           if (isPlaying) {
-            if (s.current_sentence_index !== lastPlayedSentenceRef.current) {
-              lastPlayedSentenceRef.current = s.current_sentence_index
+            if (playTargetKey !== lastPlayedTargetRef.current) {
+              lastPlayedTargetRef.current = playTargetKey
               if (clientAudioRef.current) {
                 clientAudioRef.current.pause()
                 clientAudioRef.current = null
               }
               try {
-                const audioData = await ctx.rest(`/audio/sentence/${s.current_sentence_index}?format=json`)
+                const currentSentIdx = s.current_sentence_index
+                const audioData = await ctx.rest(`/audio/sentence/${currentSentIdx}?format=json`)
+
+                // Discard audio fetched for an obsolete playback state or unmounted view (AGENTS.md:59-62)
+                if (disposed || currentGen !== pollGen || lastPlayedTargetRef.current !== playTargetKey) {
+                  return
+                }
+
                 if (audioData && audioData.audio_base64) {
                   const audio = new Audio(`data:audio/wav;base64,${audioData.audio_base64}`)
                   if (s.speed) {
@@ -466,19 +482,38 @@ function VoiceDocumentPage({ ctx }) {
                       audio.addEventListener('loadedmetadata', setOffset, { once: true })
                     }
                   }
-                  const currentSentIdx = s.current_sentence_index
                   audio.addEventListener('play', () => {
                     ctx.rest('/playback/ack', {
                       method: 'POST',
                       body: { sentence_index: currentSentIdx, event: 'started' }
                     }).catch(() => {})
                   }, { once: true })
+                  let lastProgressAck = 0
+                  audio.addEventListener('timeupdate', () => {
+                    const now = Date.now()
+                    if (now - lastProgressAck > 300) {
+                      lastProgressAck = now
+                      ctx.rest('/playback/ack', {
+                        method: 'POST',
+                        body: {
+                          sentence_index: currentSentIdx,
+                          event: 'progress',
+                          offset_seconds: audio.currentTime
+                        }
+                      }).catch(() => {})
+                    }
+                  })
                   audio.addEventListener('ended', () => {
                     ctx.rest('/playback/ack', {
                       method: 'POST',
                       body: { sentence_index: currentSentIdx, event: 'ended' }
                     }).catch(() => {})
                   }, { once: true })
+
+                  // Re-verify freshness before initiating audio playback
+                  if (disposed || currentGen !== pollGen || lastPlayedTargetRef.current !== playTargetKey) {
+                    return
+                  }
                   clientAudioRef.current = audio
                   audio.play().catch(() => {})
                 }
@@ -505,7 +540,7 @@ function VoiceDocumentPage({ ctx }) {
               clientAudioRef.current.pause()
             }
             if (s.state === 'stopped' || s.state === 'finished') {
-              lastPlayedSentenceRef.current = -1
+              lastPlayedTargetRef.current = ''
               if (clientAudioRef.current) {
                 clientAudioRef.current = null
               }
@@ -514,14 +549,20 @@ function VoiceDocumentPage({ ctx }) {
         }
       } catch (err) {
         // backend loading
+      } finally {
+        if (!disposed) {
+          timer = setTimeout(poll, 600)
+        }
       }
-      timer = setTimeout(poll, 600)
     }
     poll()
     return () => {
-      clearTimeout(timer)
+      disposed = true
+      ++pollGen
+      if (timer) clearTimeout(timer)
       if (clientAudioRef.current) {
         clientAudioRef.current.pause()
+        clientAudioRef.current = null
       }
     }
   }, [ctx, docData])
@@ -589,7 +630,11 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleStop = async () => {
-    if (clientAudioRef.current) clientAudioRef.current.pause()
+    if (clientAudioRef.current) {
+      clientAudioRef.current.pause()
+      clientAudioRef.current = null
+    }
+    lastPlayedTargetRef.current = ''
     try {
       await ctx.rest('/playback/stop', { method: 'POST' })
     } catch (err) {
@@ -598,6 +643,11 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleSeekSentence = async (sentenceIdx) => {
+    if (clientAudioRef.current) {
+      clientAudioRef.current.pause()
+      clientAudioRef.current = null
+    }
+    lastPlayedTargetRef.current = ''
     try {
       await ctx.rest('/playback/seek', {
         method: 'POST',
@@ -609,6 +659,11 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleSeekPage = async (page) => {
+    if (clientAudioRef.current) {
+      clientAudioRef.current.pause()
+      clientAudioRef.current = null
+    }
+    lastPlayedTargetRef.current = ''
     setViewPage(page)
     try {
       await ctx.rest('/playback/seek', {
@@ -623,6 +678,11 @@ function VoiceDocumentPage({ ctx }) {
   const handleSeekCitation = async (docId, page) => {
     try {
       if (docId && docData && docData.doc_id !== docId) {
+        if (clientAudioRef.current) {
+          clientAudioRef.current.pause()
+          clientAudioRef.current = null
+        }
+        lastPlayedTargetRef.current = ''
         await ctx.rest('/select_document', {
           method: 'POST',
           body: { doc_id: docId }
@@ -700,6 +760,11 @@ function VoiceDocumentPage({ ctx }) {
           }
         })
         if (res && res.document) {
+          if (clientAudioRef.current) {
+            clientAudioRef.current.pause()
+            clientAudioRef.current = null
+          }
+          lastPlayedTargetRef.current = ''
           setDocData(res.document)
           setViewPage(1)
           refreshLibrary()
@@ -715,6 +780,11 @@ function VoiceDocumentPage({ ctx }) {
   const handleSelectDoc = async (e) => {
     const docId = e.target.value
     if (!docId) return
+    if (clientAudioRef.current) {
+      clientAudioRef.current.pause()
+      clientAudioRef.current = null
+    }
+    lastPlayedTargetRef.current = ''
     try {
       const res = await ctx.rest('/select_document', {
         method: 'POST',
