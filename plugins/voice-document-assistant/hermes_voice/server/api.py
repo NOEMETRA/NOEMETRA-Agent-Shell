@@ -80,6 +80,26 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
         except Exception:
             pass
 
+    # If still unbound, anchor strictly to the gateway server's process-level home (AGENTS.md:13)
+    if not authorized_home and not bound_profile:
+        try:
+            from hermes_cli.profiles import current_profile_name, get_profile_dir
+            srv_prof = current_profile_name()
+            if srv_prof:
+                bound_profile = srv_prof
+                authorized_home = get_profile_dir(srv_prof).resolve()
+        except Exception:
+            pass
+
+    if not authorized_home and not bound_profile:
+        try:
+            from hermes_cli.profiles import _get_default_hermes_home
+            authorized_home = _get_default_hermes_home().resolve()
+            bound_profile = "default"
+        except Exception:
+            authorized_home = Path.home() / ".hermes"
+            bound_profile = "default"
+
     untrusted_profile = request.headers.get("X-Hermes-Profile") or request.query_params.get("profile") or None
     if untrusted_profile:
         untrusted_profile = untrusted_profile.strip().lower()
@@ -89,32 +109,27 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
                 detail=f"Invalid profile name {untrusted_profile!r}: must match ^[a-z0-9][a-z0-9_-]{{0,63}}$",
             )
 
-        # Check against authorized scope
-        if bound_profile:
-            if untrusted_profile != bound_profile.lower():
-                logger.warning(
-                    "Cross-profile access attempt blocked: caller requested %r but gateway is bound to %r",
-                    untrusted_profile,
-                    bound_profile,
-                )
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized profile {bound_profile!r}",
-                )
-        elif authorized_home:
-            # Custom home without a standard named profile
-            if untrusted_profile != authorized_home.name.lower():
-                logger.warning(
-                    "Cross-profile access attempt blocked: caller requested profile %r on custom home %r",
-                    untrusted_profile,
-                    str(authorized_home),
-                )
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized home {authorized_home.name!r}",
-                )
-        else:
-            bound_profile = untrusted_profile
+        # Strictly reject profile selection that does not match authorized scope
+        if bound_profile and untrusted_profile != bound_profile.lower():
+            logger.warning(
+                "Cross-profile access attempt blocked: caller requested %r but gateway is bound to %r",
+                untrusted_profile,
+                bound_profile,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized profile {bound_profile!r}",
+            )
+        elif authorized_home and untrusted_profile != authorized_home.name.lower():
+            logger.warning(
+                "Cross-profile access attempt blocked: caller requested profile %r on custom home %r",
+                untrusted_profile,
+                str(authorized_home),
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized home {authorized_home.name!r}",
+            )
 
     resolved_profile = bound_profile or (authorized_home.name if authorized_home else "default")
     return resolved_profile, authorized_home
@@ -346,6 +361,19 @@ async def get_sentence_audio(sentence_idx: int, request: Request):
     wav_bytes = await asyncio.to_thread(assistant.player.get_sentence_audio_wav, sentence_idx)
     if not wav_bytes:
         raise HTTPException(status_code=404, detail="Audio non disponibile per la frase richiesta.")
+
+    # Return base64 JSON when queried with ?format=json or accept: application/json
+    fmt = request.query_params.get("format", "").lower()
+    accept = request.headers.get("accept", "").lower()
+    if fmt == "json" or ("application/json" in accept and "audio/wav" not in accept):
+        b64_audio = base64.b64encode(wav_bytes).decode("ascii")
+        return {
+            "status": "success",
+            "sentence_index": sentence_idx,
+            "format": "wav",
+            "audio_base64": b64_audio,
+        }
+
     return Response(content=wav_bytes, media_type="audio/wav")
 
 

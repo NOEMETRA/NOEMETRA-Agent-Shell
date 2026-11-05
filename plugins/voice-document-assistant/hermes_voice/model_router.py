@@ -92,21 +92,27 @@ class ModelRouter:
         return self.ollama_model
 
     def check_ollama_health(self) -> Dict[str, Any]:
-        """Verify Ollama server connection and list available models."""
-        try:
-            resp = requests.get(f"{self.ollama_base_url}/api/tags", timeout=3.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                models = [m.get("name") for m in data.get("models", [])]
-                return {
-                    "status": "online",
-                    "available_models": models,
-                    "target_model_installed": any(self.ollama_model in m for m in models),
-                }
-        except Exception as e:
-            return {"status": "offline", "error": str(e), "available_models": []}
+        """Verify Ollama server connection and list available models with retry resilience."""
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(f"{self.ollama_base_url}/api/tags", timeout=5.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = [m.get("name") for m in data.get("models", [])]
+                    return {
+                        "status": "online",
+                        "available_models": models,
+                        "target_model_installed": any(self.ollama_model in m for m in models),
+                    }
+                else:
+                    last_err = f"HTTP {resp.status_code}"
+            except Exception as e:
+                last_err = str(e)
+            if attempt < 2:
+                time.sleep(0.5)
 
-        return {"status": "error", "available_models": []}
+        return {"status": "offline", "error": last_err or "Unknown error", "available_models": []}
 
     def get_providers_status(self) -> Dict[str, Any]:
         """Return status and privacy posture for all configured providers."""

@@ -191,6 +191,24 @@ def test_audio_sentence_stream_endpoint():
     assert res.content.startswith(b"RIFF")
     assert b"WAVE" in res.content[:16]
 
+    # Verify JSON format for desktop ctx.rest bridge
+    res_json = client.get("/api/plugins/voice-document-assistant/audio/sentence/0?format=json")
+    assert res_json.status_code == 200
+    data = res_json.json()
+    assert data["format"] == "wav"
+    assert "audio_base64" in data
+    assert len(data["audio_base64"]) > 0
+
+
+def test_unauthorized_profile_selection_rejected_in_unbound_context():
+    """Verify that an untrusted caller cannot supply an arbitrary profile in an unbound context."""
+    res = client.get(
+        "/api/plugins/voice-document-assistant/status",
+        headers={"X-Hermes-Profile": "unauthorized_foreign_profile"},
+    )
+    assert res.status_code == 403
+    assert "Access denied" in res.json()["detail"]
+
 
 def test_api_playback_config_llm_model():
     """Verify playback config supports selecting the LLM model."""
