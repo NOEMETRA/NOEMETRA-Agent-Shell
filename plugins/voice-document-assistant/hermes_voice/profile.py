@@ -108,35 +108,53 @@ def validate_path_profile_ownership(
         from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root, get_profile_dir, list_profile_names
         default_home = _get_default_hermes_home().resolve()
         profiles_root = _get_profiles_root().resolve()
-        all_profile_homes: dict[str, Path] = {"default": default_home}
+        named_profile_homes: dict[str, Path] = {"default": default_home}
+        all_homes_by_path: dict[Path, str] = {default_home: "default"}
         for pname in list_profile_names():
             try:
-                all_profile_homes[pname.lower()] = get_profile_dir(pname).resolve()
+                p_dir = get_profile_dir(pname).resolve()
+                p_key = pname.lower()
+                named_profile_homes[p_key] = p_dir
+                all_homes_by_path[p_dir] = p_key
             except Exception:
                 pass
     except Exception:
         default_home = (Path.home() / ".hermes").resolve()
         profiles_root = (default_home / "profiles").resolve()
-        all_profile_homes = {"default": default_home}
+        named_profile_homes = {"default": default_home}
+        all_homes_by_path = {default_home: "default"}
 
-    # Add all registered served custom homes
+    # Add all registered served custom homes by canonical path to avoid name collisions
     for sh, sname in _REGISTERED_SERVED_HOMES.items():
-        if sname not in all_profile_homes and sh != default_home:
-            all_profile_homes[sname] = sh
+        try:
+            sh_resolved = Path(sh).resolve()
+            if sh_resolved not in all_homes_by_path:
+                all_homes_by_path[sh_resolved] = sname or sh_resolved.name.lower() or "served_home"
+        except Exception:
+            pass
 
-    # Add served_homes if explicitly provided
+    # Add served_homes if explicitly provided, tracking by canonical path to prevent discarding name collisions
     if served_homes:
         if isinstance(served_homes, dict):
-            for sname, sh in served_homes.items():
-                try:
-                    all_profile_homes[str(sname).lower()] = Path(sh).resolve()
-                except Exception:
-                    pass
-        elif isinstance(served_homes, (list, tuple, set)):
-            for idx, sh in enumerate(served_homes):
+            for k, v in served_homes.items():
+                if isinstance(v, (str, Path)):
+                    try:
+                        p_val = Path(v).resolve()
+                        all_homes_by_path[p_val] = str(k).lower()
+                    except Exception:
+                        pass
+                elif isinstance(k, (str, Path)):
+                    try:
+                        p_key = Path(k).resolve()
+                        all_homes_by_path[p_key] = str(v).lower()
+                    except Exception:
+                        pass
+        elif isinstance(served_homes, Iterable):
+            for sh in served_homes:
                 try:
                     sh_path = Path(sh).resolve()
-                    all_profile_homes[f"served_home_{idx}"] = sh_path
+                    if sh_path not in all_homes_by_path:
+                        all_homes_by_path[sh_path] = sh_path.name.lower() or "served_home"
                 except Exception:
                     pass
 
@@ -144,8 +162,8 @@ def validate_path_profile_ownership(
     try:
         from hermes_constants import get_hermes_home
         current_proc_home = get_hermes_home().resolve()
-        if current_proc_home != default_home and "process_home" not in all_profile_homes:
-            all_profile_homes["process_home"] = current_proc_home
+        if current_proc_home not in all_homes_by_path:
+            all_homes_by_path[current_proc_home] = "process_home"
     except Exception:
         pass
 
@@ -154,7 +172,7 @@ def validate_path_profile_ownership(
     elif prof_name == "default":
         caller_home = default_home
     else:
-        caller_home = all_profile_homes.get(prof_name, (profiles_root / prof_name).resolve())
+        caller_home = named_profile_homes.get(prof_name, (profiles_root / prof_name).resolve())
 
     is_cross_profile = False
     conflicting_profile = None
@@ -165,7 +183,7 @@ def validate_path_profile_ownership(
             rel = p.relative_to(profiles_root)
             if rel.parts:
                 owner_profile = rel.parts[0].lower()
-                expected_home = all_profile_homes.get(owner_profile, (profiles_root / owner_profile).resolve())
+                expected_home = named_profile_homes.get(owner_profile, (profiles_root / owner_profile).resolve())
                 if caller_home:
                     if caller_home != expected_home:
                         is_cross_profile = True
@@ -178,7 +196,7 @@ def validate_path_profile_ownership(
             rel_parts = p.relative_to(profiles_root).parts
             if rel_parts:
                 owner_profile = rel_parts[0].lower()
-                expected_home = all_profile_homes.get(owner_profile, (profiles_root / owner_profile).resolve())
+                expected_home = named_profile_homes.get(owner_profile, (profiles_root / owner_profile).resolve())
                 if caller_home:
                     if caller_home != expected_home:
                         is_cross_profile = True
@@ -197,10 +215,10 @@ def validate_path_profile_ownership(
         except Exception:
             pass
 
-    # 3. Check against known registered profile homes outside profiles_root (e.g. custom home overrides or other served homes)
+    # 3. Check against all known served profile homes outside profiles_root (every home preserved by Path)
     if not is_cross_profile:
-        for other_name, other_home in all_profile_homes.items():
-            if other_name == "default":
+        for other_home, other_name in all_homes_by_path.items():
+            if other_home == default_home:
                 continue  # Handled above with profiles_root exclusion
             try:
                 if other_home.is_relative_to(profiles_root):

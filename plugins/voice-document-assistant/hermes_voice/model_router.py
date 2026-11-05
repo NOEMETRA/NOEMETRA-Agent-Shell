@@ -341,15 +341,21 @@ class ModelRouter:
             resp = requests.post(url, json=payload, timeout=180.0, allow_redirects=False)
             if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
                 redirect_target = urljoin(url, resp.headers.get("Location", ""))
+                orig_parsed = urlparse(url)
+                target_parsed = urlparse(redirect_target)
+                orig_origin = (orig_parsed.scheme.lower(), orig_parsed.netloc.lower())
+                target_origin = (target_parsed.scheme.lower(), target_parsed.netloc.lower())
+
                 if not is_local_endpoint(redirect_target) and not self.allow_remote:
                     raise PermissionError(
                         f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint Ollama ha tentato un reindirizzamento remoto verso '{redirect_target}'. "
                         "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
                     )
-                if is_local_endpoint(redirect_target) or self.allow_remote:
-                    resp = requests.post(redirect_target, json=payload, timeout=180.0, allow_redirects=False)
-                else:
-                    raise RuntimeError(f"Reindirizzamento non consentito verso {redirect_target}")
+                if orig_origin != target_origin and not self.allow_remote:
+                    raise PermissionError(
+                        f"Reindirizzamento verso un host diverso '{target_parsed.netloc}' bloccato in modalità locale."
+                    )
+                resp = requests.post(redirect_target, json=payload, timeout=180.0, allow_redirects=False)
 
             elapsed = time.perf_counter() - t0
 
@@ -411,15 +417,22 @@ class ModelRouter:
         resp = requests.post(url, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
         if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
             redirect_target = urljoin(url, resp.headers.get("Location", ""))
+            orig_parsed = urlparse(url)
+            target_parsed = urlparse(redirect_target)
+            orig_origin = (orig_parsed.scheme.lower(), orig_parsed.netloc.lower())
+            target_origin = (target_parsed.scheme.lower(), target_parsed.netloc.lower())
+
             if not is_local_endpoint(redirect_target) and not self.allow_remote:
                 raise PermissionError(
                     f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint ha tentato un reindirizzamento remoto verso '{redirect_target}'. "
                     "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
                 )
-            if is_local_endpoint(redirect_target) or self.allow_remote:
-                resp = requests.post(redirect_target, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
-            else:
-                raise RuntimeError(f"Reindirizzamento non consentito verso {redirect_target}")
+            if orig_origin != target_origin:
+                raise PermissionError(
+                    f"Reindirizzamento verso un'origine diversa '{target_parsed.netloc}' bloccato per prevenire "
+                    "la diffusione di credenziali di autorizzazione e contenuti documentali."
+                )
+            resp = requests.post(redirect_target, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
         if resp.status_code != 200:
             raise RuntimeError(f"API Error {resp.status_code}: {resp.text}")
 
@@ -464,15 +477,22 @@ class ModelRouter:
         resp = requests.post(url, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
         if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
             redirect_target = urljoin(url, resp.headers.get("Location", ""))
+            orig_parsed = urlparse(url)
+            target_parsed = urlparse(redirect_target)
+            orig_origin = (orig_parsed.scheme.lower(), orig_parsed.netloc.lower())
+            target_origin = (target_parsed.scheme.lower(), target_parsed.netloc.lower())
+
             if not is_local_endpoint(redirect_target) and not self.allow_remote:
                 raise PermissionError(
                     f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint ha tentato un reindirizzamento remoto verso '{redirect_target}'. "
                     "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
                 )
-            if is_local_endpoint(redirect_target) or self.allow_remote:
-                resp = requests.post(redirect_target, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
-            else:
-                raise RuntimeError(f"Reindirizzamento non consentito verso {redirect_target}")
+            if orig_origin != target_origin:
+                raise PermissionError(
+                    f"Reindirizzamento verso un'origine diversa '{target_parsed.netloc}' bloccato per prevenire "
+                    "la diffusione di credenziali di autorizzazione e contenuti documentali."
+                )
+            resp = requests.post(redirect_target, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
 
         if resp.status_code != 200:
             raise RuntimeError(f"Anthropic API Error {resp.status_code}: {resp.text}")
