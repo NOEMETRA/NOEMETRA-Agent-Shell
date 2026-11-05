@@ -83,7 +83,8 @@ class ModelRouter:
                 "model": self.ollama_model,
                 "status": ollama_health.get("status", "unknown"),
                 "models": ollama_health.get("available_models", []),
-                "is_local": True,
+                "is_local": is_local_endpoint(self.ollama_base_url),
+                "authorized": self.allow_remote or is_local_endpoint(self.ollama_base_url),
             },
             "codex": {
                 "configured": bool(self.codex_base_url),
@@ -111,6 +112,12 @@ class ModelRouter:
         selected_provider = (provider or self.default_provider).lower()
 
         if selected_provider == "ollama":
+            if not is_local_endpoint(self.ollama_base_url) and not self.allow_remote:
+                raise PermissionError(
+                    f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint Ollama '{self.ollama_base_url}' è remoto. "
+                    "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita. "
+                    "Abilitare esplicitamente allow_remote con il consenso dell'utente."
+                )
             return self._call_ollama(
                 prompt=prompt,
                 system_prompt=system_prompt,

@@ -15,6 +15,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from hermes_voice.models import ExtractedDocument, PlayerState, ReadingBookmark, SentenceSpan
+from hermes_voice.profile import resolve_voice_profile_dir
 from hermes_voice.tts_engine import PocketTTSEngine
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ class DocumentPlayer:
         on_sentence_change: Optional[Callable[[SentenceSpan], None]] = None,
     ):
         self.tts = tts_engine or PocketTTSEngine(lazy_load=True)
-        self.bookmark_path = Path(bookmark_path or Path.home() / ".hermes" / "reading_state.json")
+        self.bookmark_path = Path(bookmark_path or resolve_voice_profile_dir() / "reading_state.json")
         self.bookmark_path.parent.mkdir(parents=True, exist_ok=True)
         self.virtual_playback = virtual_playback
         self.on_sentence_change = on_sentence_change

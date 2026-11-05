@@ -103,42 +103,52 @@ class AnalystAgent:
         answer_text: str,
         excerpts: List[RetrievedExcerpt],
     ) -> List[Citation]:
-        """Parse [Pagina X] references and pair with excerpt quotes."""
-        matches = re.findall(r'\[Pagina\s*(\d+)\]', answer_text, re.IGNORECASE)
+        """Parse [Pagina X] references and extract the actual cited claims or quotes from the answer.
+
+        Strict constraint: Do not fabricate evidence for uncited answers.
+        Preserve missing citations so VerifierAgent can reject ungrounded claims.
+        """
+        matches = list(re.finditer(r'\[Pagina\s*(\d+)\]', answer_text, re.IGNORECASE))
         citations: List[Citation] = []
         seen_pages = set()
 
+        # Split answer into sentence blocks to associate each citation with its specific claim
+        sentence_spans = [
+            s.strip() for s in re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!|\n)\s+', answer_text) if s.strip()
+        ]
+
         for match in matches:
-            page_num = int(match)
+            page_num = int(match.group(1))
             if page_num in seen_pages:
                 continue
             seen_pages.add(page_num)
 
-            # Find matching excerpt for verbatim quote reference
-            quote = ""
-            for exc in excerpts:
-                if exc.page_number == page_num:
-                    quote = exc.text[:120] + "..." if len(exc.text) > 120 else exc.text
+            # Find the sentence in the answer that contains this citation
+            claim_text = ""
+            for s in sentence_spans:
+                if match.group(0) in s:
+                    # Check for explicit quotation marks inside this claim first
+                    quoted = re.findall(r'["«\']([^"»\']{8,})["»\']', s)
+                    if quoted:
+                        claim_text = quoted[0].strip()
+                    else:
+                        # Strip the citation marker from the claim sentence
+                        cleaned = re.sub(r'\[Pagina\s*\d+\]', '', s, flags=re.IGNORECASE).strip()
+                        claim_text = cleaned
                     break
+
+            if not claim_text:
+                # Fallback: strip citation markers from answer to use substantive answer text
+                claim_text = re.sub(r'\[Pagina\s*\d+\]', '', answer_text, flags=re.IGNORECASE).strip()
 
             citations.append(
                 Citation(
                     page_number=page_num,
-                    verbatim_quote=quote,
+                    verbatim_quote=claim_text,
                     confidence=1.0,
                 )
             )
 
-        # Fallback only if answer is substantive and not an error
-        if not citations and excerpts and len(answer_text) > 20 and not answer_text.startswith("Errore"):
-            # Check if any excerpt text appears in the answer
-            top_exc = excerpts[0]
-            citations.append(
-                Citation(
-                    page_number=top_exc.page_number,
-                    verbatim_quote=top_exc.text[:120] + "...",
-                    confidence=0.7,
-                )
-            )
-
+        # Do NOT fabricate evidence for uncited answers: preserve empty citations list
+        # so that VerifierAgent properly flags ungrounded answers.
         return citations

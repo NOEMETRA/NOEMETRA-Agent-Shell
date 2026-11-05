@@ -32,6 +32,22 @@ def test_privacy_guard_blocks_remote_codex_endpoint():
     assert "remoto" in str(exc_info.value)
 
 
+def test_privacy_guard_blocks_remote_ollama_endpoint():
+    """Privacy guard must apply to remote Ollama endpoints as well."""
+    router = ModelRouter(
+        allow_remote=False,
+        ollama_base_url="https://remote-ollama.example.com",
+    )
+
+    with pytest.raises(PermissionError) as exc_info:
+        router.generate(
+            prompt="Test prompt",
+            provider="ollama",
+        )
+    assert "VIOLAZIONE VINCOLO PRIVACY" in str(exc_info.value)
+    assert "remoto" in str(exc_info.value)
+
+
 def test_privacy_guard_allows_remote_only_with_explicit_consent(monkeypatch):
     router = ModelRouter(allow_remote=True)
 

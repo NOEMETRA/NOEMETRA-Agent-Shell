@@ -17,6 +17,8 @@ from typing import Dict, Optional, Tuple, Union
 import numpy as np
 import soundfile as sf
 
+from hermes_voice.profile import resolve_voice_profile_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,7 +36,7 @@ class PocketTTSEngine:
         self.language = language
         self.voice = voice
         self.quantize = quantize
-        self.cache_dir = Path(cache_dir or Path.home() / ".hermes" / "audio_cache")
+        self.cache_dir = Path(cache_dir or resolve_voice_profile_dir() / "audio_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
