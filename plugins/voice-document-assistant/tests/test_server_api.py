@@ -371,3 +371,22 @@ def test_client_playback_ack_synchronization():
     )
     assert res_end.status_code == 200
 
+
+def test_upload_cross_profile_file_path_rejected_with_403():
+    """Verify that specifying a file_path inside another profile's directory is blocked with 403."""
+    from hermes_voice.profile import resolve_voice_profile_dir
+
+    other_prof_dir = resolve_voice_profile_dir("victim_profile")
+    foreign_pdf = other_prof_dir / "victim_secret.pdf"
+    create_sample_italian_pdf(foreign_pdf)
+    try:
+        res = client.post(
+            "/api/plugins/voice-document-assistant/upload",
+            json={"file_path": str(foreign_pdf.resolve())},
+        )
+        assert res.status_code == 403
+        assert "belongs to another profile" in res.json()["detail"]
+    finally:
+        if foreign_pdf.exists():
+            foreign_pdf.unlink()
+

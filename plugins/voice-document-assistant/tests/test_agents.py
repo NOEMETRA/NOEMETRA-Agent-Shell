@@ -179,3 +179,83 @@ def test_verifier_rejects_unsupported_conclusion_appended_to_real_ngram():
         assert len(res.unsupported_claims) > 0
         assert any("affermazione non riscontrata" in c or "non contiene il testo citato" in c for c in res.unsupported_claims)
 
+
+def test_analyst_extracts_all_claims_without_page_deduplication():
+    """Verify that multiple claims citing the same page are all extracted rather than deduplicated."""
+    analyst = AnalystAgent()
+    answer_text = (
+        "Il modello italiano Pocket TTS è compatto [Pagina 1]. "
+        "Inoltre supporta la modulazione del tono e della velocità [Pagina 1]."
+    )
+    citations = analyst._extract_citations(answer_text, excerpts=[])
+    assert len(citations) == 2
+    assert citations[0].page_number == 1
+    assert "compatto" in citations[0].verbatim_quote.lower()
+    assert citations[1].page_number == 1
+    assert "modulazione" in citations[1].verbatim_quote.lower()
+
+
+def test_verifier_rejects_answer_with_uncited_substantive_claim():
+    """Verify that an answer containing an uncited substantive claim is marked invalid."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "test.pdf"
+        create_sample_italian_pdf(pdf_path)
+
+        extractor = DocumentExtractor()
+        doc = extractor.extract(pdf_path)
+        verifier = VerifierAgent(doc)
+
+        # First sentence has valid citation, second sentence has an uncited fabricated claim
+        mixed_answer = GroundedAnswer(
+            question="Cosa dice il documento?",
+            answer=(
+                "Il modello raggiunge una velocità pari a 2.6 volte il tempo reale su CPU [Pagina 2]. "
+                "Tuttavia il server richiede 512 gigabyte di memoria RAM e raffreddamento ad azoto liquido."
+            ),
+            citations=[
+                Citation(
+                    page_number=2,
+                    verbatim_quote="raggiunge una velocità di generazione pari a 2.6 volte il tempo reale su CPU",
+                )
+            ],
+        )
+
+        res = verifier.verify(mixed_answer)
+        assert res.is_valid is False
+        assert len(res.unsupported_claims) > 0
+        assert any("priva di citazione" in c for c in res.unsupported_claims)
+
+
+def test_verifier_validates_multiple_claims_on_same_page():
+    """Verify that multiple valid citations referencing the same page are all verified."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "test.pdf"
+        create_sample_italian_pdf(pdf_path)
+
+        extractor = DocumentExtractor()
+        doc = extractor.extract(pdf_path)
+        verifier = VerifierAgent(doc)
+
+        multi_answer = GroundedAnswer(
+            question="Dettagli modello",
+            answer=(
+                "Il modello è Pocket TTS [Pagina 1]. "
+                "Il runtime è locale e offline [Pagina 1]."
+            ),
+            citations=[
+                Citation(
+                    page_number=1,
+                    verbatim_quote="Pocket TTS",
+                ),
+                Citation(
+                    page_number=1,
+                    verbatim_quote="architettura multi-agente",
+                ),
+            ],
+        )
+
+        res = verifier.verify(multi_answer)
+        assert res.is_valid is True
+        assert res.citation_match_score == 1.0
+        assert len(res.unsupported_claims) == 0
+

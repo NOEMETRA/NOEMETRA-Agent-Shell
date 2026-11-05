@@ -723,6 +723,16 @@ A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono
 191. **Persistenza del Processo CLI Durante la Riproduzione Vocale (`hermes_voice/cli.py`)**:
     - *Problema*: (Rilievo Codex Round 8 P2) I comandi CLI `hermes-voice play` e `resume` avviavano la riproduzione su un thread daemon e ritornavano immediatamente, provocando la terminazione del processo CLI e l'arresto prematuro dell'audio prima della lettura del documento.
     - *Risoluzione*: Aggiornati i rami `play` e `resume` in `cli.py` con un loop di attesa attivo su `assistant.player.state == PlayerState.PLAYING`, con gestione pulita di `KeyboardInterrupt` (Ctrl+C) che invoca `assistant.pause()` per memorizzare esattamente la posizione di lettura e stampare il resoconto prima di uscire.
+192. **Isolamento dei Percorsi File Scoped in Upload contro Letture Cross-Profile (`hermes_voice/server/api.py`)**:
+    - *Problema*: (Rilievo Codex Round 9 P1) Nell'endpoint `POST /upload`, un chiamante autorizzato a un determinato profilo poteva passare un percorso `file_path` assoluto appartenente a un altro profilo, bypassando l'isolamento dei dati e i vincoli di sicurezza di AGENTS.md:13.
+    - *Risoluzione*: Implementata la verifica rigorosa di appartenenza del percorso `file_path` allo scope autorizzato (`profile_dir` o `authorized_home`). Qualsiasi percorso esterno o cross-profile viene respinto con HTTP 403 Forbidden. Validato con unit test `test_upload_cross_profile_file_path_rejected_with_403`.
+193. **Verifica Integrale di Tutte le Clausole Citate e Rigetto di Affermazioni Non Supportate (`hermes_voice/agents/analyst.py`, `verifier.py`)**:
+    - *Problema*: (Rilievo Codex Round 9 P1) L'Analista deduplicava le citazioni per numero di pagina (`seen_pages.add(page_num)`), scartando le proposizioni successive riferite alla stessa pagina e consentendo ad affermazioni inventate o allucinate di sfuggire al controllo del Verificatore; inoltre, affermazioni prive di citazione non venivano invalidate.
+    - *Risoluzione*: Riscritto il parser `_extract_citations` in `analyst.py` per preservare ogni distinta proposizione citata indipendentemente dalla pagina di riferimento. Aggiornato `verifier.py` per verificare ciascuna citazione estratta e per rilevare e respingere con `is_valid = False` qualsiasi affermazione sostanziale priva di citazione della fonte. Validato con test `test_analyst_extracts_all_claims_without_page_deduplication`, `test_verifier_rejects_answer_with_uncited_substantive_claim` e `test_verifier_validates_multiple_claims_on_same_page`.
+194. **Inclusione degli Asset Dashboard nelle Distribuzioni Wheel del Pacchetto (`pyproject.toml`)**:
+    - *Problema*: (Rilievo Codex Round 9 P2) Le direttive `package-data` per il pacchetto `plugins` includevano solo file YAML, escludendo `manifest.json`, i bundle compilati JavaScript/CSS e gli asset statici, impedendo la discovery e il rendering della dashboard in installazioni distribuite via wheel.
+    - *Risoluzione*: Dichiarati esplicitamente in `[tool.setuptools.package-data]` i pattern `**/dashboard/manifest.json`, `**/dashboard/dist/**/*`, `**/hermes_voice/server/static/**/*` e `**/skills/**/*`, assicurando l'integrità completa degli asset in qualunque ambiente di deployment.
+
 
 
 

@@ -266,10 +266,50 @@ async def upload_document(request: Request):
 
         if file_path:
             p = Path(file_path).resolve()
+            # Enforce AGENTS.md:13 profile isolation: prevent cross-profile PDF access
+            try:
+                from hermes_cli.profiles import get_profiles_dir
+                profiles_root = get_profiles_dir().resolve()
+            except Exception:
+                profiles_root = (Path.home() / ".hermes" / "profiles").resolve()
+
+            profile_dir = resolve_voice_profile_dir(profile=profile_name, home_dir=authorized_home).resolve()
+            allowed_homes = [profile_dir]
+            if authorized_home:
+                allowed_homes.append(authorized_home.resolve())
+
+            # If the path is inside the profiles tree or another profile storage,
+            # verify that it strictly belongs to the caller's authorized profile
+            is_cross_profile = False
+            if profiles_root in p.parents:
+                target_prof = p.relative_to(profiles_root).parts[0].lower()
+                if target_prof != profile_name.lower():
+                    is_cross_profile = True
+            elif "profiles" in p.parts:
+                prof_idx = p.parts.index("profiles")
+                if len(p.parts) > prof_idx + 1:
+                    target_prof = p.parts[prof_idx + 1].lower()
+                    if target_prof != profile_name.lower():
+                        is_cross_profile = True
+
+            if is_cross_profile:
+                logger.warning(
+                    "Cross-profile file path rejected in upload: %s belongs to profile %r (caller is %r)",
+                    p,
+                    target_prof if 'target_prof' in locals() else 'unknown',
+                    profile_name,
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Access denied: file_path '{file_path}' belongs to another profile and is outside the authorized profile directory.",
+                )
+
             if p.exists() and p.is_file():
                 if not p.name.lower().endswith(".pdf"):
                     raise HTTPException(status_code=400, detail="Il file deve avere estensione .pdf.")
                 target_path = p
+            else:
+                raise HTTPException(status_code=404, detail=f"File PDF non trovato al percorso specificato: '{file_path}'.")
         elif content_base64:
             clean_name = _sanitize_filename(raw_filename)
             try:

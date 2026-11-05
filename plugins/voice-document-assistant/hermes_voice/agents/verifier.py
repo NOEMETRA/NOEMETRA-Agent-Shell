@@ -65,6 +65,25 @@ class VerifierAgent:
         unsupported_claims: List[str] = []
         matched_citations = 0
 
+        # Check for substantive sentences that lack any page citation
+        sentence_spans = [
+            s.strip() for s in re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!|\n)\s+', answer_text) if s.strip()
+        ]
+        framing_prefixes = (
+            "in base al documento", "in base al testo", "dal documento", "secondo il testo",
+            "in riferimento a", "ecco la risposta", "in sintesi", "per riassumere",
+            "sulla base del", "in base a", "come indicato",
+        )
+        for s in sentence_spans:
+            if not re.search(r'\[Pagina\s*\d+\]', s, re.IGNORECASE):
+                cleaned_span = self._normalize_text(s)
+                is_framing = any(cleaned_span.startswith(self._normalize_text(prefix)) for prefix in framing_prefixes)
+                substantive_words = [w for w in cleaned_span.split() if len(w) > 3]
+                if not is_framing and len(substantive_words) >= 4:
+                    unsupported_claims.append(
+                        f"Affermazione nel testo priva di citazione o riscontro della fonte: '{s}'"
+                    )
+
         for cit in citations:
             page = self.document.get_page(cit.page_number)
             if not page:
