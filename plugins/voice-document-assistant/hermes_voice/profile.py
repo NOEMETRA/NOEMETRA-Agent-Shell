@@ -5,9 +5,27 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+_REGISTERED_SERVED_HOMES: dict[Path, str] = {}
+
+
+def register_served_profile_home(home: Union[str, Path], name: Optional[str] = None) -> None:
+    """Register an active or served profile home directory for cross-profile boundary checks."""
+    if not home:
+        return
+    try:
+        p = Path(home).resolve()
+        _REGISTERED_SERVED_HOMES[p] = (name or p.name).strip().lower() or "custom_home"
+    except Exception:
+        pass
+
+
+def clear_registered_served_profile_homes() -> None:
+    """Clear registered custom profile homes (useful for isolated tests)."""
+    _REGISTERED_SERVED_HOMES.clear()
 
 
 def resolve_voice_profile_dir(
@@ -74,10 +92,12 @@ def validate_path_profile_ownership(
     file_path: Union[str, Path],
     profile: Optional[str] = None,
     home_dir: Optional[Union[str, Path]] = None,
+    served_homes: Optional[Union[dict[str, Path], list[Path], set[Path]]] = None,
 ) -> None:
     """Validate that the given file_path belongs to or is accessible by the specified profile (AGENTS.md:13).
 
-    Strictly rejects access to files located in another profile's home directory or storage.
+    Strictly rejects access to files located in another profile's home directory or storage,
+    including default home, named profiles, and other custom HERMES_HOME directories.
     Excludes the named-profiles subtree from default-home checks so named profiles can load their own files.
     Raises PermissionError if the path belongs to a different profile.
     """
@@ -98,6 +118,36 @@ def validate_path_profile_ownership(
         default_home = (Path.home() / ".hermes").resolve()
         profiles_root = (default_home / "profiles").resolve()
         all_profile_homes = {"default": default_home}
+
+    # Add all registered served custom homes
+    for sh, sname in _REGISTERED_SERVED_HOMES.items():
+        if sname not in all_profile_homes and sh != default_home:
+            all_profile_homes[sname] = sh
+
+    # Add served_homes if explicitly provided
+    if served_homes:
+        if isinstance(served_homes, dict):
+            for sname, sh in served_homes.items():
+                try:
+                    all_profile_homes[str(sname).lower()] = Path(sh).resolve()
+                except Exception:
+                    pass
+        elif isinstance(served_homes, (list, tuple, set)):
+            for idx, sh in enumerate(served_homes):
+                try:
+                    sh_path = Path(sh).resolve()
+                    all_profile_homes[f"served_home_{idx}"] = sh_path
+                except Exception:
+                    pass
+
+    # Inspect running gateway runtime session authorities if available in the current process
+    try:
+        from hermes_constants import get_hermes_home
+        current_proc_home = get_hermes_home().resolve()
+        if current_proc_home != default_home and "process_home" not in all_profile_homes:
+            all_profile_homes["process_home"] = current_proc_home
+    except Exception:
+        pass
 
     if home_dir:
         caller_home = Path(home_dir).resolve()
@@ -147,7 +197,7 @@ def validate_path_profile_ownership(
         except Exception:
             pass
 
-    # 3. Check against known registered profile homes outside profiles_root (e.g. custom home overrides)
+    # 3. Check against known registered profile homes outside profiles_root (e.g. custom home overrides or other served homes)
     if not is_cross_profile:
         for other_name, other_home in all_profile_homes.items():
             if other_name == "default":
@@ -157,14 +207,24 @@ def validate_path_profile_ownership(
                     continue  # Handled above under profiles_root
             except Exception:
                 pass
-            if other_name != prof_name and other_home != caller_home:
+            if other_home != caller_home:
                 other_voice_dir = other_home / "voice_assistant"
                 if p == other_home or other_home in p.parents or p == other_voice_dir or other_voice_dir in p.parents:
                     is_cross_profile = True
                     conflicting_profile = other_name
                     break
 
-    # 4. Check if under another custom HERMES_HOME override
+    # 4. Check if path resides inside another profile's voice_assistant directory
+    if not is_cross_profile:
+        for parent in p.parents:
+            if parent.name == "voice_assistant":
+                potential_home = parent.parent.resolve()
+                if potential_home != caller_home:
+                    is_cross_profile = True
+                    conflicting_profile = potential_home.name or "foreign_voice_assistant"
+                    break
+
+    # 5. Check if under another custom HERMES_HOME override
     if not is_cross_profile:
         try:
             from hermes_constants import get_hermes_home_override
