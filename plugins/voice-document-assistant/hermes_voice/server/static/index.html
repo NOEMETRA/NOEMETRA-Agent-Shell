@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hermes Voice — Document Assistant</title>
+  <style>
+    :root {
+      --ui-bg-app: #0f1013;
+      --ui-bg-surface: #18191d;
+      --ui-bg-card: #222329;
+      --ui-bg-card-hover: #2a2b32;
+      --ui-stroke-primary: #3f3f46;
+      --ui-stroke-secondary: #27272a;
+      --ui-text-primary: #f4f4f5;
+      --ui-text-secondary: #a1a1aa;
+      --ui-text-tertiary: #71717a;
+      --ui-accent: #3b82f6;
+      --ui-accent-hover: #2563eb;
+      --ui-highlight: rgba(245, 158, 11, 0.22);
+      --ui-highlight-border: #f59e0b;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--ui-bg-app);
+      color: var(--ui-text-primary);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Top Bar */
+    header {
+      background: var(--ui-bg-surface);
+      border-bottom: 1px solid var(--ui-stroke-secondary);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .brand h1 {
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .badge {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: rgba(255,255,255,0.08);
+      color: var(--ui-text-secondary);
+      text-transform: uppercase;
+    }
+
+    .badge-playing {
+      background: rgba(34, 197, 94, 0.15);
+      color: #22c55e;
+      border: 1px solid rgba(34, 197, 94, 0.3);
+    }
+
+    .badge-paused {
+      background: rgba(245, 158, 11, 0.15);
+      color: #f59e0b;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    button, select {
+      font-family: inherit;
+      font-size: 12px;
+      border-radius: 6px;
+      border: 1px solid var(--ui-stroke-secondary);
+      background: var(--ui-bg-card);
+      color: var(--ui-text-primary);
+      padding: 6px 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+    }
+
+    button:hover:not(:disabled), select:hover {
+      background: var(--ui-bg-card-hover);
+      border-color: var(--ui-stroke-primary);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    button.btn-primary {
+      background: var(--ui-accent);
+      border-color: var(--ui-accent);
+      color: #ffffff;
+      font-weight: 500;
+    }
+
+    button.btn-primary:hover:not(:disabled) {
+      background: var(--ui-accent-hover);
+    }
+
+    button.btn-danger {
+      background: rgba(239, 68, 68, 0.15);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: #ef4444;
+    }
+
+    /* Main Grid */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    @media (max-width: 960px) {
+      .main-grid {
+        grid-template-columns: 1fr;
+        grid-template-rows: 1fr 1fr;
+      }
+    }
+
+    /* Left Column: Document Viewer */
+    .doc-column {
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--ui-stroke-secondary);
+      background: var(--ui-bg-app);
+      overflow: hidden;
+    }
+
+    .doc-toolbar {
+      padding: 10px 18px;
+      border-bottom: 1px solid var(--ui-stroke-secondary);
+      background: var(--ui-bg-surface);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .doc-content {
+      flex: 1;
+      padding: 28px;
+      overflow-y: auto;
+      line-height: 1.8;
+      font-size: 14.5px;
+    }
+
+    .sentence {
+      padding: 2px 4px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .sentence:hover {
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    .sentence.active-sentence {
+      background: var(--ui-highlight) !important;
+      color: #fbbf24 !important;
+      box-shadow: 0 0 0 1px var(--ui-highlight-border);
+      font-weight: 500;
+    }
+
+    /* Right Column: Panel */
+    .panel-column {
+      display: flex;
+      flex-direction: column;
+      background: var(--ui-bg-surface);
+      overflow: hidden;
+    }
+
+    .player-box {
+      padding: 14px 20px;
+      background: var(--ui-bg-card);
+      border-bottom: 1px solid var(--ui-stroke-secondary);
+    }
+
+    .player-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .timeline-container {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 11px;
+      color: var(--ui-text-tertiary);
+    }
+
+    .progress-bar {
+      flex: 1;
+      height: 6px;
+      background: var(--ui-stroke-secondary);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--ui-accent);
+      width: 0%;
+      transition: width 0.2s ease;
+    }
+
+    /* Agent Triad Status Cards */
+    .agents-box {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--ui-stroke-secondary);
+      background: var(--ui-bg-surface);
+    }
+
+    .agents-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--ui-text-tertiary);
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+
+    .agents-cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .agent-card {
+      background: var(--ui-bg-app);
+      border: 1px solid var(--ui-stroke-secondary);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 11px;
+    }
+
+    .agent-card h4 {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 3px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .agent-status-text {
+      color: var(--ui-text-secondary);
+      font-size: 10.5px;
+    }
+
+    /* Chat Section */
+    .chat-section {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .chat-history {
+      flex: 1;
+      padding: 16px 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .msg-user {
+      align-self: flex-end;
+      background: var(--ui-accent);
+      color: #ffffff;
+      padding: 8px 14px;
+      border-radius: 12px 12px 2px 12px;
+      max-width: 85%;
+      font-size: 13px;
+    }
+
+    .msg-assistant {
+      align-self: flex-start;
+      background: var(--ui-bg-card);
+      border: 1px solid var(--ui-stroke-secondary);
+      padding: 12px 16px;
+      border-radius: 12px 12px 12px 2px;
+      max-width: 90%;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .citations-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .citation-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid rgba(59, 130, 246, 0.35);
+      color: #60a5fa;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .citation-badge:hover {
+      background: rgba(59, 130, 246, 0.3);
+      border-color: #60a5fa;
+    }
+
+    .verification-box {
+      margin-top: 10px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 11.5px;
+    }
+
+    .verification-valid {
+      background: rgba(34, 197, 94, 0.1);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+      color: #4ade80;
+    }
+
+    .verification-invalid {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #f87171;
+    }
+
+    .chat-input-bar {
+      padding: 12px 20px;
+      border-top: 1px solid var(--ui-stroke-secondary);
+      background: var(--ui-bg-surface);
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .chat-input {
+      flex: 1;
+      padding: 9px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--ui-stroke-primary);
+      background: var(--ui-bg-app);
+      color: var(--ui-text-primary);
+      font-size: 13px;
+      outline: none;
+    }
+
+    .chat-input:focus {
+      border-color: var(--ui-accent);
+    }
+
+    /* Privacy Footer */
+    footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 20px;
+      background: var(--ui-bg-app);
+      border-top: 1px solid var(--ui-stroke-secondary);
+      font-size: 11px;
+      color: var(--ui-text-tertiary);
+    }
+
+    .toggle-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      color: var(--ui-text-secondary);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <span style="font-size: 18px;">📖</span>
+      <h1>Hermes Voice</h1>
+      <span id="playerStateBadge" class="badge">DISCONNESSO</span>
+    </div>
+
+    <div class="header-actions">
+      <!-- Library selector -->
+      <select id="librarySelect">
+        <option value="">Caricamento biblioteca...</option>
+      </select>
+
+      <!-- Upload PDF button -->
+      <input type="file" id="pdfFileInput" accept=".pdf" style="display: none;">
+      <button onclick="document.getElementById('pdfFileInput').click()">
+        📁 Carica PDF
+      </button>
+
+      <!-- Pocket TTS Model Selection -->
+      <select id="ttsModelSelect">
+        <option value="italian">Pocket TTS: italian (Fast 2.6x)</option>
+        <option value="italian_24l">Pocket TTS: italian_24l (Hi-Fi 24L)</option>
+      </select>
+
+      <!-- Speed selector -->
+      <select id="speedSelect">
+        <option value="0.75">0.75x</option>
+        <option value="1.0" selected>1.0x (Normale)</option>
+        <option value="1.25">1.25x</option>
+        <option value="1.5">1.5x</option>
+      </select>
+    </div>
+  </header>
+
+  <!-- Main View -->
+  <div class="main-grid">
+    <!-- Left: Document Viewer with sentence highlighting -->
+    <div class="doc-column">
+      <div class="doc-toolbar">
+        <span id="docTitleLabel" style="font-weight: 500; font-size: 13px;">Nessun documento caricato</span>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <button id="prevPageBtn" disabled>◀ Prec</button>
+          <span id="pageIndicator" style="font-size: 12px;">Pagina 1 di 1</span>
+          <button id="nextPageBtn" disabled>Succ ▶</button>
+        </div>
+      </div>
+      <div id="docContent" class="doc-content">
+        <div style="text-align: center; color: var(--ui-text-tertiary); margin-top: 60px;">
+          Carica un file PDF italiano o seleziona un documento dalla biblioteca.
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: Controls, Agents, Chat -->
+    <div class="panel-column">
+      <!-- Playback Controls -->
+      <div class="player-box">
+        <div class="player-controls">
+          <button id="playBtn" class="btn-primary" disabled>▶ Ascolta</button>
+          <button id="pauseBtn" disabled>⏸ Pausa</button>
+          <button id="resumeBtn" class="btn-primary" style="display:none;">▶ Riprendi</button>
+          <button id="stopBtn" class="btn-danger" disabled>⏹ Stop</button>
+          <span id="speakingSentenceLabel" style="margin-left: auto; font-size: 11px; color: var(--ui-text-secondary); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"></span>
+        </div>
+        <div class="timeline-container">
+          <span id="sentenceCounterLabel">0 / 0</span>
+          <div class="progress-bar">
+            <div id="progressFill" class="progress-fill"></div>
+          </div>
+          <span id="timeOffsetLabel">0.0s</span>
+        </div>
+      </div>
+
+      <!-- Agent Triad Status -->
+      <div class="agents-box">
+        <div class="agents-title">Stato Reale Triade Multi-Agente</div>
+        <div class="agents-cards">
+          <div class="agent-card">
+            <h4>📚 Bibliotecario</h4>
+            <div id="librarianStatus" class="agent-status-text">In attesa</div>
+          </div>
+          <div class="agent-card">
+            <h4>🧠 Analista</h4>
+            <div id="analystStatus" class="agent-status-text">In attesa (Ollama)</div>
+          </div>
+          <div class="agent-card">
+            <h4>🔍 Verificatore</h4>
+            <div id="verifierStatus" class="agent-status-text">In attesa</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Q&A Chat -->
+      <div class="chat-section">
+        <div id="chatHistory" class="chat-history">
+          <div style="color: var(--ui-text-tertiary); text-align: center; margin-top: 40px; font-size: 13px;">
+            Poni una domanda sul documento. L'Analista estrarrà la risposta dal testo originale e il Verificatore convaliderà ogni numero di pagina con citazioni verificabili.
+          </div>
+        </div>
+
+        <div class="chat-input-bar">
+          <input type="text" id="questionInput" class="chat-input" placeholder="Formula una domanda sul documento...">
+          <button id="micBtn" title="Input Vocale">🎤</button>
+          <button id="askBtn" class="btn-primary">Chiedi</button>
+        </div>
+      </div>
+
+      <!-- Privacy Consent Footer -->
+      <footer>
+        <div>
+          🔒 Routing: <strong>Ollama Locale (gemma4:12b)</strong> · Nessun dato inviato a server terzi
+        </div>
+        <label class="toggle-label">
+          <input type="checkbox" id="privacyConsentToggle">
+          Consenti provider remoti
+        </label>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = '/api/plugins/voice-document-assistant';
+
+    let currentStatus = null;
+    let currentDocData = null;
+    let currentViewPage = 1;
+    let isAsking = false;
+    let isRecording = false;
+
+    // Elements
+    const playerStateBadge = document.getElementById('playerStateBadge');
+    const librarySelect = document.getElementById('librarySelect');
+    const pdfFileInput = document.getElementById('pdfFileInput');
+    const ttsModelSelect = document.getElementById('ttsModelSelect');
+    const speedSelect = document.getElementById('speedSelect');
+    const docTitleLabel = document.getElementById('docTitleLabel');
+    const prevPageBtn = document.getElementById('prevPageBtn');
+    const nextPageBtn = document.getElementById('nextPageBtn');
+    const pageIndicator = document.getElementById('pageIndicator');
+    const docContent = document.getElementById('docContent');
+    const playBtn = document.getElementById('playBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const resumeBtn = document.getElementById('resumeBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const speakingSentenceLabel = document.getElementById('speakingSentenceLabel');
+    const sentenceCounterLabel = document.getElementById('sentenceCounterLabel');
+    const progressFill = document.getElementById('progressFill');
+    const timeOffsetLabel = document.getElementById('timeOffsetLabel');
+    const librarianStatus = document.getElementById('librarianStatus');
+    const analystStatus = document.getElementById('analystStatus');
+    const verifierStatus = document.getElementById('verifierStatus');
+    const chatHistory = document.getElementById('chatHistory');
+    const questionInput = document.getElementById('questionInput');
+    const micBtn = document.getElementById('micBtn');
+    const askBtn = document.getElementById('askBtn');
+    const privacyConsentToggle = document.getElementById('privacyConsentToggle');
+
+    // API Helper
+    async function api(path, options = {}) {
+      const res = await fetch(`${API_BASE}${path}`, {
+        headers: { 'Content-Type': 'application/json' },
+        ...options,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      return res.json();
+    }
+
+    // Refresh Library
+    async function loadLibrary() {
+      try {
+        const data = await api('/library');
+        librarySelect.innerHTML = '<option value="">Seleziona documento...</option>';
+        (data.documents || []).forEach(doc => {
+          const opt = document.createElement('option');
+          opt.value = doc.doc_id;
+          opt.textContent = `${doc.title} (${doc.total_pages} pag.)`;
+          if (currentStatus && currentStatus.doc_id === doc.doc_id) {
+            opt.selected = true;
+          }
+          librarySelect.appendChild(opt);
+        });
+      } catch (err) {
+        console.error('Error loading library:', err);
+      }
+    }
+
+    // Poll Status
+    async function pollStatus() {
+      try {
+        const s = await api('/status');
+        currentStatus = s;
+        updateUI(s);
+
+        // Load document text if changed
+        if (s.doc_id && (!currentDocData || currentDocData.doc_id !== s.doc_id)) {
+          loadDocumentDetails(s.doc_id, s.current_page || 1);
+        } else if (s.state === 'playing' && s.current_page && s.current_page !== currentViewPage) {
+          renderDocumentPage(s.current_page);
+        }
+      } catch (err) {
+        playerStateBadge.textContent = 'DISCONNESSO';
+        playerStateBadge.className = 'badge';
+      }
+      setTimeout(pollStatus, 500);
+    }
+
+    async function loadDocumentDetails(docId, targetPage = 1) {
+      try {
+        const doc = await api(`/document/${docId}`);
+        currentDocData = doc;
+        currentViewPage = targetPage;
+        renderDocumentPage(targetPage);
+        docTitleLabel.textContent = doc.title || 'Documento';
+        loadLibrary();
+      } catch (err) {
+        console.error('Error loading doc details:', err);
+      }
+    }
+
+    function renderDocumentPage(pageNumber) {
+      if (!currentDocData || !currentDocData.pages) return;
+      currentViewPage = pageNumber;
+      const page = currentDocData.pages.find(p => p.page_number === pageNumber);
+
+      pageIndicator.textContent = `Pagina ${pageNumber} di ${currentDocData.total_pages}`;
+      prevPageBtn.disabled = pageNumber <= 1;
+      nextPageBtn.disabled = pageNumber >= currentDocData.total_pages;
+
+      if (!page || !page.sentences || page.sentences.length === 0) {
+        docContent.innerHTML = '<div style="text-align: center; color: var(--ui-text-tertiary); margin-top: 40px;">Nessun testo estratto per questa pagina.</div>';
+        return;
+      }
+
+      docContent.innerHTML = '';
+      page.sentences.forEach(sent => {
+        const span = document.createElement('span');
+        span.className = 'sentence';
+        span.dataset.sentIdx = sent.sentence_index;
+        span.textContent = sent.text + ' ';
+        span.title = `Frase #${sent.sentence_index + 1} (Clicca per ascoltare)`;
+        span.onclick = () => seekSentence(sent.sentence_index);
+        docContent.appendChild(span);
+      });
+
+      updateSentenceHighlight();
+    }
+
+    function updateSentenceHighlight() {
+      if (!currentStatus) return;
+      const activeIdx = currentStatus.current_sentence_index;
+      const isPlaying = currentStatus.state === 'playing';
+
+      document.querySelectorAll('.sentence').forEach(el => {
+        const idx = parseInt(el.dataset.sentIdx, 10);
+        if (idx === activeIdx && isPlaying) {
+          el.classList.add('active-sentence');
+          el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } else {
+          el.classList.remove('active-sentence');
+        }
+      });
+    }
+
+    function updateUI(s) {
+      // Badge
+      playerStateBadge.textContent = s.state.toUpperCase();
+      playerStateBadge.className = 'badge';
+      if (s.state === 'playing') playerStateBadge.classList.add('badge-playing');
+      if (s.state === 'paused') playerStateBadge.classList.add('badge-paused');
+
+      // Controls
+      const hasDoc = Boolean(s.doc_id);
+      playBtn.disabled = !hasDoc || s.state === 'playing';
+      pauseBtn.disabled = s.state !== 'playing';
+      stopBtn.disabled = s.state === 'idle' || s.state === 'stopped';
+
+      if (s.state === 'paused') {
+        playBtn.style.display = 'none';
+        resumeBtn.style.display = 'inline-flex';
+        resumeBtn.disabled = false;
+      } else {
+        playBtn.style.display = 'inline-flex';
+        resumeBtn.style.display = 'none';
+      }
+
+      // Sentence label & counters
+      speakingSentenceLabel.textContent = s.current_sentence_text ? `"${s.current_sentence_text}"` : '';
+      sentenceCounterLabel.textContent = s.total_sentences > 0 ? `Frase ${s.current_sentence_index + 1} / ${s.total_sentences}` : '0 / 0';
+      timeOffsetLabel.textContent = `${(s.audio_seconds_offset || 0).toFixed(1)}s`;
+
+      if (s.total_sentences > 0) {
+        const pct = ((s.current_sentence_index + 1) / s.total_sentences) * 100;
+        progressFill.style.width = `${pct}%`;
+      } else {
+        progressFill.style.width = '0%';
+      }
+
+      // Sync active page if playing and moved to new page
+      if (s.state === 'playing' && s.current_page && s.current_page !== currentViewPage) {
+        renderDocumentPage(s.current_page);
+      } else {
+        updateSentenceHighlight();
+      }
+
+      // Agents status
+      if (s.agents) {
+        librarianStatus.textContent = s.agents.librarian === 'searching' ? '🔍 Ricerca...' : '✅ Indicizzato';
+        analystStatus.textContent = isAsking || s.agents.analyst === 'generating' ? '⏳ Generazione LLM...' : '✅ Pronto (Ollama)';
+        verifierStatus.textContent = s.agents.verifier === 'valid'
+          ? '✅ Convalidato 100%'
+          : s.agents.verifier === 'invalid'
+          ? '⚠️ Rilevate Discrepanze'
+          : '✅ Pronto';
+      }
+
+      // Privacy toggle
+      privacyConsentToggle.checked = Boolean(s.allow_remote);
+      ttsModelSelect.value = s.tts_model || 'italian';
+      speedSelect.value = (s.speed || 1.0).toString();
+    }
+
+    // Actions
+    async function play() {
+      try { await api('/playback/play', { method: 'POST' }); } catch (err) { alert(err.message); }
+    }
+
+    async function pause() {
+      try { await api('/playback/pause', { method: 'POST' }); } catch (err) { alert(err.message); }
+    }
+
+    async function resume() {
+      try { await api('/playback/resume', { method: 'POST' }); } catch (err) { alert(err.message); }
+    }
+
+    async function stop() {
+      try { await api('/playback/stop', { method: 'POST' }); } catch (err) { alert(err.message); }
+    }
+
+    async function seekSentence(idx) {
+      try {
+        await api('/playback/seek', {
+          method: 'POST',
+          body: JSON.stringify({ sentence_index: idx })
+        });
+      } catch (err) { console.error(err); }
+    }
+
+    async function jumpToPage(pageNum) {
+      renderDocumentPage(pageNum);
+      try {
+        await api('/playback/seek', {
+          method: 'POST',
+          body: JSON.stringify({ page_number: pageNum })
+        });
+      } catch (err) { console.error(err); }
+    }
+
+    // Listeners
+    playBtn.onclick = play;
+    pauseBtn.onclick = pause;
+    resumeBtn.onclick = resume;
+    stopBtn.onclick = stop;
+
+    prevPageBtn.onclick = () => { if (currentViewPage > 1) jumpToPage(currentViewPage - 1); };
+    nextPageBtn.onclick = () => { if (currentDocData && currentViewPage < currentDocData.total_pages) jumpToPage(currentViewPage + 1); };
+
+    ttsModelSelect.onchange = async () => {
+      await api('/playback/config', {
+        method: 'POST',
+        body: JSON.stringify({ tts_model: ttsModelSelect.value })
+      });
+    };
+
+    speedSelect.onchange = async () => {
+      await api('/playback/config', {
+        method: 'POST',
+        body: JSON.stringify({ speed: parseFloat(speedSelect.value) })
+      });
+    };
+
+    privacyConsentToggle.onchange = async () => {
+      await api('/config/privacy', {
+        method: 'POST',
+        body: JSON.stringify({ allow_remote: privacyConsentToggle.checked })
+      });
+    };
+
+    librarySelect.onchange = async () => {
+      const docId = librarySelect.value;
+      if (!docId) return;
+      try {
+        const res = await api('/select_document', {
+          method: 'POST',
+          body: JSON.stringify({ doc_id: docId })
+        });
+        loadDocumentDetails(docId, 1);
+      } catch (err) { alert(err.message); }
+    };
+
+    // PDF Upload
+    pdfFileInput.onchange = async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const base64 = reader.result.split(',')[1];
+          const res = await api('/upload', {
+            method: 'POST',
+            body: JSON.stringify({
+              filename: file.name,
+              content_base64: base64
+            })
+          });
+          if (res.document) {
+            loadDocumentDetails(res.document.doc_id, 1);
+          }
+        } catch (err) {
+          alert('Errore caricamento PDF: ' + err.message);
+        }
+      };
+      reader.readAsDataURL(file);
+    };
+
+    // Q&A Chat
+    async function ask() {
+      const q = questionInput.value.trim();
+      if (!q || isAsking) return;
+
+      isAsking = true;
+      askBtn.disabled = true;
+      askBtn.textContent = 'Analisi...';
+      questionInput.value = '';
+
+      // Append user msg
+      const userDiv = document.createElement('div');
+      userDiv.className = 'msg-user';
+      userDiv.textContent = q;
+      chatHistory.appendChild(userDiv);
+      chatHistory.scrollTop = chatHistory.scrollHeight;
+
+      try {
+        const answer = await api('/ask', {
+          method: 'POST',
+          body: JSON.stringify({ question: q })
+        });
+
+        const asstDiv = document.createElement('div');
+        asstDiv.className = 'msg-assistant';
+
+        const textP = document.createElement('div');
+        textP.textContent = answer.answer;
+        asstDiv.appendChild(textP);
+
+        // Clickable Citations
+        if (answer.citations && answer.citations.length > 0) {
+          const citRow = document.createElement('div');
+          citRow.className = 'citations-row';
+          const label = document.createElement('span');
+          label.style.fontSize = '11px';
+          label.style.color = 'var(--ui-text-secondary)';
+          label.textContent = 'Riferimenti verificabili:';
+          citRow.appendChild(label);
+
+          const sourceDocId = currentDocData ? currentDocData.doc_id : null;
+          answer.citations.forEach(cit => {
+            const btn = document.createElement('button');
+            btn.className = 'citation-badge';
+            btn.textContent = `[Pagina ${cit.page_number}]`;
+            btn.title = `Clicca per aprire Pagina ${cit.page_number}\n"${cit.verbatim_quote}"`;
+            btn.onclick = async () => {
+              if (sourceDocId && currentDocData && currentDocData.doc_id !== sourceDocId) {
+                await api('/select_document', {
+                  method: 'POST',
+                  body: JSON.stringify({ doc_id: sourceDocId })
+                });
+                await loadDocumentDetails(sourceDocId, cit.page_number);
+              }
+              jumpToPage(cit.page_number);
+            };
+            citRow.appendChild(btn);
+          });
+          asstDiv.appendChild(citRow);
+        }
+
+        // Verification Box
+        if (answer.verification) {
+          const verBox = document.createElement('div');
+          const isValid = answer.verification.is_valid;
+          verBox.className = `verification-box ${isValid ? 'verification-valid' : 'verification-invalid'}`;
+          verBox.textContent = isValid
+            ? `✅ Verificatore: ${answer.verification.notes || 'Citazioni convalidate con precisione del 100%'}`
+            : `⚠️ Verificatore: ${answer.verification.notes || 'Citazioni non conformi al testo sorgente.'}`;
+          asstDiv.appendChild(verBox);
+        }
+
+        chatHistory.appendChild(asstDiv);
+      } catch (err) {
+        const errDiv = document.createElement('div');
+        errDiv.className = 'msg-assistant';
+        errDiv.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+        errDiv.innerHTML = `<div style="color: #f87171;">⚠️ Errore durante l'interrogazione: ${err.message}</div>`;
+        chatHistory.appendChild(errDiv);
+      } finally {
+        isAsking = false;
+        askBtn.disabled = false;
+        askBtn.textContent = 'Chiedi';
+        chatHistory.scrollTop = chatHistory.scrollHeight;
+      }
+    }
+
+    askBtn.onclick = ask;
+    questionInput.onkeydown = (e) => { if (e.key === 'Enter') ask(); };
+
+    // Speech recognition
+    micBtn.onclick = () => {
+      if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+        alert('Riconoscimento vocale Web Speech non supportato su questo browser.');
+        return;
+      }
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!isRecording) {
+        const rec = new SR();
+        rec.lang = 'it-IT';
+        rec.onstart = () => { isRecording = true; micBtn.style.color = '#ef4444'; };
+        rec.onresult = (evt) => {
+          questionInput.value = evt.results[0][0].transcript;
+          isRecording = false;
+          micBtn.style.color = '';
+        };
+        rec.onerror = () => { isRecording = false; micBtn.style.color = ''; };
+        rec.onend = () => { isRecording = false; micBtn.style.color = ''; };
+        rec.start();
+      }
+    };
+
+    // Initialize
+    loadLibrary();
+    pollStatus();
+  </script>
+</body>
+</html>

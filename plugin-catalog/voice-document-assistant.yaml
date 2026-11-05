@@ -1,0 +1,27 @@
+name: voice-document-assistant
+repo: https://github.com/NOEMETRA/Hermes-assistant-audio
+sha: edb63444223f3cd652308c3faaeb163413fac278
+description: "Assistente vocale documentale multi-agente deterministico con Pocket TTS, evidenziazione del testo e verifica delle citazioni."
+maintainer: NOEMETRA
+tier: official
+category: voice
+requires_hermes: ">=0.20.0"
+version: "1.0.0"
+title: "NOEMETRA Voice Assistant"
+platforms:
+  - linux
+  - macos
+  - windows
+capabilities:
+  provides_tools:
+    - voice_load_document
+    - voice_play_document
+    - voice_pause_document
+    - voice_resume_document
+    - voice_stop_document
+    - voice_seek_document
+    - voice_ask_document
+    - voice_get_status
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []
