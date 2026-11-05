@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusResponse, ReadingBookmark
-from hermes_voice.profile import PROFILE_ID_RE, resolve_voice_profile_dir
+from hermes_voice.profile import PROFILE_ID_RE, resolve_voice_profile_dir, validate_path_profile_ownership
 from hermes_voice.server.state import get_assistant
 
 logger = logging.getLogger(__name__)
@@ -268,86 +268,17 @@ async def upload_document(request: Request):
             p = Path(file_path).resolve()
             # Enforce AGENTS.md:13 profile isolation: validate path ownership against authorized vs foreign profile homes
             try:
-                from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root, get_profile_dir, list_profile_names
-                default_home = _get_default_hermes_home().resolve()
-                profiles_root = _get_profiles_root().resolve()
-                all_profile_homes: dict[str, Path] = {"default": default_home}
-                for pname in list_profile_names():
-                    try:
-                        all_profile_homes[pname.lower()] = get_profile_dir(pname).resolve()
-                    except Exception:
-                        pass
-            except Exception:
-                default_home = (Path.home() / ".hermes").resolve()
-                profiles_root = (default_home / "profiles").resolve()
-                all_profile_homes = {"default": default_home}
-
-            caller_home = authorized_home.resolve() if authorized_home else all_profile_homes.get(profile_name.lower(), default_home)
-            caller_voice_dir = resolve_voice_profile_dir(profile=profile_name, home_dir=authorized_home).resolve()
-
-            is_cross_profile = False
-            conflicting_profile = None
-
-            # 1. Check if path is under named profiles directory
-            try:
-                if p.is_relative_to(profiles_root):
-                    rel = p.relative_to(profiles_root)
-                    if rel.parts:
-                        owner_profile = rel.parts[0].lower()
-                        if owner_profile != profile_name.lower():
-                            is_cross_profile = True
-                            conflicting_profile = owner_profile
-            except AttributeError:
-                if str(p).startswith(str(profiles_root)):
-                    rel_parts = p.relative_to(profiles_root).parts
-                    if rel_parts and rel_parts[0].lower() != profile_name.lower():
-                        is_cross_profile = True
-                        conflicting_profile = rel_parts[0].lower()
-
-            # 2. Check if caller is a named profile attempting to access default profile home (outside profiles_root)
-            if not is_cross_profile and profile_name.lower() != "default":
-                try:
-                    if p.is_relative_to(default_home) and not p.is_relative_to(profiles_root):
-                        is_cross_profile = True
-                        conflicting_profile = "default"
-                except Exception:
-                    pass
-
-            # 3. Check against known registered profile homes and their voice assistant directories
-            if not is_cross_profile:
-                for other_name, other_home in all_profile_homes.items():
-                    if other_name != profile_name.lower() and other_home != caller_home:
-                        # If file is inside another profile's home or storage, it is cross-profile
-                        other_voice_dir = other_home / "voice_assistant"
-                        if p == other_home or other_home in p.parents or p == other_voice_dir or other_voice_dir in p.parents:
-                            is_cross_profile = True
-                            conflicting_profile = other_name
-                            break
-
-            # 4. Also check if under another custom HERMES_HOME override
-            if not is_cross_profile:
-                try:
-                    from hermes_constants import get_hermes_home_override
-                    env_override = get_hermes_home_override()
-                    if env_override:
-                        env_home = Path(env_override).resolve()
-                        if env_home != caller_home and (p == env_home or env_home in p.parents):
-                            is_cross_profile = True
-                            conflicting_profile = "custom_home"
-                except Exception:
-                    pass
-
-            if is_cross_profile:
+                validate_path_profile_ownership(p, profile=profile_name, home_dir=authorized_home)
+            except PermissionError as e:
                 logger.warning(
-                    "Cross-profile file path rejected in upload: %s belongs to foreign profile %r (caller is %r at %s)",
-                    p,
-                    conflicting_profile,
+                    "Cross-profile file path rejected in upload: %s (caller is %r at %s)",
+                    e,
                     profile_name,
-                    caller_home,
+                    authorized_home,
                 )
                 raise HTTPException(
                     status_code=403,
-                    detail=f"Access denied: file_path '{file_path}' belongs to profile {conflicting_profile!r} and is outside the authorized home directory.",
+                    detail=f"Access denied: {e}",
                 )
 
             if p.exists() and p.is_file():

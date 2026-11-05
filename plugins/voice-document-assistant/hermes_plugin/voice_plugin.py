@@ -40,7 +40,21 @@ def voice_load_document(args: Any = None, **kwargs) -> str:
         return json.dumps({"error": "Parametro 'pdf_path' mancante o non valido."})
 
     assistant = _get_assistant()
-    bookmark = assistant.load_document(pdf_path)
+    try:
+        from hermes_voice.profile import validate_path_profile_ownership
+        validate_path_profile_ownership(pdf_path, profile=assistant.profile, home_dir=assistant.home_dir)
+    except PermissionError as err:
+        return json.dumps({"error": f"Access denied: {err}"})
+    except Exception as err:
+        return json.dumps({"error": f"Errore validazione percorso: {err}"})
+
+    try:
+        bookmark = assistant.load_document(pdf_path)
+    except PermissionError as err:
+        return json.dumps({"error": f"Access denied: {err}"})
+    except Exception as err:
+        return json.dumps({"error": f"Errore caricamento documento: {err}"})
+
     return json.dumps({
         "status": "success",
         "doc_id": bookmark.doc_id,

@@ -316,10 +316,7 @@ class DocumentPlayer:
             if not self._document or sentence_index < 0 or sentence_index >= len(self._document.all_sentences):
                 return b""
             sentence = self._document.all_sentences[sentence_index]
-            self._audio_fetched_sent_idx = sentence_index
             self.client_playback = True
-            if sentence_index == self._current_sent_idx:
-                self._client_started_event.set()
 
         # Synthesize audio using Pocket TTS
         audio_data, sr = self.tts.synthesize(sentence.text)
@@ -536,7 +533,7 @@ class DocumentPlayer:
                     wait_start = time.time()
                     while not self._stop_event.is_set() and not self._pause_event.is_set():
                         with self._lock:
-                            if self._client_started_event.is_set() or self._audio_fetched_sent_idx == self._current_sent_idx:
+                            if self._client_started_event.is_set():
                                 break
                         # Timeout after 15s to allow for slow remote downloads without hanging indefinitely
                         if time.time() - wait_start > 15.0:
