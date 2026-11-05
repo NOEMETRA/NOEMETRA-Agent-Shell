@@ -39,6 +39,15 @@ I test sono stati eseguiti con `uv run --group dev pytest`.
   - Isolamento delle tracce e dei file di sessione.
   - Deallogazione risorse e chiusura pulita dei processi orfani.
 
+### 2.4 Suite Voice Document Assistant (`plugins/voice-document-assistant/tests/`)
+- **`test_agents.py`**: **6 PASSED / 0 FAILED** (Verifica triade Librarian, Analyst, Verifier)
+- **`test_end_to_end.py`**: **1 PASSED / 0 FAILED** (Verifica pipeline end-to-end con Ollama locale `gemma4:12b`)
+- **`test_extractor.py`**: **2 PASSED / 0 FAILED** (Estrazione deterministica PDF e bounding box)
+- **`test_player.py`**: **2 PASSED / 0 FAILED** (Player audio e stato di riproduzione)
+- **`test_router.py`**: **4 PASSED / 0 FAILED** (ModelRouter, routing dinamico e Privacy Guard)
+- **`test_server_api.py`**: **6 PASSED / 0 FAILED** (API REST FastAPI del server vocale)
+- **Totale**: **21 PASSED / 0 FAILED** (100% in 89.36s)
+
 ---
 
 ## 3. Prove Eseguite sul Runtime Reale (Live E2E)
@@ -606,6 +615,21 @@ A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono
 159. **Correzione del Path Regex Escape per Rilevamento Processi Legacy Windows (`apps/desktop/electron/main.ts`)**:
     - *Problema*: (Rilievo Codex P2) In `isLegacyAppRunning` rung 2 (Windows), lo script PowerShell sostituiva ogni backslash del percorso legacy con un doppio backslash prima di invocare `[regex]::Escape`. Nelle stringhe letterali PowerShell a singolo apice (`'...'`), il backslash non funge da carattere di escape; di conseguenza, la stringa ricevuta da `[regex]::Escape` conteneva doppi separatori, e l'espressione regolare risultante cercava doppi backslash letterali, fallendo il match rispetto alla reale riga di comando del processo (`$cmd`).
     - *Risoluzione*: Aggiornato `apps/desktop/electron/main.ts`: rimosso `.replace(/\\/g, '\\\\')` dal template di script PowerShell, consentendo a `[regex]::Escape` di ricevere il percorso reale con singoli backslash ed eseguire il matching corretto contro le righe di comando dei processi Windows in esecuzione.
+160. **Integrazione Modulare del Voice Document Assistant come Unified Plugin Package (`plugins/voice-document-assistant/`, `plugin-catalog/voice-document-assistant.yaml`, `pyproject.toml`)**:
+    - *Problema / Obiettivo*: Integrazione del prototipo audio unificato da `https://github.com/NOEMETRA/Hermes-assistant-audio` all'interno della piattaforma NOEMETRA Agent Shell nel pieno rispetto del principio di *Universal & Agnostic Runtime*: nessun accoppiamento stretto o hardcoding documentale o audio nel core runtime (`agent/`, `gateway/`, `hermes_cli/`). Tutto il comportamento applicativo deve operare tramite il pattern standard dei plugin unificati.
+    - *Risoluzione*:
+      1. Strutturato il pacchetto unificato in `plugins/voice-document-assistant/`:
+         - Manifest unificato `plugin.yaml` con metadati, 8 tool agentici (`voice_load_document`, `voice_play_document`, `voice_pause_document`, `voice_resume_document`, `voice_stop_document`, `voice_seek_document`, `voice_ask_document`, `voice_get_status`), configurazione dashboard e desktop.
+         - Entry point `__init__.py` con `register(ctx)` conforme a `PluginManager` e iniezione isolata di `_PLUGIN_DIR` in `sys.path` per la risoluzione autonoma di `hermes_voice` e `hermes_plugin`.
+         - Endpoint REST per il gateway montato dinamicamente su `/api/plugins/voice-document-assistant/` via `dashboard/manifest.json` e `dashboard/plugin_api.py` con labeling "NOEMETRA Voice".
+         - Componente frontend desktop in `desktop/plugin.js` conforme alle API di estensione `@hermes/plugin-sdk`.
+         - Motore audio/documentale deterministico multi-agente in `hermes_voice/` (PyMuPDF, Pocket TTS, SoundDevice, SoundFile, ModelRouter con Privacy Guard, triade agentica Librarian/Analyst/Verifier, server REST FastAPI).
+         - Tool agentici in `hermes_plugin/voice_plugin.py` registrati su `ctx.register_tool`.
+         - Specifica di skill conforme in `skills/voice-doc-assistant/SKILL.md`.
+      2. Validata e registrata la voce di catalogo ufficiale in `plugin-catalog/voice-document-assistant.yaml` tramite `scripts/validate_plugin_catalog.py` (0 errori, validazione superata al 100%).
+      3. Aggiunto l'extra opzionale `voice-document-assistant` in `pyproject.toml` (`pocket-tts==4.0.1`, `pymupdf==2.0`, `sounddevice==0.5.6`, `soundfile==0.14.0`) con marker `sys_platform != 'android'`, garantendo coerenza di lock e isolamento rispetto al core lean.
+      4. Eseguiti con successo al 100% tutti i 21 test unitari ed end-to-end con Ollama locale (`gemma4:12b`), oltre al typecheck completo TypeScript Electron/Web (0 errori) e la suite Vitest desktop (68/68 test superati).
+
 
 
 

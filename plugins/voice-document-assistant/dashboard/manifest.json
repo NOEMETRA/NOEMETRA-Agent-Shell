@@ -1,0 +1,11 @@
+{
+  "name": "voice-document-assistant",
+  "label": "NOEMETRA Voice",
+  "description": "Assistente vocale documentale multi-agente con sintesi deterministica Pocket TTS, evidenziazione del testo e verifica delle citazioni.",
+  "version": "1.0.0",
+  "api": "plugin_api.py",
+  "tab": {
+    "path": "/voice-document",
+    "position": "after:skills"
+  }
+}

@@ -1,0 +1,7 @@
+name: voice-document-assistant
+version: 0.1.0
+description: Assistente vocale documentale multi-agente deterministico con Pocket TTS.
+kind: general
+entrypoint: voice_plugin:register
+author: Hermes Voice Research Team
+license: MIT

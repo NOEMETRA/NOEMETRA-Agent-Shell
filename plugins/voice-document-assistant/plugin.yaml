@@ -1,0 +1,18 @@
+name: voice-document-assistant
+version: 1.0.0
+description: "Assistente vocale documentale multi-agente deterministico con Pocket TTS, evidenziazione del testo e verifica delle citazioni."
+author: "NOEMETRA Voice Team"
+entry_point: "hermes_plugin.voice_plugin:register"
+tools:
+  - voice_load_document
+  - voice_play_document
+  - voice_pause_document
+  - voice_resume_document
+  - voice_stop_document
+  - voice_seek_document
+  - voice_ask_document
+  - voice_get_status
+dashboard:
+  manifest: "dashboard/manifest.json"
+desktop:
+  entry: "desktop/plugin.js"
