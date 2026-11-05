@@ -78,8 +78,15 @@ class DocumentPlayer:
 
     def load_document(self, document: ExtractedDocument, resume_from_bookmark: bool = True) -> ReadingBookmark:
         """Load an extracted document and optionally restore previous bookmark."""
+        # 1. Stop playback and wait completely for previous worker outside any lock to prevent audio leakage
+        self.stop()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=3.0)
+            if self._worker_thread.is_alive():
+                logger.error("Impossibile caricare nuovo documento: il worker audio precedente non si è arrestato.")
+                raise RuntimeError("Il worker di riproduzione precedente è ancora attivo. Riprovare.")
+
         with self._lock:
-            self.stop()
             self._document = document
             self._current_sent_idx = 0
             self._sample_offset = 0
@@ -89,8 +96,15 @@ class DocumentPlayer:
             if resume_from_bookmark and self.bookmark_path.exists():
                 try:
                     data = json.loads(self.bookmark_path.read_text(encoding="utf-8"))
-                    saved_bookmark = ReadingBookmark(**data)
-                    if saved_bookmark.doc_id == document.doc_id:
+                    saved_dict = None
+                    if isinstance(data, dict):
+                        if "bookmarks" in data and isinstance(data["bookmarks"], dict):
+                            saved_dict = data["bookmarks"].get(document.doc_id)
+                        if not saved_dict and data.get("doc_id") == document.doc_id:
+                            saved_dict = data
+
+                    if saved_dict:
+                        saved_bookmark = ReadingBookmark(**saved_dict)
                         self._current_sent_idx = min(
                             saved_bookmark.current_sentence_index,
                             max(0, len(document.all_sentences) - 1),
@@ -212,7 +226,7 @@ class DocumentPlayer:
 
         # Join worker thread cleanly outside the lock
         if worker_to_join and worker_to_join != threading.current_thread():
-            worker_to_join.join(timeout=1.5)
+            worker_to_join.join(timeout=3.0)
 
         with self._lock:
             return self._save_bookmark()
@@ -283,12 +297,30 @@ class DocumentPlayer:
             )
 
     def _save_bookmark(self) -> ReadingBookmark:
-        """Persist current bookmark to JSON file if a document is loaded."""
+        """Persist current bookmark to JSON file, preserving per-document reading positions."""
         bookmark = self.get_bookmark()
         if not self._document:
             return bookmark
         try:
-            self.bookmark_path.write_text(bookmark.model_dump_json(indent=2), encoding="utf-8")
+            bookmarks_map: dict[str, Any] = {}
+            if self.bookmark_path.exists():
+                try:
+                    existing = json.loads(self.bookmark_path.read_text(encoding="utf-8"))
+                    if isinstance(existing, dict):
+                        if "bookmarks" in existing and isinstance(existing["bookmarks"], dict):
+                            bookmarks_map = dict(existing["bookmarks"])
+                        elif "doc_id" in existing:
+                            bookmarks_map[existing["doc_id"]] = existing
+                except Exception:
+                    pass
+
+            bookmarks_map[bookmark.doc_id] = bookmark.model_dump()
+            payload = {
+                "active_doc_id": bookmark.doc_id,
+                **bookmark.model_dump(),
+                "bookmarks": bookmarks_map,
+            }
+            self.bookmark_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"Impossibile salvare il bookmark su {self.bookmark_path}: {e}")
         return bookmark
@@ -324,8 +356,10 @@ class DocumentPlayer:
                     try:
                         audio_data, sr = self.tts.synthesize(sentence.text)
                         with self._lock:
-                            self._current_audio = audio_data
-                            self._current_sr = sr
+                            # Verify document has not changed while synthesizing
+                            if self._document and self._document.doc_id == sentence.doc_id:
+                                self._current_audio = audio_data
+                                self._current_sr = sr
                     except Exception as e:
                         logger.error(f"Errore sintesi TTS per la frase {self._current_sent_idx}: {e}")
                         with self._lock:

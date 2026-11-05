@@ -97,28 +97,42 @@ class VerifierAgent:
                 matched_citations += 1
                 verified_quotes.append(f"Pagina {cit.page_number}: riscontro letterale esatto trovato.")
             else:
-                # Substring check: take n-grams of 4 consecutive words from quote
-                found_ngram = False
-                if len(words) >= 4:
-                    for i in range(len(words) - 3):
-                        ngram = " ".join(words[i:i+4])
-                        if ngram in page_text_clean:
-                            found_ngram = True
-                            matched_citations += 1
-                            verified_quotes.append(f"Pagina {cit.page_number}: riscontro confermato su '{ngram}'.")
+                # Substring / full quote check: verify that the substantive claim words are grounded on the page
+                present_words = [w for w in words if w in page_text_clean]
+                ratio = len(present_words) / len(words)
+
+                # Split quote into sub-clauses to detect fabricated conclusions or claims appended to real phrases
+                sub_clauses = [
+                    c.strip()
+                    for c in re.split(
+                        r'[,;\.\n]|(?:\b(?:ma|però|tuttavia|quindi|inoltre|invece|sebbene|benché)\b)',
+                        cit.verbatim_quote,
+                        flags=re.IGNORECASE,
+                    )
+                    if c.strip()
+                ]
+                unsupported_subclause = None
+                for clause in sub_clauses:
+                    clause_words = [w for w in self._normalize_text(clause).split() if len(w) > 2]
+                    if len(clause_words) >= 3:
+                        clause_match_count = sum(1 for w in clause_words if w in page_text_clean)
+                        if clause_match_count / len(clause_words) < 0.5:
+                            unsupported_subclause = clause
                             break
 
-                if not found_ngram:
-                    # Require at least 80% of significant words to appear in page
-                    present_words = [w for w in words if w in page_text_clean]
-                    ratio = len(present_words) / len(words)
-                    if ratio >= 0.8:
-                        matched_citations += 1
-                        verified_quotes.append(f"Pagina {cit.page_number}: concetti chiave confermati ({len(present_words)}/{len(words)} parole).")
-                    else:
-                        unsupported_claims.append(
-                            f"La pagina {cit.page_number} non contiene il testo citato: '{cit.verbatim_quote[:80]}'."
-                        )
+                if unsupported_subclause:
+                    unsupported_claims.append(
+                        f"La citazione a Pagina {cit.page_number} contiene l'affermazione non riscontrata nel testo: '{unsupported_subclause}'."
+                    )
+                elif ratio >= 0.85:
+                    matched_citations += 1
+                    verified_quotes.append(
+                        f"Pagina {cit.page_number}: concetti chiave confermati ({len(present_words)}/{len(words)} parole)."
+                    )
+                else:
+                    unsupported_claims.append(
+                        f"La pagina {cit.page_number} non contiene il testo citato: '{cit.verbatim_quote[:80]}'."
+                    )
 
         total_citations = len(citations)
         score = matched_citations / total_citations if total_citations > 0 else 0.0

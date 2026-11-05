@@ -40,14 +40,14 @@ I test sono stati eseguiti con `uv run --group dev pytest`.
   - Deallogazione risorse e chiusura pulita dei processi orfani.
 
 ### 2.4 Suite Voice Document Assistant (`plugins/voice-document-assistant/tests/`)
-- **`test_agents.py`**: **6 PASSED / 0 FAILED** (Verifica triade Librarian, Analyst, Verifier)
+- **`test_agents.py`**: **7 PASSED / 0 FAILED** (Verifica triade Librarian, Analyst, Verifier e rigetto conclusioni fabbricate su n-grammi parziali)
 - **`test_end_to_end.py`**: **1 PASSED / 0 FAILED** (Verifica pipeline end-to-end con Ollama locale `gemma4:12b`)
 - **`test_extractor.py`**: **2 PASSED / 0 FAILED** (Estrazione deterministica PDF e bounding box)
-- **`test_player.py`**: **2 PASSED / 0 FAILED** (Player audio, pause/resume e assenza deadlock)
+- **`test_player.py`**: **4 PASSED / 0 FAILED** (Player audio, pause/resume, assenza deadlock, persistenza bookmark multi-documento e isolamento audio su cambio documento)
 - **`test_plugin_contract_and_isolation.py`**: **7 PASSED / 0 FAILED** (Contratto ToolRegistry, isolamento per profilo, privacy Ollama, assenza fallback fake citations, convalida stringhe profilo, gestione errori sintesi e fallimento hardware audio)
 - **`test_router.py`**: **5 PASSED / 0 FAILED** (ModelRouter, routing dinamico, Ollama health e Privacy Guard)
 - **`test_server_api.py`**: **6 PASSED / 0 FAILED** (API REST FastAPI del server vocale)
-- **Totale**: **29 PASSED / 0 FAILED** (100% in 41.74s)
+- **Totale**: **32 PASSED / 0 FAILED** (100% in 86.46s)
 
 ---
 
@@ -660,6 +660,15 @@ A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono
 170. **Completamento del Bundle Web Dashboard e Contratto Manifest (`plugins/voice-document-assistant/dashboard/`)**:
     - *Problema*: (Rilievo Codex Round 2 P2) La directory `dashboard/` conteneva unicamente il router API Python `plugin_api.py` e un `manifest.json` privo dei puntatori ad asset web compilati (`entry` e `css`), impedendo il caricamento dell'interfaccia nella dashboard web via `GET /api/dashboard/plugins`.
     - *Risoluzione*: Generato il foglio di stile dedicato `dashboard/dist/style.css` e il bundle JavaScript IIFE `dashboard/dist/index.js`, che consuma `window.__HERMES_PLUGIN_SDK__` e si registra su `window.__HERMES_PLUGINS__.register("voice-document-assistant", VoiceDocumentDashboard)`. Aggiornato `manifest.json` con `"entry": "dist/index.js"` e `"css": "dist/style.css"`, completando al 100% il contratto dashboard sia per l'ambiente desktop Electron che per la web dashboard.
+171. **Verifica Rigorosa delle Affermazioni Citate contro Allucinazioni Parziali e N-Grammi Permissivi (`hermes_voice/agents/verifier.py`, `plugins/voice-document-assistant/tests/test_agents.py`)**:
+    - *Problema*: (Rilievo Codex Round 3 P1) Nel verificare le citazioni, il ramo n-gramma approvava la citazione non appena riscontrava 4 parole consecutive coincidenti nella pagina reale (`found_ngram = True`). Di conseguenza, una risposta contenente conclusioni o asserzioni completamente allucinate unite a una frase lecita di 4 parole otteneva `is_valid=True`, certificando come grounded risposte parzialmente o totalmente inventate.
+    - *Risoluzione*: Sostituita la logica a singolo n-gramma con un controllo rigoroso a livello di clausola: `verifier.py` scompone il testo citato nelle sue proposizioni logiche e sub-clausole (`re.split` su congiunzioni avversative e punteggiatura) e verifica che ciascuna proposizione significativa sia supportata dal testo della pagina reale. Se una qualsiasi proposizione risulta non attestata (< 50% di overlap lessicale), viene registrata come affermazione non supportata in `unsupported_claims` e la risposta viene respinta (`is_valid=False`). Inoltre, viene richiesta una copertura complessiva del testo citato di almeno l'85%. Validato con test unitario dedicato in `test_agents.py`.
+172. **Arresto e Join Precedente del Worker prima della Commutazione Documentale (`hermes_voice/player.py`, `plugins/voice-document-assistant/tests/test_player.py`)**:
+    - *Problema*: (Rilievo Codex Round 3 P1) In `load_document()`, `self.stop()` veniva invocato all'interno del blocco `with self._lock:`. Poiché il worker thread precedente necessitava del lock per completare l'iterazione, `stop()` andava in timeout dopo 1.5 secondi e `load_document` rimpiazzava il documento (`self._document = document`) mentre il worker precedente stava ancora sintetizzando audio. Al termine della sintesi, il vecchio worker assegnava `self._current_audio = audio_data`, causando una fuga di audio del documento precedente che veniva riprodotto sul nuovo documento.
+    - *Risoluzione*: Riorganizzato `load_document`: `self.stop()` viene eseguito al di fuori di qualsiasi lock e attende fino a 3.0 secondi la completa terminazione del worker precedente; in caso di mancato arresto, solleva `RuntimeError` senza procedere all'attivazione del nuovo documento. Inoltre, in `_run_audio_playback()` e `_run_virtual_playback()`, l'assegnazione di `_current_audio` e l'avanzamento dei chunk verificano atomicamente che `self._document and self._document.doc_id == sentence.doc_id`, impedendo in modo assoluto qualsiasi sovrascrittura o leak audio tra documenti differenti. Aggiunto unit test dedicato `test_player_load_document_waits_for_previous_worker_without_audio_leak`.
+173. **Persistenza e Ripristino dei Segnalibri Multi-Documento per la Libreria (`hermes_voice/player.py`, `plugins/voice-document-assistant/tests/test_player.py`)**:
+    - *Problema*: (Rilievo Codex Round 3 P2) Il file `reading_state.json` salvava un unico segnalibro globale. Quando un utente passava dal documento A al documento B e poi tornava al documento A, il segnalibro di A era stato sovrascritto da quello di B; il controllo su `doc_id` rilevava la discrepanza e resettava sempre la lettura di A alla prima pagina/frase, azzerando la cronologia di lettura.
+    - *Risoluzione*: Aggiornati `_save_bookmark()` e `load_document()` in `player.py`: `reading_state.json` mantiene ora una mappa persistente `bookmarks: { <doc_id>: <ReadingBookmark> }`, oltre a preservare i campi del segnalibro attivo a livello root per retrocompatibilità. Al caricamento di qualsiasi documento della libreria, `load_document()` recupera il segnalibro specifico di quel `doc_id`, ripristinando fedelmente pagina e offset di lettura indipendentemente dal numero di documenti alternati. Validato con il test unitario `test_player_switching_documents_preserves_independent_bookmarks`.
 
 
 
