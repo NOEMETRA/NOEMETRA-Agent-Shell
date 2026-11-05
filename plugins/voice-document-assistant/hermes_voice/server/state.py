@@ -26,14 +26,41 @@ def get_assistant(
     prof_dir = resolve_voice_profile_dir(profile=profile, home_dir=home_dir)
     canonical_key = str(prof_dir.resolve())
 
+    # Resolve actual profile identity rather than deriving from directory basename (AGENTS.md:13)
+    resolved_profile = (profile or "").strip().lower()
+    if not resolved_profile:
+        try:
+            from hermes_cli.profiles import current_profile_name, _get_default_hermes_home, _get_profiles_root
+            default_home = _get_default_hermes_home().resolve()
+            profiles_root = _get_profiles_root().resolve()
+            home_resolved = prof_dir.parent.resolve()
+            if home_resolved == default_home:
+                resolved_profile = "default"
+            elif home_resolved.is_relative_to(profiles_root):
+                rel_parts = home_resolved.relative_to(profiles_root).parts
+                if rel_parts:
+                    resolved_profile = rel_parts[0].lower()
+            else:
+                curr = current_profile_name()
+                resolved_profile = curr.lower() if curr else "default"
+        except Exception:
+            pass
+
+    if not resolved_profile:
+        resolved_profile = (
+            os.environ.get("HERMES_PROFILE_NAME")
+            or os.environ.get("HERMES_PROFILE")
+            or "default"
+        ).strip().lower()
+
     with _lock:
         if canonical_key not in _assistants:
-            logger.info("Inizializzazione HermesVoiceAssistant per identità '%s'...", canonical_key)
+            logger.info("Inizializzazione HermesVoiceAssistant per identità '%s' (profilo: %s)...", canonical_key, resolved_profile)
             _assistants[canonical_key] = HermesVoiceAssistant(
                 bookmark_path=prof_dir / "reading_state.json",
                 library_path=prof_dir / "voice_library.json",
                 cache_dir=prof_dir / "audio_cache",
-                profile=profile or prof_dir.parent.name,
+                profile=resolved_profile,
                 home_dir=prof_dir.parent,
             )
         return _assistants[canonical_key]
