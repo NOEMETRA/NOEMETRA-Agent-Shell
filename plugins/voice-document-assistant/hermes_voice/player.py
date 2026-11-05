@@ -408,6 +408,7 @@ class DocumentPlayer:
                         break
 
                     sentence = self._document.all_sentences[self._current_sent_idx]
+                    current_doc_id = self._document.doc_id
                     effective_speed = self._speed
 
                 if self.on_sentence_change:
@@ -422,7 +423,7 @@ class DocumentPlayer:
                         audio_data, sr = self.tts.synthesize(sentence.text)
                         with self._lock:
                             # Verify document has not changed while synthesizing
-                            if self._document and self._document.doc_id == sentence.doc_id:
+                            if self._document and self._document.doc_id == current_doc_id:
                                 self._current_audio = audio_data
                                 self._current_sr = sr
                     except Exception as e:
@@ -506,6 +507,7 @@ class DocumentPlayer:
                         break
 
                     sentence = self._document.all_sentences[self._current_sent_idx]
+                    current_doc_id = self._document.doc_id
                     effective_speed = self._speed
 
                 if self.on_sentence_change:
@@ -519,7 +521,7 @@ class DocumentPlayer:
                     try:
                         audio_data, sr = self.tts.synthesize(sentence.text)
                         with self._lock:
-                            if self._document and self._document.doc_id == sentence.doc_id:
+                            if self._document and self._document.doc_id == current_doc_id:
                                 self._current_audio = audio_data
                                 self._current_sr = sr
                     except Exception as e:

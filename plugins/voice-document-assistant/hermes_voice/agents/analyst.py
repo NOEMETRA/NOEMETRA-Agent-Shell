@@ -121,8 +121,8 @@ class AnalystAgent:
             if not matches:
                 continue
 
-            # Check for explicit quotation marks inside this claim first
-            quoted = re.findall(r'["«\']([^"»\']{8,})["»\']', s)
+            # Check for explicit quotation marks inside this claim first (excluding apostrophes which occur in Italian words like dell'interazione)
+            quoted = re.findall(r'["“«]([^"”»\n]{8,})["”»]', s)
             if quoted:
                 claim_text = quoted[0].strip()
             else:
