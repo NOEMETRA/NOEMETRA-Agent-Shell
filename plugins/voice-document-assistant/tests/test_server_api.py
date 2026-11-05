@@ -531,5 +531,51 @@ def test_models_endpoint_dispatched():
     assert "allow_remote" in data
 
 
+def test_custom_homes_with_same_basename_are_strictly_isolated(tmp_path):
+    """Verify that multiple custom homes sharing the same basename are not dropped or conflated (AGENTS.md:13)."""
+    from hermes_voice.profile import (
+        clear_registered_served_profile_homes,
+        register_served_profile_home,
+        validate_path_profile_ownership,
+    )
+
+    home_1 = tmp_path / "tenant_alpha" / "workspace"
+    home_2 = tmp_path / "tenant_beta" / "workspace"
+    home_1.mkdir(parents=True, exist_ok=True)
+    home_2.mkdir(parents=True, exist_ok=True)
+
+    pdf_in_1 = home_1 / "doc1.pdf"
+    pdf_in_2 = home_2 / "doc2.pdf"
+    create_sample_italian_pdf(pdf_in_1)
+    create_sample_italian_pdf(pdf_in_2)
+
+    clear_registered_served_profile_homes()
+    # Register both homes which share basename 'workspace'
+    register_served_profile_home(home_1, "workspace")
+    register_served_profile_home(home_2, "workspace")
+
+    # Home 1 can access its own file
+    validate_path_profile_ownership(pdf_in_1, home_dir=home_1)
+
+    # Home 1 CANNOT access home 2's file despite identical basename
+    with pytest.raises(PermissionError) as exc_1:
+        validate_path_profile_ownership(pdf_in_2, home_dir=home_1)
+    assert "outside the authorized home directory" in str(exc_1.value)
+
+    # Home 2 can access its own file
+    validate_path_profile_ownership(pdf_in_2, home_dir=home_2)
+
+    # Home 2 CANNOT access home 1's file
+    with pytest.raises(PermissionError) as exc_2:
+        validate_path_profile_ownership(pdf_in_1, home_dir=home_2)
+    assert "outside the authorized home directory" in str(exc_2.value)
+
+    # Also test when passed via served_homes iterable
+    clear_registered_served_profile_homes()
+    with pytest.raises(PermissionError):
+        validate_path_profile_ownership(pdf_in_2, home_dir=home_1, served_homes=[home_1, home_2])
+
+
+
 
 

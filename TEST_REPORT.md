@@ -40,14 +40,14 @@ I test sono stati eseguiti con `uv run --group dev pytest`.
   - Deallogazione risorse e chiusura pulita dei processi orfani.
 
 ### 2.4 Suite Voice Document Assistant (`plugins/voice-document-assistant/tests/`)
-- **`test_agents.py`**: **7 PASSED / 0 FAILED** (Verifica triade Librarian, Analyst, Verifier e rigetto conclusioni fabbricate su n-grammi parziali)
+- **`test_agents.py`**: **10 PASSED / 0 FAILED** (Verifica triade Librarian, Analyst, Verifier e rigetto conclusioni fabbricate su n-grammi parziali)
 - **`test_end_to_end.py`**: **1 PASSED / 0 FAILED** (Verifica pipeline end-to-end con Ollama locale `gemma4:12b`)
 - **`test_extractor.py`**: **2 PASSED / 0 FAILED** (Estrazione deterministica PDF e bounding box)
 - **`test_player.py`**: **4 PASSED / 0 FAILED** (Player audio, pause/resume, assenza deadlock, persistenza bookmark multi-documento e isolamento audio su cambio documento)
-- **`test_plugin_contract_and_isolation.py`**: **7 PASSED / 0 FAILED** (Contratto ToolRegistry, isolamento per profilo, privacy Ollama, assenza fallback fake citations, convalida stringhe profilo, gestione errori sintesi e fallimento hardware audio)
-- **`test_router.py`**: **7 PASSED / 0 FAILED** (ModelRouter, routing dinamico, Ollama health, Privacy Guard, selezione dinamica modello da config e fallback sui modelli installati)
-- **`test_server_api.py`**: **14 PASSED / 0 FAILED** (API REST FastAPI del server vocale, rigetto 403 in contesto unbound e cross-profile, streaming audio WAV e JSON base64, preservazione home per grant nativi custom, recovery dipendenze mancanti, chiave unificata assistenti su home canonica e preservazione percorsi override)
-- **Totale**: **41 PASSED / 0 FAILED** (100% in 71.10s)
+- **`test_plugin_contract_and_isolation.py`**: **12 PASSED / 0 FAILED** (Contratto ToolRegistry, isolamento per profilo, privacy Ollama, assenza fallback fake citations, convalida stringhe profilo, gestione errori sintesi e fallimento hardware audio)
+- **`test_router.py`**: **17 PASSED / 0 FAILED** (ModelRouter, routing dinamico, Ollama health, Privacy Guard, selezione dinamica modello da config, fallback modelli installati e blocco reindirizzamenti cross-origin credential leak)
+- **`test_server_api.py`**: **20 PASSED / 0 FAILED** (API REST FastAPI del server vocale, rigetto 403 in contesto unbound e cross-profile, streaming audio WAV e JSON base64, preservazione home per grant nativi custom, recovery dipendenze mancanti, chiave unificata assistenti su home canonica, preservazione percorsi override, isolamento custom homes con identico basename e asincronia get_models)
+- **Totale**: **66 PASSED / 0 FAILED** (100%)
 
 ---
 
@@ -807,6 +807,13 @@ A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono
 219. **Scoping di Profilo e Autenticazione Session Token nei Download Audio della Dashboard (`dashboard/dist/index.js`)**:
     - *Problema*: (Rilievo Codex Round 18 P1) La dashboard web istanziava la riproduzione sonora passando direttamente l'URL grezzo `/api/plugins/voice-document-assistant/audio/sentence/${currentSentIdx}` al costruttore `new Audio(...)`. Questa richiesta GET del browser bypassava `fetchJSON`: (1) ometteva il parametro di scoping `?profile=<name>` quando la dashboard gestiva un profilo secondario, causando il download dell'audio dal profilo primario anziché da quello selezionato in contrasto con AGENTS.md:13; (2) ometteva l'header di sessione token (`__HERMES_SESSION_TOKEN__`) richiesto dalle dashboard protette.
     - *Risoluzione*: Il download dei frammenti audio nella web dashboard viene ora effettuato tramite `fetchJSON('/api/plugins/voice-document-assistant/audio/sentence/${currentSentIdx}?format=json')`. In questo modo la richiesta eredita automaticamente lo scope del profilo attivo, le credenziali e i token di sessione autenticati. Al completamento del fetch autenticato e verificato l'id generazionale, l'audio viene istanziato localmente tramite data URI `data:audio/wav;base64,...`.
+220. **Preservazione di Tutte le Home Servite nella Verifica di Proprietà Tramite Percorso Canonico (`hermes_voice/profile.py`, `test_server_api.py`)**:
+    - *Problema*: (Rilievo Codex Round 18 P1) Nel verificare i confini di isolamento tra profili, `all_profile_homes` teneva traccia delle home servite mediante una mappa indicizzata per nome di profilo/basename stringa (`dict[str, Path]`). Quando due o più sessioni operavano con directory home personalizzate aventi lo stesso basename (es. `/tmp/tenant1/workspace` e `/tmp/tenant2/workspace`), la seconda home veniva scartata o sovrascritta. Una chiamata tool dal primo profilo poteva pertanto caricare ed accedere a file PDF appartenenti alla seconda home aggirando i vincoli di isolamento di AGENTS.md:13.
+    - *Risoluzione*: Aggiornato `profile.py` tracciando tutte le home attive e servite mediante il loro percorso canonico univoco (`all_homes_by_path: dict[Path, str]`). Due home custom distinte con basename identico vengono entrambe preservate e verificate come confini invalicabili (`other_home != caller_home`). Validato con unit test `test_custom_homes_with_same_basename_are_strictly_isolated`.
+221. **Blocco dei Reindirizzamenti Cross-Origin e Tutela delle Credenziali di Provider Remoti (`hermes_voice/model_router.py`, `test_router.py`)**:
+    - *Problema*: (Rilievo Codex Round 18 P1) Nei metodi `_call_openai_compatible` e `_call_anthropic` di `ModelRouter`, quando l'accesso a provider remoti era abilitato (`allow_remote=True`), un eventuale reindirizzamento HTTP 301/302/307/308 restituito dall'endpoint re-inoltrava incondizionatamente sia il testo riservato del documento sia le credenziali autenticate (`Authorization: Bearer <token>` o `x-api-key`) al nuovo host di destinazione, esponendo le credenziali e i dati utente a leakage verso terze parti in violazione dei requisiti di sicurezza.
+    - *Risoluzione*: Introdotta la verifica dell'origine di destinazione (`orig_origin == target_origin`) su tutti i percorsi di reindirizzamento HTTP in `model_router.py`. Se l'endpoint tenta un reindirizzamento verso un host, porta o schema differente (`orig_origin != target_origin`), la richiesta viene bloccata immediatamente con `PermissionError` prevenendo qualsiasi inoltro di token bearer, API key o payload documentali. Validato con unit test `test_openai_blocks_cross_origin_redirect_even_when_remote_allowed` e `test_anthropic_blocks_cross_origin_redirect_even_when_remote_allowed`.
+
 
 
 

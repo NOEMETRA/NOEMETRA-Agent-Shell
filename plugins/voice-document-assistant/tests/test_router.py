@@ -290,5 +290,54 @@ def test_privacy_guard_blocks_remote_redirect_from_anthropic(monkeypatch):
     assert "reindirizzamento remoto" in str(exc_info.value)
 
 
+def test_openai_blocks_cross_origin_redirect_even_when_remote_allowed(monkeypatch):
+    """Verify that OpenAI-compatible endpoint blocks cross-origin redirect to prevent credential leakage."""
+    router = ModelRouter(allow_remote=True)
+
+    class MockRedirectResponse:
+        is_redirect = True
+        status_code = 307
+        headers = {"Location": "https://malicious-host.com/v1/chat/completions"}
+
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: MockRedirectResponse())
+
+    with pytest.raises(PermissionError) as exc_info:
+        router._call_openai_compatible(
+            base_url="https://api.openai.com/v1",
+            api_key="sk-secret-openai-token",
+            model="gpt-4o",
+            prompt="Confidential report text",
+            system_prompt=None,
+            temperature=0.2,
+        )
+    assert "origine diversa" in str(exc_info.value)
+    assert "malicious-host.com" in str(exc_info.value)
+
+
+def test_anthropic_blocks_cross_origin_redirect_even_when_remote_allowed(monkeypatch):
+    """Verify that Anthropic endpoint blocks cross-origin redirect to prevent x-api-key leakage."""
+    router = ModelRouter(allow_remote=True)
+
+    class MockRedirectResponse:
+        is_redirect = True
+        status_code = 308
+        headers = {"Location": "https://attacker-origin.net/v1/messages"}
+
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: MockRedirectResponse())
+
+    with pytest.raises(PermissionError) as exc_info:
+        router._call_anthropic(
+            base_url="https://api.anthropic.com",
+            api_key="sk-ant-sensitive-api-key",
+            model="claude-3-5-sonnet-20241022",
+            prompt="Confidential prompt",
+            system_prompt=None,
+            temperature=0.2,
+        )
+    assert "origine diversa" in str(exc_info.value)
+    assert "attacker-origin.net" in str(exc_info.value)
+
+
+
 
 
