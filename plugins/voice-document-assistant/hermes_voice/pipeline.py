@@ -36,7 +36,7 @@ from hermes_voice.models import (
 )
 from hermes_voice.model_router import ModelRouter
 from hermes_voice.player import DocumentPlayer
-from hermes_voice.profile import resolve_voice_profile_dir
+from hermes_voice.profile import resolve_voice_profile_dir, validate_path_profile_ownership
 from hermes_voice.tts_engine import PocketTTSEngine
 
 logger = logging.getLogger(__name__)
@@ -164,6 +164,7 @@ class HermesVoiceAssistant:
 
     def load_document(self, file_path: Union[str, Path], resume_bookmark: bool = True) -> ReadingBookmark:
         """Extract PDF document and set up player and agents atomically."""
+        validate_path_profile_ownership(file_path, profile=self.profile, home_dir=self.home_dir)
         with self._activation_lock:
             logger.info(f"Caricamento documento da '{file_path}'...")
             doc = self.extractor.extract(file_path)

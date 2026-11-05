@@ -194,3 +194,64 @@ def test_player_audio_stream_failure_preserves_sentence_index():
             # Verify sentence index was NOT advanced
             assert player.current_sentence_index == 0
 
+
+def test_voice_load_document_rejects_cross_profile_path():
+    """Verify voice_load_document tool blocks loading a PDF belonging to another profile (P1)."""
+    reset_assistants()
+    victim_dir = resolve_voice_profile_dir("victim_profile")
+    victim_pdf = victim_dir / "secret.pdf"
+    create_sample_italian_pdf(victim_pdf)
+    try:
+        # Caller is default profile assistant
+        res = json.loads(voice_load_document({"pdf_path": str(victim_pdf.resolve())}))
+        assert "error" in res
+        assert "Access denied" in res["error"]
+        assert "victim_profile" in res["error"]
+    finally:
+        if victim_pdf.exists():
+            victim_pdf.unlink()
+
+
+def test_named_profile_can_load_own_file():
+    """Verify that a named profile can load a PDF located in its own profile directory without default-home collision (P2)."""
+    from hermes_voice.profile import validate_path_profile_ownership, resolve_voice_profile_dir
+
+    named_prof = "custom_named_profile"
+    prof_dir = resolve_voice_profile_dir(named_prof)
+    my_pdf = prof_dir / "my_report.pdf"
+    create_sample_italian_pdf(my_pdf)
+    try:
+        # Must not raise PermissionError
+        validate_path_profile_ownership(my_pdf, profile=named_prof)
+    finally:
+        if my_pdf.exists():
+            my_pdf.unlink()
+
+
+def test_client_playback_does_not_advance_on_audio_fetch():
+    """Verify that fetching audio for a sentence does NOT mark the playback clock as started (P2)."""
+    from hermes_voice.extractor import DocumentExtractor
+    from hermes_voice.player import DocumentPlayer
+    from hermes_voice.tts_engine import PocketTTSEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc.pdf"
+        bm_path = Path(tmpdir) / "state.json"
+        create_sample_italian_pdf(pdf_path)
+        doc = DocumentExtractor().extract(pdf_path)
+
+        player = DocumentPlayer(tts_engine=PocketTTSEngine(lazy_load=True), bookmark_path=bm_path, virtual_playback=True)
+        player.load_document(doc)
+        player.client_playback = True
+
+        # Fetch sentence audio
+        wav = player.get_sentence_audio_wav(0)
+        assert len(wav) > 0
+        # Started event must NOT be set simply by fetching audio
+        assert not player._client_started_event.is_set()
+
+        # Started event is only set when client explicitly sends started ack
+        player.handle_client_ack(0, "started")
+        assert player._client_started_event.is_set()
+
+
