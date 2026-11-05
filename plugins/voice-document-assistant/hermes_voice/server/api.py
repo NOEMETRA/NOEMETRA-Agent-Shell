@@ -59,19 +59,15 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
         p = Path(prof_id)
         if p.is_absolute() or "\\" in prof_id or "/" in prof_id or p.exists():
             resolved = p.resolve()
-            if "profiles" in resolved.parts:
-                bound_profile = resolved.name
-                authorized_home = resolved
-            else:
-                try:
-                    from hermes_cli.profiles import _get_default_hermes_home
-                    if resolved == _get_default_hermes_home().resolve():
-                        bound_profile = "default"
-                except Exception:
-                    pass
-                authorized_home = resolved
+            authorized_home = resolved
+            bound_profile = resolved.name if PROFILE_ID_RE.match(resolved.name.lower()) else "default"
         elif PROFILE_ID_RE.match(prof_id.lower()):
             bound_profile = prof_id.lower()
+            try:
+                from hermes_cli.profiles import get_profile_dir
+                authorized_home = get_profile_dir(bound_profile).resolve()
+            except Exception:
+                pass
 
     if not authorized_home and not bound_profile:
         try:
@@ -79,17 +75,8 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
             home_override = get_hermes_home_override()
             if home_override:
                 resolved = Path(home_override).resolve()
-                if "profiles" in resolved.parts:
-                    bound_profile = resolved.name
-                    authorized_home = resolved
-                else:
-                    try:
-                        from hermes_cli.profiles import _get_default_hermes_home
-                        if resolved == _get_default_hermes_home().resolve():
-                            bound_profile = "default"
-                    except Exception:
-                        pass
-                    authorized_home = resolved
+                authorized_home = resolved
+                bound_profile = resolved.name if PROFILE_ID_RE.match(resolved.name.lower()) else "default"
         except Exception:
             pass
 

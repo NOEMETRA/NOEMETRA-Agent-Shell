@@ -34,13 +34,9 @@ def resolve_voice_profile_dir(
             from hermes_constants import get_hermes_home_override
             home_override = get_hermes_home_override()
             if home_override:
-                ov_path = Path(home_override).resolve()
-                if "profiles" in ov_path.parts:
-                    prof = ov_path.name
-                else:
-                    target_dir = ov_path / "voice_assistant"
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    return target_dir
+                target_dir = Path(home_override).resolve() / "voice_assistant"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                return target_dir
         except Exception:
             pass
 

@@ -256,3 +256,39 @@ def test_missing_dependencies_status_endpoint_returns_json():
     assert res.json()["error"] == "missing_dependencies"
     assert "pymupdf" in res.json()["detail"]
 
+
+def test_state_keys_assistants_consistently_across_name_and_home_dir():
+    """Verify that accessing by profile name and by authorized home path returns the identical singleton instance."""
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_voice.server.state import get_assistant, reset_assistants
+
+    profile_name = "test_unified_identity"
+    home_dir = get_profile_dir(profile_name)
+
+    reset_assistants(profile_name)
+    try:
+        ast_by_name = get_assistant(profile=profile_name)
+        ast_by_home = get_assistant(home_dir=home_dir)
+        assert ast_by_name is ast_by_home
+        assert ast_by_name.library_path == home_dir / "voice_assistant" / "voice_library.json"
+    finally:
+        reset_assistants(profile_name)
+
+
+def test_scoped_home_with_profiles_segment_preserves_full_override_path():
+    """Verify that a scoped home containing a 'profiles' path segment preserves the override path."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        override_root = Path(tmpdir) / "other_root" / "profiles" / "tenant_alice"
+        override_root.mkdir(parents=True, exist_ok=True)
+
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_voice.profile import resolve_voice_profile_dir
+
+        token = set_hermes_home_override(str(override_root))
+        try:
+            target_dir = resolve_voice_profile_dir()
+            assert target_dir == override_root.resolve() / "voice_assistant"
+            assert str(override_root.resolve()) in str(target_dir)
+        finally:
+            reset_hermes_home_override(token)
+
