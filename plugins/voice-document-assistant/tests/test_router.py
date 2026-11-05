@@ -209,12 +209,86 @@ def test_remote_provider_settings_populated_from_config(monkeypatch):
         captured["prompt"] = prompt
         return "Anthropic Response"
 
-    monkeypatch.setattr(router, "_call_openai_compatible", mock_call)
+    monkeypatch.setattr(router, "_call_anthropic", mock_call)
     res = router.generate(prompt="What is the summary?")
     assert res == "Anthropic Response"
     assert captured["base_url"] == "https://api.custom-anthropic.com/v1"
     assert captured["api_key"] == "sk-ant-test-key-12345"
     assert captured["model"] == "claude-3-5-sonnet-20241022"
+
+
+def test_call_anthropic_payload_and_headers(monkeypatch):
+    """Verify _call_anthropic sends required Anthropic Messages API headers and payload format."""
+    router = ModelRouter(allow_remote=True)
+
+    sent_requests = []
+
+    class MockAnthropicResponse:
+        is_redirect = False
+        status_code = 200
+
+        def json(self):
+            return {
+                "id": "msg_0123",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Anthropic document answer."}
+                ],
+            }
+
+    def mock_post(url, headers=None, json=None, **kwargs):
+        sent_requests.append({"url": url, "headers": headers, "json": json})
+        return MockAnthropicResponse()
+
+    monkeypatch.setattr("requests.post", mock_post)
+
+    result = router._call_anthropic(
+        base_url="https://api.anthropic.com",
+        api_key="sk-ant-api03-test",
+        model="claude-3-5-sonnet-20241022",
+        prompt="Spiega il documento",
+        system_prompt="Sei un assistente documentale preciso.",
+        temperature=0.3,
+    )
+
+    assert result == "Anthropic document answer."
+    assert len(sent_requests) == 1
+    req = sent_requests[0]
+    assert req["url"] == "https://api.anthropic.com/v1/messages"
+    assert req["headers"]["x-api-key"] == "sk-ant-api03-test"
+    assert req["headers"]["anthropic-version"] == "2023-06-01"
+    assert req["headers"]["Content-Type"] == "application/json"
+    assert req["json"]["model"] == "claude-3-5-sonnet-20241022"
+    assert req["json"]["system"] == "Sei un assistente documentale preciso."
+    assert req["json"]["messages"] == [{"role": "user", "content": "Spiega il documento"}]
+    assert req["json"]["temperature"] == 0.3
+    assert req["json"]["max_tokens"] == 1024
+
+
+def test_privacy_guard_blocks_remote_redirect_from_anthropic(monkeypatch):
+    """Verify that Anthropic endpoint redirect to remote host is intercepted and blocked."""
+    router = ModelRouter(allow_remote=False)
+
+    class MockRedirectResponse:
+        is_redirect = True
+        status_code = 308
+        headers = {"Location": "https://malicious-external-sink.com/messages"}
+
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: MockRedirectResponse())
+
+    with pytest.raises(PermissionError) as exc_info:
+        router._call_anthropic(
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="local-key",
+            model="local-claude",
+            prompt="Sensitive document text",
+            system_prompt=None,
+            temperature=0.2,
+        )
+    assert "VIOLAZIONE VINCOLO PRIVACY" in str(exc_info.value)
+    assert "reindirizzamento remoto" in str(exc_info.value)
+
 
 
 

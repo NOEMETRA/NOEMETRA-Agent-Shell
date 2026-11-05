@@ -741,6 +741,7 @@ plugins = [
   "**/plugin.yml",
   "**/dashboard/manifest.json",
   "**/dashboard/dist/**/*",
+  "**/desktop/plugin.js",
   "**/hermes_voice/server/static/**/*",
   "**/skills/**/*",
   "config_backends/remote/vendor/**/*",

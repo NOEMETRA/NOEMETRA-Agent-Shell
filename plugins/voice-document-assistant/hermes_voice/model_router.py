@@ -291,6 +291,16 @@ class ModelRouter:
                 else:
                     target_model = "gpt-4o-mini"
 
+            if selected_provider == "anthropic" or "anthropic.com" in target_url:
+                return self._call_anthropic(
+                    base_url=target_url,
+                    api_key=target_key,
+                    model=target_model,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    temperature=temperature,
+                )
+
             return self._call_openai_compatible(
                 base_url=target_url,
                 api_key=target_key,
@@ -415,3 +425,67 @@ class ModelRouter:
 
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
+
+    def _call_anthropic(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        prompt: str,
+        system_prompt: Optional[str],
+        temperature: float,
+        max_tokens: int = 1024,
+    ) -> str:
+        """Call Anthropic native Messages API endpoint."""
+        clean_url = base_url.rstrip("/")
+        if clean_url.endswith("/messages"):
+            url = clean_url
+        elif clean_url.endswith("/v1"):
+            url = f"{clean_url}/messages"
+        else:
+            url = f"{clean_url}/v1/messages"
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        payload: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
+        if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+            redirect_target = urljoin(url, resp.headers.get("Location", ""))
+            if not is_local_endpoint(redirect_target) and not self.allow_remote:
+                raise PermissionError(
+                    f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint ha tentato un reindirizzamento remoto verso '{redirect_target}'. "
+                    "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
+                )
+            if is_local_endpoint(redirect_target) or self.allow_remote:
+                resp = requests.post(redirect_target, headers=headers, json=payload, timeout=60.0, allow_redirects=False)
+            else:
+                raise RuntimeError(f"Reindirizzamento non consentito verso {redirect_target}")
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Anthropic API Error {resp.status_code}: {resp.text}")
+
+        data = resp.json()
+        content = data.get("content", [])
+        if isinstance(content, list):
+            text_parts = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            return "".join(text_parts).strip()
+        elif isinstance(content, str):
+            return content.strip()
+        return ""
