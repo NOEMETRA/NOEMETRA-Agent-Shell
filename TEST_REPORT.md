@@ -46,8 +46,8 @@ I test sono stati eseguiti con `uv run --group dev pytest`.
 - **`test_player.py`**: **4 PASSED / 0 FAILED** (Player audio, pause/resume, assenza deadlock, persistenza bookmark multi-documento e isolamento audio su cambio documento)
 - **`test_plugin_contract_and_isolation.py`**: **7 PASSED / 0 FAILED** (Contratto ToolRegistry, isolamento per profilo, privacy Ollama, assenza fallback fake citations, convalida stringhe profilo, gestione errori sintesi e fallimento hardware audio)
 - **`test_router.py`**: **7 PASSED / 0 FAILED** (ModelRouter, routing dinamico, Ollama health, Privacy Guard, selezione dinamica modello da config e fallback sui modelli installati)
-- **`test_server_api.py`**: **10 PASSED / 0 FAILED** (API REST FastAPI del server vocale, rigetto 403 su bypass cross-profile, streaming audio WAV, preservazione home per grant nativi custom ed endpoint di recovery dipendenze mancanti)
-- **Totale**: **38 PASSED / 0 FAILED** (100% in 65.50s)
+- **`test_server_api.py`**: **13 PASSED / 0 FAILED** (API REST FastAPI del server vocale, rigetto 403 su bypass cross-profile, streaming audio WAV, preservazione home per grant nativi custom, endpoint di recovery dipendenze mancanti, chiave unificata assistenti su home canonica e preservazione percorsi override contenenti 'profiles')
+- **Totale**: **40 PASSED / 0 FAILED** (100% in 68.20s)
 
 ---
 
@@ -687,6 +687,12 @@ A seguito dell'esecuzione di `codex exec review` (modello `gpt-6.1-terra`), sono
 179. **Persistenza del Messaggio di Errore nel Fallback delle Dipendenze Mancanti (`dashboard/plugin_api.py`, `plugins/voice-document-assistant/tests/test_server_api.py`)**:
     - *Problema*: (Rilievo Codex Round 4 P2) In `dashboard/plugin_api.py`, nel blocco `except (ImportError, ModuleNotFoundError) as err:`, l'handler `_missing_deps` referenziava direttamente la variabile `err`. In Python 3, la variabile di eccezione viene distrutta al termine del blocco `except`, causando un'eccezione `NameError` a runtime al momento dell'invocazione di `GET /status`.
     - *Risoluzione*: Catturata la stringa di dettaglio dell'errore in una variabile persistente `_missing_err_msg = str(err)` a livello di modulo prima di definire l'handler `_missing_deps`. In questo modo l'endpoint di fallback eroga regolarmente e senza errori la guida per l'installazione delle dipendenze. Validato con unit test `test_missing_dependencies_status_endpoint_returns_json`.
+180. **Preservazione dell'Intero Percorso Scoped per Override Contenenti il Segmento 'profiles' (`hermes_voice/profile.py`, `hermes_voice/server/api.py`, `plugins/voice-document-assistant/tests/test_server_api.py`)**:
+    - *Problema*: (Rilievo Codex Round 5 P1) In `profile.py`, quando `home_override` o un ticket conteneva una directory denominata `profiles` (es. `/custom-root/profiles/alice`), la logica estraeva il `name` (`alice`) e lo risolveva sotto la directory standard dei profili (`~/.hermes/profiles/alice`), violando l'isolamento della tenancy (`AGENTS.md:13`).
+    - *Risoluzione*: Eliminata la riduzione arbitraria a nome: qualsiasi override contestuale `home_override` o identificatore di percorso in `native_http_principal` viene preservato integralmente e risolto nel percorso effettivo (`<override_path>/voice_assistant/`), garantendo isolamento assoluto. Validato con unit test dedicato `test_scoped_home_with_profiles_segment_preserves_full_override_path`.
+181. **Chiave Unica Canonica su Home Risolta per le Istanze Assistant (`hermes_voice/server/state.py`, `plugins/voice-document-assistant/tests/test_server_api.py`)**:
+    - *Problema*: (Rilievo Codex Round 5 P2) Quando una richiesta della dashboard identificava un profilo tramite il suo percorso home (`home_dir`), mentre un tool vocale accedeva allo stesso profilo per nome (`profile`), `state.py` generava due chiavi distinte (`home:<path>` e `<name>`), instanziando due assistenti separati concorrenti per gli stessi file con rischio di disallineamento dello stato di lettura e sovrascrittura concorrente della libreria.
+    - *Risoluzione*: Entrambe le modalità vengono risolte nella directory canonica di storage tramite `resolve_voice_profile_dir(profile=profile, home_dir=home_dir)` e indicizzate univocamente su `canonical_key = str(prof_dir.resolve())`. In questo modo ogni profilo condivide un'unica istanza singleton in memoria su tutte le superfici operative (desktop, web e agent loop). Validato con unit test `test_state_keys_assistants_consistently_across_name_and_home_dir`.
 
 
 
