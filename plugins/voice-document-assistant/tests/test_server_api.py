@@ -310,3 +310,35 @@ def test_scoped_home_with_profiles_segment_preserves_full_override_path():
         finally:
             reset_hermes_home_override(token)
 
+
+def test_authorized_default_profile_selector_accepted():
+    """Verify that an explicitly selected default profile is accepted on the default home."""
+    res_hdr = client.get(
+        "/api/plugins/voice-document-assistant/status",
+        headers={"X-Hermes-Profile": "default"},
+    )
+    assert res_hdr.status_code == 200
+
+    res_query = client.get(
+        "/api/plugins/voice-document-assistant/status?profile=default",
+    )
+    assert res_query.status_code == 200
+
+
+def test_client_playback_mode_selection():
+    """Verify that /playback/play with output='client' configures client_playback mode."""
+    assistant = get_assistant()
+    if not assistant.current_document:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "doc.pdf"
+            create_sample_italian_pdf(pdf_path)
+            assistant.load_document(pdf_path)
+
+    res = client.post(
+        "/api/plugins/voice-document-assistant/playback/play",
+        json={"output": "client"},
+    )
+    assert res.status_code == 200
+    assert assistant.player.client_playback is True
+    assistant.player.stop()
+

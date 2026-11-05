@@ -448,15 +448,44 @@ function VoiceDocumentPage({ ctx }) {
                 const audioData = await ctx.rest(`/audio/sentence/${s.current_sentence_index}?format=json`)
                 if (audioData && audioData.audio_base64) {
                   const audio = new Audio(`data:audio/wav;base64,${audioData.audio_base64}`)
+                  if (s.speed) {
+                    audio.playbackRate = s.speed
+                  }
+                  const startOffset = s.audio_seconds_offset || 0
+                  if (startOffset > 0.05) {
+                    const setOffset = () => {
+                      try {
+                        if (startOffset < audio.duration) {
+                          audio.currentTime = startOffset
+                        }
+                      } catch (_) {}
+                    }
+                    if (audio.readyState >= 1) {
+                      setOffset()
+                    } else {
+                      audio.addEventListener('loadedmetadata', setOffset, { once: true })
+                    }
+                  }
                   clientAudioRef.current = audio
                   audio.play().catch(() => {})
                 }
               } catch (e) {
                 // audio fetch fallback
               }
-            } else if (clientAudioRef.current && clientAudioRef.current.paused) {
-              // Resume playback of existing audio within the same sentence
-              clientAudioRef.current.play().catch(() => {})
+            } else if (clientAudioRef.current) {
+              // Synchronize speed if changed
+              if (s.speed && clientAudioRef.current.playbackRate !== s.speed) {
+                clientAudioRef.current.playbackRate = s.speed
+              }
+              if (clientAudioRef.current.paused) {
+                // Resume playback of existing audio within the same sentence at current bookmark offset
+                if (s.audio_seconds_offset !== undefined && Math.abs(clientAudioRef.current.currentTime - s.audio_seconds_offset) > 0.3) {
+                  try {
+                    clientAudioRef.current.currentTime = s.audio_seconds_offset
+                  } catch (_) {}
+                }
+                clientAudioRef.current.play().catch(() => {})
+              }
             }
           } else {
             if (clientAudioRef.current && !clientAudioRef.current.paused) {
@@ -515,7 +544,11 @@ function VoiceDocumentPage({ ctx }) {
   // Playback handlers
   const handlePlay = async () => {
     try {
-      await ctx.rest('/playback/play', { method: 'POST' })
+      await ctx.rest('/playback/play', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: { output: 'client' },
+      })
     } catch (err) {
       host.notifyError(err, 'Errore avvio riproduzione audio')
     }
@@ -532,7 +565,11 @@ function VoiceDocumentPage({ ctx }) {
 
   const handleResume = async () => {
     try {
-      await ctx.rest('/playback/resume', { method: 'POST' })
+      await ctx.rest('/playback/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: { output: 'client' },
+      })
     } catch (err) {
       host.notifyError(err, 'Errore ripresa audio')
     }
@@ -601,6 +638,9 @@ function VoiceDocumentPage({ ctx }) {
 
   const handleSpeedChange = async (e) => {
     const speed = parseFloat(e.target.value)
+    if (clientAudioRef.current && !isNaN(speed) && speed > 0) {
+      clientAudioRef.current.playbackRate = speed
+    }
     try {
       await ctx.rest('/playback/config', {
         method: 'POST',

@@ -30,10 +30,31 @@
             lastPlayedSentRef.current = data.current_sentence_index;
             if (clientAudioRef.current) clientAudioRef.current.pause();
             const audio = new Audio("/api/plugins/voice-document-assistant/audio/sentence/" + data.current_sentence_index);
+            if (data.speed) audio.playbackRate = data.speed;
+            const startOffset = data.audio_seconds_offset || 0;
+            if (startOffset > 0.05) {
+              const setOffset = () => {
+                try {
+                  if (startOffset < audio.duration) audio.currentTime = startOffset;
+                } catch (_) {}
+              };
+              if (audio.readyState >= 1) setOffset();
+              else audio.addEventListener("loadedmetadata", setOffset, { once: true });
+            }
             clientAudioRef.current = audio;
             audio.play().catch(() => {});
-          } else if (clientAudioRef.current && clientAudioRef.current.paused) {
-            clientAudioRef.current.play().catch(() => {});
+          } else if (clientAudioRef.current) {
+            if (data.speed && clientAudioRef.current.playbackRate !== data.speed) {
+              clientAudioRef.current.playbackRate = data.speed;
+            }
+            if (clientAudioRef.current.paused) {
+              if (data.audio_seconds_offset !== undefined && Math.abs(clientAudioRef.current.currentTime - data.audio_seconds_offset) > 0.3) {
+                try {
+                  clientAudioRef.current.currentTime = data.audio_seconds_offset;
+                } catch (_) {}
+              }
+              clientAudioRef.current.play().catch(() => {});
+            }
           }
         } else {
           if (clientAudioRef.current && !clientAudioRef.current.paused) {
@@ -69,14 +90,20 @@
     }, [refreshStatus, refreshLibrary]);
 
     const handleAction = async (endpoint, body = {}) => {
-      if (endpoint === "pause" || endpoint === "stop") {
+      const normalizedEndpoint = (endpoint === "play" || endpoint === "pause" || endpoint === "resume" || endpoint === "stop" || endpoint === "seek" || endpoint === "config")
+        ? `playback/${endpoint}`
+        : endpoint;
+      if (normalizedEndpoint === "playback/pause" || normalizedEndpoint === "playback/stop") {
         if (clientAudioRef.current) clientAudioRef.current.pause();
       }
+      const finalBody = (normalizedEndpoint === "playback/play" || normalizedEndpoint === "playback/resume")
+        ? { output: "client", ...body }
+        : body;
       try {
-        await fetchJSON(`/api/plugins/voice-document-assistant/${endpoint}`, {
+        await fetchJSON(`/api/plugins/voice-document-assistant/${normalizedEndpoint}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify(finalBody),
         });
         await refreshStatus();
       } catch (err) {

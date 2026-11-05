@@ -218,17 +218,17 @@ class HermesVoiceAssistant:
 
         return self.load_document(entry.file_path, resume_bookmark=True)
 
-    def play(self) -> ReadingBookmark:
+    def play(self, client_playback: Optional[bool] = None) -> ReadingBookmark:
         """Start or resume deterministic audio reading."""
-        return self.player.play()
+        return self.player.play(client_playback=client_playback)
 
     def pause(self) -> ReadingBookmark:
         """Pause audio reading and record exact position."""
         return self.player.pause()
 
-    def resume(self) -> ReadingBookmark:
+    def resume(self, client_playback: Optional[bool] = None) -> ReadingBookmark:
         """Resume audio reading from exact position."""
-        return self.player.resume()
+        return self.player.resume(client_playback=client_playback)
 
     def stop(self) -> ReadingBookmark:
         """Stop playback."""
