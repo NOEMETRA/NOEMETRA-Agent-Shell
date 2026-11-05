@@ -564,6 +564,9 @@
     const askBtn = document.getElementById('askBtn');
     const privacyConsentToggle = document.getElementById('privacyConsentToggle');
 
+    let clientAudio = null;
+    let lastPlayedSentence = -1;
+
     // API Helper
     async function api(path, options = {}) {
       const res = await fetch(`${API_BASE}${path}`, {
@@ -729,22 +732,92 @@
       privacyConsentToggle.checked = Boolean(s.allow_remote);
       ttsModelSelect.value = s.tts_model || 'italian';
       speedSelect.value = (s.speed || 1.0).toString();
+
+      // Standalone browser client-side audio streaming
+      if (s.state === 'playing') {
+        if (s.current_sentence_index !== lastPlayedSentence) {
+          lastPlayedSentence = s.current_sentence_index;
+          if (clientAudio) {
+            clientAudio.pause();
+            clientAudio = null;
+          }
+          const audio = new Audio(`${API_BASE}/audio/sentence/${s.current_sentence_index}`);
+          if (s.speed) audio.playbackRate = s.speed;
+          const startOffset = s.audio_seconds_offset || 0;
+          if (startOffset > 0.05) {
+            const setOffset = () => {
+              try { if (startOffset < audio.duration) audio.currentTime = startOffset; } catch (_) {}
+            };
+            if (audio.readyState >= 1) setOffset();
+            else audio.addEventListener('loadedmetadata', setOffset, { once: true });
+          }
+          const sentIdx = s.current_sentence_index;
+          audio.addEventListener('play', () => {
+            api('/playback/ack', {
+              method: 'POST',
+              body: JSON.stringify({ sentence_index: sentIdx, event: 'started' })
+            }).catch(() => {});
+          }, { once: true });
+          audio.addEventListener('ended', () => {
+            api('/playback/ack', {
+              method: 'POST',
+              body: JSON.stringify({ sentence_index: sentIdx, event: 'ended' })
+            }).catch(() => {});
+          }, { once: true });
+          clientAudio = audio;
+          audio.play().catch(() => {});
+        } else if (clientAudio) {
+          if (s.speed && clientAudio.playbackRate !== s.speed) {
+            clientAudio.playbackRate = s.speed;
+          }
+          if (clientAudio.paused) {
+            if (s.audio_seconds_offset !== undefined && Math.abs(clientAudio.currentTime - s.audio_seconds_offset) > 0.3) {
+              try { clientAudio.currentTime = s.audio_seconds_offset; } catch (_) {}
+            }
+            clientAudio.play().catch(() => {});
+          }
+        }
+      } else {
+        if (clientAudio && !clientAudio.paused) {
+          clientAudio.pause();
+        }
+        if (s.state === 'stopped' || s.state === 'finished') {
+          lastPlayedSentence = -1;
+          clientAudio = null;
+        }
+      }
     }
 
     // Actions
     async function play() {
-      try { await api('/playback/play', { method: 'POST' }); } catch (err) { alert(err.message); }
+      try {
+        await api('/playback/play', {
+          method: 'POST',
+          body: JSON.stringify({ output: 'client' })
+        });
+      } catch (err) { alert(err.message); }
     }
 
     async function pause() {
+      if (clientAudio) clientAudio.pause();
       try { await api('/playback/pause', { method: 'POST' }); } catch (err) { alert(err.message); }
     }
 
     async function resume() {
-      try { await api('/playback/resume', { method: 'POST' }); } catch (err) { alert(err.message); }
+      try {
+        await api('/playback/resume', {
+          method: 'POST',
+          body: JSON.stringify({ output: 'client' })
+        });
+      } catch (err) { alert(err.message); }
     }
 
     async function stop() {
+      if (clientAudio) {
+        clientAudio.pause();
+        clientAudio = null;
+      }
+      lastPlayedSentence = -1;
       try { await api('/playback/stop', { method: 'POST' }); } catch (err) { alert(err.message); }
     }
 

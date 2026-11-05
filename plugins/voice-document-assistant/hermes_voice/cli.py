@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from hermes_voice.extractor import create_sample_italian_pdf
+from hermes_voice.models import PlayerState
 from hermes_voice.pipeline import HermesVoiceAssistant
 from hermes_voice.tts_engine import PocketTTSEngine
 
@@ -67,6 +68,15 @@ def main() -> None:
     elif args.command == "play":
         bookmark = assistant.play()
         print(f"Riproduzione avviata: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
+        try:
+            print("Riproduzione in corso (premere Ctrl+C per mettere in pausa)...")
+            while assistant.player.state == PlayerState.PLAYING:
+                time.sleep(0.2)
+            if assistant.player.state == PlayerState.FINISHED:
+                print("Lettura del documento completata.")
+        except KeyboardInterrupt:
+            bookmark = assistant.pause()
+            print(f"\nRiproduzione interrotta su frase {bookmark.current_sentence_index + 1}.")
 
     elif args.command == "pause":
         bookmark = assistant.pause()
@@ -77,6 +87,15 @@ def main() -> None:
     elif args.command == "resume":
         bookmark = assistant.resume()
         print(f"Riproduzione ripresa: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
+        try:
+            print("Riproduzione in corso (premere Ctrl+C per mettere in pausa)...")
+            while assistant.player.state == PlayerState.PLAYING:
+                time.sleep(0.2)
+            if assistant.player.state == PlayerState.FINISHED:
+                print("Lettura del documento completata.")
+        except KeyboardInterrupt:
+            bookmark = assistant.pause()
+            print(f"\nRiproduzione interrotta su frase {bookmark.current_sentence_index + 1}.")
 
     elif args.command == "ask":
         # Ensure document is loaded

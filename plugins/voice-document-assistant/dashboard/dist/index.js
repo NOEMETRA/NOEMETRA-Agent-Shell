@@ -41,6 +41,21 @@
               if (audio.readyState >= 1) setOffset();
               else audio.addEventListener("loadedmetadata", setOffset, { once: true });
             }
+            const currentSentIdx = data.current_sentence_index;
+            audio.addEventListener("play", () => {
+              fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ sentence_index: currentSentIdx, event: "started" })
+              }).catch(() => {});
+            }, { once: true });
+            audio.addEventListener("ended", () => {
+              fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ sentence_index: currentSentIdx, event: "ended" })
+              }).catch(() => {});
+            }, { once: true });
             clientAudioRef.current = audio;
             audio.play().catch(() => {});
           } else if (clientAudioRef.current) {

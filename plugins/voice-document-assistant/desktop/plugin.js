@@ -466,6 +466,19 @@ function VoiceDocumentPage({ ctx }) {
                       audio.addEventListener('loadedmetadata', setOffset, { once: true })
                     }
                   }
+                  const currentSentIdx = s.current_sentence_index
+                  audio.addEventListener('play', () => {
+                    ctx.rest('/playback/ack', {
+                      method: 'POST',
+                      body: { sentence_index: currentSentIdx, event: 'started' }
+                    }).catch(() => {})
+                  }, { once: true })
+                  audio.addEventListener('ended', () => {
+                    ctx.rest('/playback/ack', {
+                      method: 'POST',
+                      body: { sentence_index: currentSentIdx, event: 'ended' }
+                    }).catch(() => {})
+                  }, { once: true })
                   clientAudioRef.current = audio
                   audio.play().catch(() => {})
                 }
