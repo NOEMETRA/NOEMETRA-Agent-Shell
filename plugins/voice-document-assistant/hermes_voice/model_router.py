@@ -34,7 +34,7 @@ class ModelRouter:
         self,
         default_provider: str = "ollama",
         ollama_base_url: str = "http://127.0.0.1:11434",
-        ollama_model: str = "gemma4:12b",
+        ollama_model: Optional[str] = None,
         codex_base_url: Optional[str] = None,
         codex_api_key: Optional[str] = None,
         remote_base_url: Optional[str] = None,
@@ -43,7 +43,22 @@ class ModelRouter:
     ):
         self.default_provider = default_provider.lower()
         self.ollama_base_url = ollama_base_url.rstrip("/")
-        self.ollama_model = ollama_model
+
+        # Initialize from configured profile model or fallback to gemma4:12b
+        resolved_model = (ollama_model or "").strip()
+        if not resolved_model:
+            try:
+                from hermes_cli.config import load_config
+                cfg = load_config()
+                model_cfg = cfg.get("model")
+                if isinstance(model_cfg, dict):
+                    resolved_model = model_cfg.get("default") or model_cfg.get("name") or ""
+                elif isinstance(model_cfg, str):
+                    resolved_model = model_cfg
+            except Exception:
+                pass
+
+        self.ollama_model = resolved_model or "gemma4:12b"
         self.codex_base_url = codex_base_url
         self.codex_api_key = codex_api_key
         self.remote_base_url = remote_base_url
@@ -54,6 +69,27 @@ class ModelRouter:
         """Update explicit user authorization for remote network transmission."""
         self.allow_remote = bool(allowed)
         logger.info(f"Autorizzazione provider remoti aggiornata a: {self.allow_remote}")
+
+    def set_model(self, model_name: str) -> None:
+        """Explicitly switch the local model used for question answering."""
+        if model_name and model_name.strip():
+            self.ollama_model = model_name.strip()
+            logger.info("Modello Ollama aggiornato a: %s", self.ollama_model)
+
+    def select_installed_model(self) -> str:
+        """Autodetect and select an installed Ollama model if the configured target model is missing."""
+        health = self.check_ollama_health()
+        if health.get("status") == "online":
+            available = health.get("available_models", [])
+            if available:
+                if not any(self.ollama_model in m for m in available):
+                    logger.info(
+                        "Modello configurato '%s' non trovato in Ollama. Selezione automatica del modello disponibile '%s'",
+                        self.ollama_model,
+                        available[0],
+                    )
+                    self.ollama_model = available[0]
+        return self.ollama_model
 
     def check_ollama_health(self) -> Dict[str, Any]:
         """Verify Ollama server connection and list available models."""
@@ -118,10 +154,11 @@ class ModelRouter:
                     "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita. "
                     "Abilitare esplicitamente allow_remote con il consenso dell'utente."
                 )
+            target_model = model or self.select_installed_model()
             return self._call_ollama(
                 prompt=prompt,
                 system_prompt=system_prompt,
-                model=model or self.ollama_model,
+                model=target_model,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )

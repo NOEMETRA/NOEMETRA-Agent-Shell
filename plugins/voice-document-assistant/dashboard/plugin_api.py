@@ -12,7 +12,19 @@ _PLUGIN_DIR = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
-from hermes_voice.server.api import router
+try:
+    from hermes_voice.server.api import router
+except (ImportError, ModuleNotFoundError) as err:
+    import logging
+    from fastapi import APIRouter
+    logging.getLogger("hermes.plugins.voice").warning("Dipendenze del plugin voice non ancora installate: %s", err)
+    router = APIRouter()
+    @router.get("/status")
+    async def _missing_deps():
+        return {
+            "error": "missing_dependencies",
+            "detail": f"Dipendenze Python mancanti ({err}). Eseguire: hermes plugins install voice-document-assistant",
+        }
 
 __all__ = ["router"]
 

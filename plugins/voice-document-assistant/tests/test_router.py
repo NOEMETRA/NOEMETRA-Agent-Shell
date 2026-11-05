@@ -68,3 +68,24 @@ def test_ollama_health_check():
     # Since Ollama is running, it should report online
     assert health["status"] == "online"
     assert "gemma4:12b" in health["available_models"]
+
+
+def test_model_router_resolves_and_switches_model(monkeypatch):
+    """Verify ModelRouter initializes from config and supports explicit switching and autoselection."""
+    # Test explicit switching
+    router = ModelRouter()
+    assert router.ollama_model is not None
+
+    router.set_model("llama3.2:latest")
+    assert router.ollama_model == "llama3.2:latest"
+
+    # Test autoselection when target model is not in available models
+    monkeypatch.setattr(
+        router,
+        "check_ollama_health",
+        lambda: {"status": "online", "available_models": ["gemma4:12b", "phi3:mini"]},
+    )
+    selected = router.select_installed_model()
+    assert selected == "gemma4:12b"
+    assert router.ollama_model == "gemma4:12b"
+

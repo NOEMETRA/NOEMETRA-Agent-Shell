@@ -3,6 +3,11 @@ version: 1.0.0
 description: "Assistente vocale documentale multi-agente deterministico con Pocket TTS, evidenziazione del testo e verifica delle citazioni."
 author: "NOEMETRA Voice Team"
 entry_point: "hermes_plugin.voice_plugin:register"
+python_dependencies:
+  - "pocket-tts>=4.0.0; sys_platform != 'android'"
+  - "pymupdf>=2.0.0; sys_platform != 'android'"
+  - "sounddevice>=0.5.0; sys_platform != 'android'"
+  - "soundfile>=0.14.0; sys_platform != 'android'"
 tools:
   - voice_load_document
   - voice_play_document

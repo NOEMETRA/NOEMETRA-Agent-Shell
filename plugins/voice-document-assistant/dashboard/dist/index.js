@@ -7,7 +7,7 @@
   }
 
   const { React, hooks, fetchJSON } = sdk;
-  const { useState, useEffect, useCallback } = hooks;
+  const { useState, useEffect, useCallback, useRef } = hooks;
   const h = React.createElement;
 
   function VoiceDocumentDashboard() {
@@ -17,11 +17,25 @@
     const [answer, setAnswer] = useState(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
+    const clientAudioRef = useRef(null);
+    const lastPlayedSentRef = useRef(-1);
 
     const refreshStatus = useCallback(async () => {
       try {
         const data = await fetchJSON("/api/plugins/voice-document-assistant/status");
         setStatus(data);
+        // Client-side desktop audio stream
+        if (data && data.player_state === "PLAYING") {
+          if (data.current_sentence_index !== lastPlayedSentRef.current) {
+            lastPlayedSentRef.current = data.current_sentence_index;
+            if (clientAudioRef.current) clientAudioRef.current.pause();
+            const audio = new Audio("/api/plugins/voice-document-assistant/audio/sentence/" + data.current_sentence_index);
+            clientAudioRef.current = audio;
+            audio.play().catch(() => {});
+          }
+        } else if (clientAudioRef.current) {
+          clientAudioRef.current.pause();
+        }
       } catch (err) {
         // silent on background polling
       }
@@ -40,10 +54,16 @@
       refreshStatus();
       refreshLibrary();
       const interval = setInterval(refreshStatus, 3000);
-      return () => clearInterval(interval);
+      return () => {
+        clearInterval(interval);
+        if (clientAudioRef.current) clientAudioRef.current.pause();
+      };
     }, [refreshStatus, refreshLibrary]);
 
     const handleAction = async (endpoint, body = {}) => {
+      if (endpoint === "pause" || endpoint === "stop") {
+        if (clientAudioRef.current) clientAudioRef.current.pause();
+      }
       try {
         await fetchJSON(`/api/plugins/voice-document-assistant/${endpoint}`, {
           method: "POST",

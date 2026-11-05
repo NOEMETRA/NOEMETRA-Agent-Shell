@@ -14,7 +14,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusResponse, ReadingBookmark
@@ -35,12 +35,62 @@ def _sanitize_filename(name: str) -> str:
     return cleaned
 
 
-def _req_profile(request: Request) -> Optional[str]:
-    return request.headers.get("X-Hermes-Profile") or request.query_params.get("profile") or None
+def _resolve_authorized_profile(request: Request) -> str:
+    """Resolve the profile bound to this request's authorized gateway scope.
+
+    Strictly enforces AGENTS.md:13 profile isolation:
+    - If a native HTTP principal grant is present on request.state, the profile is bound to it.
+    - If the context has an active hermes_home_override, the profile is bound to it.
+    - An unauthenticated caller cannot supply X-Hermes-Profile to bypass or escape the gateway-scoped profile.
+    - If an explicit profile is requested, it must strictly match the authorized scope.
+    """
+    grant = getattr(request.state, "native_http_principal", None)
+    bound_profile: Optional[str] = None
+    if isinstance(grant, dict) and grant.get("profile_id"):
+        prof_id = str(grant["profile_id"])
+        prof_path = Path(prof_id)
+        if "profiles" in prof_path.parts:
+            bound_profile = prof_path.name
+        else:
+            bound_profile = "default" if prof_path.resolve() == (Path.home() / ".hermes").resolve() else prof_path.name
+
+    try:
+        from hermes_constants import get_hermes_home_override
+        home_override = get_hermes_home_override()
+        if not bound_profile and home_override:
+            ov_path = Path(home_override)
+            if "profiles" in ov_path.parts:
+                bound_profile = ov_path.name
+            else:
+                bound_profile = "default"
+    except Exception:
+        pass
+
+    untrusted_profile = request.headers.get("X-Hermes-Profile") or request.query_params.get("profile") or None
+    if untrusted_profile:
+        untrusted_profile = untrusted_profile.strip().lower()
+        if bound_profile and untrusted_profile != bound_profile.lower():
+            logger.warning(
+                "Cross-profile access attempt blocked: caller requested %r but gateway is bound to %r",
+                untrusted_profile,
+                bound_profile,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access denied: request profile {untrusted_profile!r} does not match authorized profile {bound_profile!r}",
+            )
+        if not bound_profile:
+            bound_profile = untrusted_profile
+
+    return bound_profile or "default"
+
+
+def _req_profile(request: Request) -> str:
+    return _resolve_authorized_profile(request)
 
 
 def _req_assistant(request: Request) -> HermesVoiceAssistant:
-    profile = _req_profile(request)
+    profile = _resolve_authorized_profile(request)
     try:
         return get_assistant(profile)
     except ValueError as e:
@@ -60,6 +110,7 @@ class ConfigRequest(BaseModel):
     tts_model: Optional[str] = None
     speed: Optional[float] = None
     allow_remote: Optional[bool] = None
+    llm_model: Optional[str] = None
 
 
 class AskRequest(BaseModel):
@@ -248,9 +299,19 @@ async def seek_playback(req: SeekRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/audio/sentence/{sentence_idx}")
+async def get_sentence_audio(sentence_idx: int, request: Request):
+    """Deliver generated audio for sentence to the desktop client for local playback."""
+    assistant = _req_assistant(request)
+    wav_bytes = await asyncio.to_thread(assistant.player.get_sentence_audio_wav, sentence_idx)
+    if not wav_bytes:
+        raise HTTPException(status_code=404, detail="Audio non disponibile per la frase richiesta.")
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
 @router.post("/playback/config")
 async def configure_playback(req: ConfigRequest, request: Request):
-    """Update TTS model, playback speed, or privacy settings."""
+    """Update TTS model, playback speed, LLM model, or privacy settings."""
     assistant = _req_assistant(request)
     if req.tts_model:
         await asyncio.to_thread(assistant.set_tts_model, req.tts_model)
@@ -258,12 +319,15 @@ async def configure_playback(req: ConfigRequest, request: Request):
         assistant.set_speed(req.speed)
     if req.allow_remote is not None:
         assistant.set_allow_remote(req.allow_remote)
+    if req.llm_model:
+        assistant.router.set_model(req.llm_model)
 
     return {
         "status": "success",
         "tts_model": assistant.tts.language,
         "speed": assistant.player.speed,
         "allow_remote": assistant.router.allow_remote,
+        "llm_model": assistant.router.ollama_model,
     }
 
 

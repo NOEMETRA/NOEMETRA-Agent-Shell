@@ -296,6 +296,21 @@ class DocumentPlayer:
                 total_sentences=total,
             )
 
+    def get_sentence_audio_wav(self, sentence_index: int) -> bytes:
+        """Synthesize and return standard WAV audio bytes for client-side playback on desktop/web."""
+        with self._lock:
+            if not self._document or sentence_index < 0 or sentence_index >= len(self._document.all_sentences):
+                return b""
+            sentence = self._document.all_sentences[sentence_index]
+
+        # Synthesize audio using Pocket TTS
+        audio_data, sr = self.tts.synthesize(sentence.text)
+        import io
+        import soundfile as sf
+        buffer = io.BytesIO()
+        sf.write(buffer, audio_data, sr, format="WAV")
+        return buffer.getvalue()
+
     def _save_bookmark(self) -> ReadingBookmark:
         """Persist current bookmark to JSON file, preserving per-document reading positions."""
         bookmark = self.get_bookmark()
@@ -331,6 +346,24 @@ class DocumentPlayer:
             import sounddevice as sd
         except ImportError:
             logger.warning("sounddevice non disponibile. Passaggio alla riproduzione virtuale.")
+            self._run_virtual_playback()
+            return
+
+        # On a headless server, remote SSH gateway, or when no audio output device exists,
+        # run server-side sentence tracking while delivering synthesized audio to the client.
+        has_output_device = False
+        try:
+            default_out = sd.default.device[1]
+            if default_out is not None and default_out >= 0:
+                has_output_device = True
+        except Exception:
+            has_output_device = False
+
+        if not has_output_device or getattr(self, "client_playback", False):
+            logger.info(
+                "Nessun dispositivo hardware audio rilevato sul gateway (server headless/remoto) o client playback attivo. "
+                "Esecuzione in modalità virtual tracking; l'audio viene erogato in streaming al client desktop."
+            )
             self._run_virtual_playback()
             return
 

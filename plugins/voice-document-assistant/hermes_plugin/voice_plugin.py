@@ -11,7 +11,16 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from hermes_voice.server.state import get_assistant
+def _get_assistant():
+    """Lazily load the assistant instance, handling missing optional dependencies gracefully."""
+    try:
+        from hermes_voice.server.state import get_assistant
+        return get_assistant()
+    except (ImportError, ModuleNotFoundError) as err:
+        raise RuntimeError(
+            f"Dipendenze Python mancanti per voice-document-assistant ({err}). "
+            "Installare con: hermes plugins install voice-document-assistant"
+        ) from err
 
 
 def _extract_arg(args: Any, kwargs: dict, key: str, default: Any = None) -> Any:
@@ -30,7 +39,7 @@ def voice_load_document(args: Any = None, **kwargs) -> str:
     if not pdf_path:
         return json.dumps({"error": "Parametro 'pdf_path' mancante o non valido."})
 
-    assistant = get_assistant()
+    assistant = _get_assistant()
     bookmark = assistant.load_document(pdf_path)
     return json.dumps({
         "status": "success",
@@ -45,7 +54,7 @@ def voice_load_document(args: Any = None, **kwargs) -> str:
 
 def voice_play_document(args: Any = None, **kwargs) -> str:
     """Avvia o riprende la riproduzione vocale deterministica del documento caricato con Pocket TTS."""
-    assistant = get_assistant()
+    assistant = _get_assistant()
     bookmark = assistant.play()
     return json.dumps({
         "status": bookmark.state.value,
@@ -57,7 +66,7 @@ def voice_play_document(args: Any = None, **kwargs) -> str:
 
 def voice_pause_document(args: Any = None, **kwargs) -> str:
     """Mette in pausa la lettura vocale e memorizza il punto esatto (frase e millisecondo)."""
-    assistant = get_assistant()
+    assistant = _get_assistant()
     bookmark = assistant.pause()
     return json.dumps({
         "status": bookmark.state.value,
@@ -70,7 +79,7 @@ def voice_pause_document(args: Any = None, **kwargs) -> str:
 
 def voice_resume_document(args: Any = None, **kwargs) -> str:
     """Riprende la lettura vocale esattamente dal punto in cui era stata sospesa."""
-    assistant = get_assistant()
+    assistant = _get_assistant()
     bookmark = assistant.resume()
     return json.dumps({
         "status": bookmark.state.value,
@@ -82,7 +91,7 @@ def voice_resume_document(args: Any = None, **kwargs) -> str:
 
 def voice_stop_document(args: Any = None, **kwargs) -> str:
     """Interrompe completamente la riproduzione vocale."""
-    assistant = get_assistant()
+    assistant = _get_assistant()
     bookmark = assistant.stop()
     return json.dumps({
         "status": bookmark.state.value,
@@ -97,7 +106,7 @@ def voice_seek_document(args: Any = None, **kwargs) -> str:
     page = args_dict.get("page") if isinstance(args_dict, dict) else kwargs.get("page")
     sentence_index = args_dict.get("sentence_index") if isinstance(args_dict, dict) else kwargs.get("sentence_index")
 
-    assistant = get_assistant()
+    assistant = _get_assistant()
     if sentence_index is not None:
         bookmark = assistant.seek_sentence(int(sentence_index))
     elif page is not None:
@@ -119,7 +128,7 @@ def voice_ask_document(args: Any = None, **kwargs) -> str:
     if not question:
         return json.dumps({"error": "Parametro 'question' mancante o non valido."})
 
-    assistant = get_assistant()
+    assistant = _get_assistant()
     answer = assistant.ask(question)
     return json.dumps({
         "question": answer.question,
@@ -133,7 +142,7 @@ def voice_ask_document(args: Any = None, **kwargs) -> str:
 
 def voice_get_status(args: Any = None, **kwargs) -> str:
     """Restituisce lo stato attuale del lettore vocale e il bookmark registrato."""
-    assistant = get_assistant()
+    assistant = _get_assistant()
     status = assistant.get_full_status()
     return json.dumps(status.model_dump(), indent=2)
 
