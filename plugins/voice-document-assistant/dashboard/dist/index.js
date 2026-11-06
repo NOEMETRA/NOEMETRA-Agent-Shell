@@ -29,7 +29,7 @@
         if (currentGen !== pollGenRef.current) return;
         setStatus(data);
         // Client-side desktop audio stream
-        const isPlaying = data && (data.state === "playing" || data.player_state === "PLAYING");
+        const isPlaying = data && (data.state === "playing" || data.player_state === "PLAYING") && data.client_playback !== false;
         if (isPlaying) {
           const targetDocId = data.doc_id || "";
           const playTargetKey = `${targetDocId}:${data.current_sentence_index}`;
@@ -56,7 +56,7 @@
             }
             // Re-validate playback state after audio synthesis
             const fresh = await fetchJSON("/api/plugins/voice-document-assistant/status");
-            const freshPlaying = fresh && (fresh.state === "playing" || fresh.player_state === "PLAYING");
+            const freshPlaying = fresh && (fresh.state === "playing" || fresh.player_state === "PLAYING") && fresh.client_playback !== false;
             if (
               currentGen !== pollGenRef.current ||
               !freshPlaying ||

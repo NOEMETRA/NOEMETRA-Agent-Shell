@@ -734,7 +734,7 @@
       speedSelect.value = (s.speed || 1.0).toString();
 
       // Standalone browser client-side audio streaming
-      if (s.state === 'playing') {
+      if (s.state === 'playing' && s.client_playback !== false) {
         const targetDocId = s.doc_id || '';
         const targetKey = `${targetDocId}:${s.current_sentence_index}`;
         if (targetKey !== lastPlayedTarget) {

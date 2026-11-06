@@ -567,8 +567,6 @@ async def ack_playback(req: PlaybackAckRequest, request: Request):
 async def get_sentence_audio(sentence_idx: int, request: Request):
     """Deliver generated audio for sentence to the desktop client for local playback."""
     assistant = _req_assistant(request)
-    # When a client fetches sentence audio via HTTP, ensure client playback is active to avoid double output
-    assistant.player.client_playback = True
     wav_bytes = await asyncio.to_thread(assistant.player.get_sentence_audio_wav, sentence_idx)
     if not wav_bytes:
         raise HTTPException(status_code=404, detail="Audio non disponibile per la frase richiesta.")

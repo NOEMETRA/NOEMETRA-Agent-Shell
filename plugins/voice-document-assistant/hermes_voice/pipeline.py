@@ -292,6 +292,7 @@ class HermesVoiceAssistant:
             audio_seconds_offset=bm.audio_seconds_offset,
             tts_model=self.tts.language,
             speed=self.player.speed,
+            client_playback=self.player.client_playback,
             allow_remote=self.router.allow_remote,
             agents=self._agents_status,
             last_answer=self._last_answer,

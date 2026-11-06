@@ -976,6 +976,76 @@ def test_standalone_browser_reports_and_persists_playback_progress():
             assistant.player.stop()
 
 
+def test_fetching_sentence_audio_does_not_mutate_server_playback_mode(monkeypatch):
+    """Verify GET /audio/sentence/{idx} does not mutate client_playback or corrupt active server-side playback transition (P2)."""
+    import time
+
+    assistant = get_assistant()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc_mode_switch.pdf"
+        create_sample_italian_pdf(pdf_path)
+        assistant.load_document(pdf_path)
+
+        prev_virtual = assistant.player.virtual_playback
+        prev_client = assistant.player.client_playback
+        assistant.player.virtual_playback = False
+        assistant.player.client_playback = False
+
+        # Simulate a live server-side hardware worker blocking cleanly until _stop_event/_pause_event
+        monkeypatch.setattr(assistant.player, "_has_audio_output_device", lambda: True)
+
+        server_worker_stopped = []
+
+        def fake_server_audio_worker():
+            while not assistant.player._stop_event.is_set() and not assistant.player._pause_event.is_set():
+                time.sleep(0.02)
+            server_worker_stopped.append(True)
+
+        monkeypatch.setattr(assistant.player, "_run_audio_playback", fake_server_audio_worker)
+
+        try:
+            res_server_play = client.post(
+                "/api/plugins/voice-document-assistant/playback/play",
+                json={"output": "server"},
+            )
+            assert res_server_play.status_code == 200
+            assert assistant.player.client_playback is False
+            assert assistant.player._active_worker_mode == "server"
+
+            res_status = client.get("/api/plugins/voice-document-assistant/status")
+            assert res_status.status_code == 200
+            assert res_status.json()["client_playback"] is False
+
+            # Fetching audio must NOT mutate client_playback or leave server worker orphaned
+            res_audio = client.get("/api/plugins/voice-document-assistant/audio/sentence/0")
+            assert res_audio.status_code == 200
+            assert assistant.player.client_playback is False
+            assert assistant.player._active_worker_mode == "server"
+
+            # Stray client ack while server-side playback is active must be ignored
+            res_stray_ack = client.post(
+                "/api/plugins/voice-document-assistant/playback/ack",
+                json={"sentence_index": 0, "event": "progress", "offset_seconds": 2.5},
+            )
+            assert res_stray_ack.status_code == 200
+            assert assistant.player.client_playback is False
+
+            # Explicit switch to client playback stops the server worker and starts virtual/client worker
+            res_client_play = client.post(
+                "/api/plugins/voice-document-assistant/playback/play",
+                json={"output": "client"},
+            )
+            assert res_client_play.status_code == 200
+            assert server_worker_stopped == [True]
+            assert assistant.player.client_playback is True
+            assert assistant.player._active_worker_mode == "virtual"
+        finally:
+            assistant.player.stop()
+            assistant.player.virtual_playback = prev_virtual
+            assistant.player.client_playback = prev_client
+
+
+
 
 
 

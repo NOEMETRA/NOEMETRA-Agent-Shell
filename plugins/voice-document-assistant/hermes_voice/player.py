@@ -62,6 +62,7 @@ class DocumentPlayer:
         self._client_ended_event = threading.Event()
         self._audio_fetched_sent_idx: int = -1
         self._playback_generation: int = 0
+        self._active_worker_mode: Optional[str] = None
 
     @property
     def state(self) -> PlayerState:
@@ -175,7 +176,14 @@ class DocumentPlayer:
             if not self._document or not self._document.all_sentences:
                 raise ValueError("Nessun documento caricato per la riproduzione.")
 
-            if self._state == PlayerState.PLAYING and effective_client_playback == self.client_playback:
+            desired_worker_mode = "virtual" if (self.virtual_playback or effective_client_playback) else "server"
+            if (
+                self._state == PlayerState.PLAYING
+                and effective_client_playback == self.client_playback
+                and self._active_worker_mode == desired_worker_mode
+                and self._worker_thread is not None
+                and self._worker_thread.is_alive()
+            ):
                 return self.get_bookmark()
 
             self.client_playback = effective_client_playback
@@ -212,8 +220,10 @@ class DocumentPlayer:
             self._state = PlayerState.PLAYING
 
             if self.virtual_playback or self.client_playback:
+                self._active_worker_mode = "virtual"
                 self._worker_thread = threading.Thread(target=self._run_virtual_playback, daemon=True)
             else:
+                self._active_worker_mode = "server"
                 self._worker_thread = threading.Thread(target=self._run_audio_playback, daemon=True)
 
             self._worker_thread.start()
@@ -229,6 +239,7 @@ class DocumentPlayer:
 
             self._pause_event.set()
             self._state = PlayerState.PAUSED
+            self._active_worker_mode = None
 
             if self._stream is not None:
                 try:
@@ -277,6 +288,7 @@ class DocumentPlayer:
                 worker_to_join = self._worker_thread
 
             self._state = PlayerState.STOPPED
+            self._active_worker_mode = None
 
         # Join worker thread cleanly outside the lock
         if worker_to_join and worker_to_join != threading.current_thread():
@@ -360,7 +372,6 @@ class DocumentPlayer:
             if not self._document or sentence_index < 0 or sentence_index >= len(self._document.all_sentences):
                 return b""
             sentence = self._document.all_sentences[sentence_index]
-            self.client_playback = True
 
         # Synthesize audio using Pocket TTS
         audio_data, sr = self.tts.synthesize(sentence.text)
@@ -380,6 +391,8 @@ class DocumentPlayer:
         """Process client playback progress and completion events."""
         with self._lock:
             if doc_id and self._document and self._document.doc_id != doc_id:
+                return
+            if self._state == PlayerState.PLAYING and not self.client_playback:
                 return
             self.client_playback = True
             if sentence_index == self._current_sent_idx:

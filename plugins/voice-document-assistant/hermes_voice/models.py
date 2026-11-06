@@ -133,6 +133,7 @@ class PlayerStatusResponse(BaseModel):
     audio_seconds_offset: float = 0.0
     tts_model: str = "italian"  # "italian" | "italian_24l"
     speed: float = 1.0
+    client_playback: bool = False
     allow_remote: bool = False
     agents: AgentStatusInfo = Field(default_factory=AgentStatusInfo)
     last_answer: Optional[GroundedAnswer] = None
