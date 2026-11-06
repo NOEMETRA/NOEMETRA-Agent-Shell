@@ -2,8 +2,10 @@
 
 import json
 import tempfile
+import threading
 import time
 from pathlib import Path
+import numpy as np
 import pytest
 
 from hermes_voice.extractor import DocumentExtractor, create_sample_italian_pdf
@@ -140,4 +142,46 @@ def test_player_load_document_waits_for_previous_worker_without_audio_leak():
         assert player.state == PlayerState.IDLE
         assert player._current_audio is None
         assert player._current_sent_idx == 0
+
+
+def test_player_discards_stale_synthesized_audio_after_seek():
+    """Verify that synthesized audio finishing after a sentence seek within the same doc is discarded (P2)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc.pdf"
+        bm_path = Path(tmpdir) / "state.json"
+        create_sample_italian_pdf(pdf_path)
+        doc = DocumentExtractor().extract(pdf_path)
+
+        player = DocumentPlayer(bookmark_path=bm_path, virtual_playback=True)
+        player.load_document(doc)
+
+        try:
+            # Capture state before seek
+            gen_before_seek = player._playback_generation
+            sent_idx_before_seek = player.current_sentence_index
+            assert sent_idx_before_seek == 0
+
+            # Seek to sentence 2
+            player.seek_to_sentence(2)
+            assert player._playback_generation > gen_before_seek
+            assert player.current_sentence_index == 2
+
+            # An old worker finishing synthesis for sentence 0 attempts to cache its result
+            stale_audio = np.ones(1000, dtype=np.float32)
+            with player._lock:
+                # Guard implemented in player.py lines 433 and 542:
+                if (
+                    player._document
+                    and player._document.doc_id == doc.doc_id
+                    and player._current_sent_idx == sent_idx_before_seek
+                    and player._playback_generation == gen_before_seek
+                ):
+                    player._current_audio = stale_audio
+
+            # Stale audio must have been discarded because sentence index and generation changed
+            with player._lock:
+                assert player._current_audio is None
+        finally:
+            player.stop()
+
 

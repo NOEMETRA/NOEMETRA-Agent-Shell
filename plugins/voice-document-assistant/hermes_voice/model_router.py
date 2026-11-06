@@ -187,6 +187,14 @@ class ModelRouter:
 
     def check_ollama_health(self) -> Dict[str, Any]:
         """Verify Ollama server connection and list available models with retry resilience."""
+        if not is_local_endpoint(self.ollama_base_url) and not self.allow_remote:
+            return {
+                "status": "remote_unauthorized",
+                "error": "L'endpoint Ollama configurato è remoto e richiede il consenso esplicito dell'utente (allow_remote=True).",
+                "available_models": [],
+                "target_model_installed": False,
+            }
+
         last_err = None
         for attempt in range(3):
             try:

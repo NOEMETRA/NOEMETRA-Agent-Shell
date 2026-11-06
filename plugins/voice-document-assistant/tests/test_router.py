@@ -436,6 +436,46 @@ def test_configured_non_loopback_ollama_endpoint_preserved(monkeypatch):
     assert captured_url == ["http://192.168.1.100:11434/api/generate"]
 
 
+def test_remote_consent_guard_blocks_remote_ollama_health_checks(monkeypatch):
+    """Verify check_ollama_health does not probe external network when endpoint is remote and allow_remote is false (P2)."""
+    fake_config = {
+        "model": {
+            "provider": "ollama",
+            "base_url": "http://192.168.1.100:11434",
+            "name": "gemma4:12b",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    router = ModelRouter()
+    probed_urls = []
+
+    def mock_get(url, **kwargs):
+        probed_urls.append(url)
+        raise AssertionError("Remote endpoint was probed without consent!")
+
+    monkeypatch.setattr("requests.get", mock_get)
+
+    health = router.check_ollama_health()
+    assert health["status"] == "remote_unauthorized"
+    assert len(probed_urls) == 0
+
+    # Once remote access is explicitly authorized, probe is allowed
+    router.set_allow_remote(True)
+
+    class MockResp:
+        status_code = 200
+
+        def json(self):
+            return {"models": [{"name": "gemma4:12b"}]}
+
+    monkeypatch.setattr("requests.get", lambda url, **kwargs: MockResp())
+    authorized_health = router.check_ollama_health()
+    assert authorized_health["status"] == "online"
+    assert authorized_health["target_model_installed"] is True
+
+
+
 
 
 
