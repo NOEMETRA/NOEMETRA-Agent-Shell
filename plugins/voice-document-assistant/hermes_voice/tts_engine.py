@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple, Union
 import numpy as np
 import soundfile as sf
 
-from hermes_voice.profile import resolve_voice_profile_dir
+from hermes_voice.profile import ensure_voice_dir, resolve_voice_profile_dir
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class PocketTTSEngine:
         self.voice = voice
         self.quantize = quantize
         self.cache_dir = Path(cache_dir or resolve_voice_profile_dir() / "audio_cache")
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        ensure_voice_dir(self.cache_dir)
         self._lock = threading.Lock()
 
         self._model = None
@@ -140,6 +140,7 @@ class PocketTTSEngine:
         # Save to disk cache
         if use_cache:
             try:
+                ensure_voice_dir(self.cache_dir)
                 sf.write(str(cache_file), audio_np, self.sample_rate)
             except Exception as e:
                 logger.warning(f"Impossibile scrivere la cache audio su {cache_file}: {e}")

@@ -9,12 +9,30 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from hermes_voice.pipeline import HermesVoiceAssistant
-from hermes_voice.profile import resolve_voice_profile_dir
+from hermes_voice.profile import assert_voice_home_live, resolve_voice_profile_dir
 
 logger = logging.getLogger(__name__)
 
 _assistants: Dict[str, HermesVoiceAssistant] = {}
 _lock = threading.Lock()
+
+
+def _evict_dead_assistants() -> None:
+    """Stop and evict any cached assistant whose named profile home has been deleted."""
+    with _lock:
+        dead_keys = []
+        for k in list(_assistants.keys()):
+            try:
+                assert_voice_home_live(Path(k))
+            except FileNotFoundError:
+                dead_keys.append(k)
+        for k in dead_keys:
+            ast = _assistants.pop(k, None)
+            if ast is not None:
+                try:
+                    ast.player.stop()
+                except Exception:
+                    pass
 
 
 def get_assistant(
@@ -23,7 +41,11 @@ def get_assistant(
 ) -> HermesVoiceAssistant:
     """Return persistent assistant instance keyed consistently by canonical storage home (AGENTS.md:13)."""
     global _assistants
-    prof_dir = resolve_voice_profile_dir(profile=profile, home_dir=home_dir)
+    try:
+        prof_dir = resolve_voice_profile_dir(profile=profile, home_dir=home_dir)
+    except FileNotFoundError:
+        _evict_dead_assistants()
+        raise
     canonical_key = str(prof_dir.resolve())
 
     # Resolve actual profile identity rather than deriving from directory basename (AGENTS.md:13)
@@ -71,22 +93,27 @@ def reset_assistants(profile: Optional[str] = None) -> None:
     global _assistants
     with _lock:
         if profile:
+            candidate_keys = {profile.strip()}
             try:
                 prof_dir = resolve_voice_profile_dir(profile)
-                canon_key = str(prof_dir.resolve())
+                candidate_keys.add(str(prof_dir.resolve()))
             except Exception:
-                canon_key = profile.strip()
-            if canon_key in _assistants:
                 try:
-                    _assistants[canon_key].player.stop()
+                    from hermes_cli.profiles import get_profile_dir
+                    candidate_keys.add(str((get_profile_dir(profile.strip().lower()) / "voice_assistant").resolve()))
                 except Exception:
                     pass
-                del _assistants[canon_key]
+            for canon_key in list(_assistants.keys()):
+                if canon_key in candidate_keys:
+                    try:
+                        _assistants[canon_key].player.stop()
+                    except Exception:
+                        pass
+                    del _assistants[canon_key]
         else:
             for ast in _assistants.values():
                 try:
                     ast.player.stop()
                 except Exception:
                     pass
-            _assistants.clear()
             _assistants.clear()

@@ -15,7 +15,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from hermes_voice.models import ExtractedDocument, PlayerState, ReadingBookmark, SentenceSpan
-from hermes_voice.profile import resolve_voice_profile_dir
+from hermes_voice.profile import ensure_voice_dir, resolve_voice_profile_dir
 from hermes_voice.tts_engine import PocketTTSEngine
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ class DocumentPlayer:
     ):
         self.tts = tts_engine or PocketTTSEngine(lazy_load=True)
         self.bookmark_path = Path(bookmark_path or resolve_voice_profile_dir() / "reading_state.json")
-        self.bookmark_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_voice_dir(self.bookmark_path.parent)
         self.virtual_playback = virtual_playback
         self.client_playback = client_playback
         self.on_sentence_change = on_sentence_change
@@ -374,6 +374,7 @@ class DocumentPlayer:
                 **bookmark.model_dump(),
                 "bookmarks": bookmarks_map,
             }
+            ensure_voice_dir(self.bookmark_path.parent)
             self.bookmark_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"Impossibile salvare il bookmark su {self.bookmark_path}: {e}")

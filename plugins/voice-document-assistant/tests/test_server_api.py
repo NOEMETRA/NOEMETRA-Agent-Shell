@@ -150,10 +150,15 @@ def test_api_get_document_does_not_switch_active():
         assert assistant.current_document.doc_id == active_doc_id
 
 
-def test_cross_profile_access_rejected_with_403():
+def test_cross_profile_access_rejected_with_403(tmp_path, monkeypatch):
     """Verify that attempting to access a different profile than the gateway-bound scope returns 403."""
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from hermes_voice.profile import resolve_voice_profile_dir
+
+    default_home = tmp_path / ".hermes"
+    (default_home / "profiles" / "alpha_profile").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
 
     prof_dir = resolve_voice_profile_dir("alpha_profile")
     token = set_hermes_home_override(str(prof_dir.parent))
@@ -174,6 +179,7 @@ def test_cross_profile_access_rejected_with_403():
         assert res_ok.status_code == 200
     finally:
         reset_hermes_home_override(token)
+        reset_assistants("alpha_profile")
 
 
 def test_audio_sentence_stream_endpoint():
@@ -275,13 +281,18 @@ def test_missing_dependencies_status_endpoint_returns_json():
     assert "pymupdf" in res.json()["detail"]
 
 
-def test_state_keys_assistants_consistently_across_name_and_home_dir():
+def test_state_keys_assistants_consistently_across_name_and_home_dir(tmp_path, monkeypatch):
     """Verify that accessing by profile name and by authorized home path returns the identical singleton instance."""
     from hermes_cli.profiles import get_profile_dir
-    from hermes_voice.server.state import get_assistant, reset_assistants, reset_assistants
+    from hermes_voice.server.state import get_assistant, reset_assistants
+
+    default_home = tmp_path / ".hermes"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
 
     profile_name = "test_unified_identity"
     home_dir = get_profile_dir(profile_name)
+    home_dir.mkdir(parents=True, exist_ok=True)
 
     reset_assistants(profile_name)
     try:
@@ -372,9 +383,15 @@ def test_client_playback_ack_synchronization():
     assert res_end.status_code == 200
 
 
-def test_upload_cross_profile_file_path_rejected_with_403():
+def test_upload_cross_profile_file_path_rejected_with_403(tmp_path, monkeypatch):
     """Verify that specifying a file_path inside another profile's directory is blocked with 403."""
     from hermes_voice.profile import resolve_voice_profile_dir
+
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir(parents=True, exist_ok=True)
+    (default_home / "profiles" / "victim_profile").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
 
     other_prof_dir = resolve_voice_profile_dir("victim_profile")
     foreign_pdf = other_prof_dir / "victim_secret.pdf"
@@ -387,6 +404,7 @@ def test_upload_cross_profile_file_path_rejected_with_403():
         assert res.status_code == 403
         assert "belongs to profile" in res.json()["detail"]
     finally:
+        reset_assistants()
         if foreign_pdf.exists():
             foreign_pdf.unlink()
 
@@ -630,6 +648,59 @@ def test_standalone_server_blocks_dns_rebinding_host_header():
             headers={"Host": valid_host},
         )
         assert resp_valid.status_code == 200
+
+
+def test_api_returns_404_and_refuses_to_recreate_deleted_profile_home(tmp_path, monkeypatch):
+    """Verify HTTP requests for a deleted named profile fail with 404 without recreating its directory (P2)."""
+    import base64
+    import shutil
+    from hermes_constants import (
+        mark_named_profile_deleted,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir(parents=True, exist_ok=True)
+    (default_home / "config.yaml").write_text("model: test\n", encoding="utf-8")
+    worker_dir = default_home / "profiles" / "worker_api"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    (worker_dir / ".env").write_text("# worker\n", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    pdf_file = tmp_path / "sample.pdf"
+    create_sample_italian_pdf(pdf_file)
+    pdf_b64 = base64.b64encode(pdf_file.read_bytes()).decode("ascii")
+
+    reset_assistants()
+    token = set_hermes_home_override(str(worker_dir))
+    try:
+        # Warm up cached assistant while profile is live
+        res_ok = client.get("/api/plugins/voice-document-assistant/status")
+        assert res_ok.status_code == 200
+        assert (worker_dir / "voice_assistant").is_dir()
+
+        # Delete the profile while requests are still scoped to it
+        mark_named_profile_deleted(worker_dir)
+        shutil.rmtree(worker_dir)
+        assert not worker_dir.exists()
+
+        # Subsequent status and upload requests must return 404 and never recreate worker_dir
+        res_status = client.get("/api/plugins/voice-document-assistant/status")
+        assert res_status.status_code == 404
+        assert not worker_dir.exists()
+
+        res_upload = client.post(
+            "/api/plugins/voice-document-assistant/upload",
+            json={"filename": "sample.pdf", "content_base64": pdf_b64},
+        )
+        assert res_upload.status_code == 404
+        assert not worker_dir.exists()
+    finally:
+        reset_hermes_home_override(token)
+        reset_assistants()
 
 
 

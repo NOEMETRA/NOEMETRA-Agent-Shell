@@ -23,7 +23,13 @@ def is_pid_alive(pid: int) -> bool:
 from hermes_voice.extractor import create_sample_italian_pdf
 from hermes_voice.models import PlayerState
 from hermes_voice.pipeline import HermesVoiceAssistant
+from hermes_voice.profile import ensure_voice_dir
 from hermes_voice.tts_engine import PocketTTSEngine
+
+
+def _write_ctrl_file(ctrl_file: Path, payload: dict) -> None:
+    ensure_voice_dir(ctrl_file.parent)
+    ctrl_file.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def main() -> None:
@@ -81,7 +87,7 @@ def main() -> None:
         bookmark = assistant.play()
         print(f"Riproduzione avviata: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
         ctrl_file = assistant.player.bookmark_path.parent / "player_control.json"
-        ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "playing"}), encoding="utf-8")
+        _write_ctrl_file(ctrl_file, {"pid": os.getpid(), "command": "", "status": "playing"})
         try:
             print("Riproduzione in corso (premere Ctrl+C per mettere in pausa)...")
             while assistant.player.state == PlayerState.PLAYING:
@@ -92,12 +98,12 @@ def main() -> None:
                         cmd = cdata.get("command")
                         if cmd == "pause":
                             bookmark = assistant.pause()
-                            ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "paused"}), encoding="utf-8")
+                            _write_ctrl_file(ctrl_file, {"pid": os.getpid(), "command": "", "status": "paused"})
                             print(f"\nRicevuto comando di pausa dall'esterno su frase {bookmark.current_sentence_index + 1}.")
                             break
                         elif cmd == "stop":
                             bookmark = assistant.stop()
-                            ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "stopped"}), encoding="utf-8")
+                            _write_ctrl_file(ctrl_file, {"pid": os.getpid(), "command": "", "status": "stopped"})
                             print("\nRicevuto comando di stop dall'esterno.")
                             break
                     except Exception:
@@ -124,7 +130,7 @@ def main() -> None:
                 active_pid = cdata.get("pid")
                 if active_pid and is_pid_alive(active_pid) and active_pid != os.getpid():
                     cdata["command"] = "pause"
-                    ctrl_file.write_text(json.dumps(cdata), encoding="utf-8")
+                    _write_ctrl_file(ctrl_file, cdata)
                     for _ in range(25):
                         time.sleep(0.1)
                         if not ctrl_file.exists():
@@ -164,7 +170,7 @@ def main() -> None:
         bookmark = assistant.resume()
         print(f"Riproduzione ripresa: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
         ctrl_file = assistant.player.bookmark_path.parent / "player_control.json"
-        ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "playing"}), encoding="utf-8")
+        _write_ctrl_file(ctrl_file, {"pid": os.getpid(), "command": "", "status": "playing"})
         try:
             print("Riproduzione in corso (premere Ctrl+C per mettere in pausa)...")
             while assistant.player.state == PlayerState.PLAYING:
@@ -175,12 +181,12 @@ def main() -> None:
                         cmd = cdata.get("command")
                         if cmd == "pause":
                             bookmark = assistant.pause()
-                            ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "paused"}), encoding="utf-8")
+                            _write_ctrl_file(ctrl_file, {"pid": os.getpid(), "command": "", "status": "paused"})
                             print(f"\nRicevuto comando di pausa dall'esterno su frase {bookmark.current_sentence_index + 1}.")
                             break
                         elif cmd == "stop":
                             bookmark = assistant.stop()
-                            ctrl_file.write_text(json.dumps({"pid": os.getpid(), "command": "", "status": "stopped"}), encoding="utf-8")
+                            _write_ctrl_file(ctrl_file, {"pid": os.getpid(), "command": "", "status": "stopped"})
                             print("\nRicevuto comando di stop dall'esterno.")
                             break
                     except Exception:
