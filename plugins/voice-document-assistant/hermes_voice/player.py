@@ -21,6 +21,11 @@ from hermes_voice.tts_engine import PocketTTSEngine
 logger = logging.getLogger(__name__)
 
 
+class AudioOutputUnavailableError(RuntimeError):
+    """Raised when server-side hardware audio playback is requested without an available output device."""
+
+
+
 class DocumentPlayer:
     """Manages audio synthesis and playback with exact pause/resume semantics."""
 
@@ -127,20 +132,53 @@ class DocumentPlayer:
 
             return self.get_bookmark()
 
+    def _has_audio_output_device(self) -> bool:
+        """Return True if sounddevice is available and a usable audio output device is present."""
+        try:
+            import sounddevice as sd
+            default_out = sd.default.device[1]
+            if isinstance(default_out, int) and default_out < 0:
+                return False
+            dev_info = (
+                sd.query_devices(kind="output")
+                if default_out is None
+                else sd.query_devices(default_out, "output")
+            )
+            return isinstance(dev_info, dict) and int(dev_info.get("max_output_channels", 0)) > 0
+        except Exception:
+            return False
+
     def play(self, client_playback: Optional[bool] = None) -> ReadingBookmark:
         """Start or resume playback from current position."""
-        if client_playback is not None:
-            with self._lock:
-                self.client_playback = client_playback
+        with self._lock:
+            if not self._document or not self._document.all_sentences:
+                raise ValueError("Nessun documento caricato per la riproduzione.")
+            effective_client_playback = (
+                self.client_playback if client_playback is None else bool(client_playback)
+            )
+            if self._state == PlayerState.PLAYING and effective_client_playback == self.client_playback:
+                return self.get_bookmark()
+
+        if (
+            not self.virtual_playback
+            and not effective_client_playback
+            and not self._has_audio_output_device()
+        ):
+            raise AudioOutputUnavailableError(
+                "Nessun dispositivo hardware di output audio disponibile sul server. "
+                "Avviare la riproduzione tramite client web/desktop (output='client') "
+                "oppure abilitare esplicitamente virtual_playback."
+            )
 
         worker_to_join = None
         with self._lock:
             if not self._document or not self._document.all_sentences:
                 raise ValueError("Nessun documento caricato per la riproduzione.")
 
-            if self._state == PlayerState.PLAYING:
+            if self._state == PlayerState.PLAYING and effective_client_playback == self.client_playback:
                 return self.get_bookmark()
 
+            self.client_playback = effective_client_playback
             self._playback_generation += 1
 
             # Ensure previous worker thread is finished and wait for it
@@ -390,29 +428,30 @@ class DocumentPlayer:
 
     def _run_audio_playback(self) -> None:
         """Real audio playback loop using sounddevice."""
-        try:
-            import sounddevice as sd
-        except ImportError:
-            logger.warning("sounddevice non disponibile. Passaggio alla riproduzione virtuale.")
+        if getattr(self, "client_playback", False):
             self._run_virtual_playback()
             return
 
-        # On a headless server, remote SSH gateway, or when no audio output device exists,
-        # run server-side sentence tracking while delivering synthesized audio to the client.
-        has_output_device = False
         try:
-            default_out = sd.default.device[1]
-            if default_out is not None and default_out >= 0:
-                has_output_device = True
-        except Exception:
-            has_output_device = False
+            import sounddevice as sd
+        except ImportError:
+            logger.error("sounddevice non disponibile: impossibile riprodurre audio sul server.")
+            with self._lock:
+                self._state = PlayerState.PAUSED
+                self._save_bookmark()
+            return
 
-        if not has_output_device or getattr(self, "client_playback", False):
-            logger.info(
-                "Nessun dispositivo hardware audio rilevato sul gateway (server headless/remoto) o client playback attivo. "
-                "Esecuzione in modalità virtual tracking; l'audio viene erogato in streaming al client desktop."
+        if not self._has_audio_output_device():
+            if getattr(self, "client_playback", False):
+                self._run_virtual_playback()
+                return
+            logger.error(
+                "Nessun dispositivo hardware di output audio rilevato sul server. "
+                "Riproduzione sospesa senza avanzare il segnalibro; utilizzare riproduzione client (output='client')."
             )
-            self._run_virtual_playback()
+            with self._lock:
+                self._state = PlayerState.PAUSED
+                self._save_bookmark()
             return
 
         try:
@@ -584,6 +623,15 @@ class DocumentPlayer:
                             if self._client_ended_event.is_set():
                                 break
                         time.sleep(0.05)
+                elif not getattr(self, "virtual_playback", False):
+                    logger.error(
+                        "Virtual playback invocato senza virtual_playback o client_playback attivi; "
+                        "sospensione immediata senza avanzare il segnalibro."
+                    )
+                    with self._lock:
+                        self._state = PlayerState.PAUSED
+                        self._save_bookmark()
+                    return
                 elif self._current_audio is not None and len(self._current_audio) > 0:
                     sr = self._current_sr or 24000
                     total_samples = len(self._current_audio)

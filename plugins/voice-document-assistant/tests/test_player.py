@@ -10,7 +10,7 @@ import pytest
 
 from hermes_voice.extractor import DocumentExtractor, create_sample_italian_pdf
 from hermes_voice.models import PlayerState
-from hermes_voice.player import DocumentPlayer
+from hermes_voice.player import AudioOutputUnavailableError, DocumentPlayer
 
 
 def test_player_pause_resume_bookmark():
@@ -212,6 +212,41 @@ def test_repeated_play_call_does_not_bump_generation_or_interrupt_playback():
             assert player._playback_generation == gen_first
         finally:
             player.stop()
+
+
+def test_player_refuses_headless_server_playback_without_advancing_bookmark():
+    """Verify server-side playback fails fast on headless machines without simulating progress (P2)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc_headless.pdf"
+        bm_path = Path(tmpdir) / "state_headless.json"
+        create_sample_italian_pdf(pdf_path)
+        doc = DocumentExtractor().extract(pdf_path)
+
+        player = DocumentPlayer(bookmark_path=bm_path, virtual_playback=False, client_playback=False)
+        player._has_audio_output_device = lambda: False
+        player.load_document(doc)
+
+        # 1. Server-side play() must raise AudioOutputUnavailableError and keep IDLE at sentence 0
+        with pytest.raises(AudioOutputUnavailableError, match="Nessun dispositivo hardware di output audio"):
+            player.play()
+        assert player.state == PlayerState.IDLE
+        assert player.current_sentence_index == 0
+
+        # 2. Server-side resume() from a paused bookmark must raise and preserve exact sentence index
+        player.seek_to_sentence(2)
+        assert player.state == PlayerState.PAUSED
+        assert player.current_sentence_index == 2
+        with pytest.raises(AudioOutputUnavailableError, match="Nessun dispositivo hardware di output audio"):
+            player.resume()
+        assert player.state == PlayerState.PAUSED
+        assert player.current_sentence_index == 2
+
+        # 3. Even if _run_audio_playback() is invoked after device loss, it pauses without advancing
+        player._state = PlayerState.PLAYING
+        player._run_audio_playback()
+        assert player.state == PlayerState.PAUSED
+        assert player.current_sentence_index == 2
+
 
 
 
