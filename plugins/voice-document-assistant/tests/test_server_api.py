@@ -703,6 +703,124 @@ def test_api_returns_404_and_refuses_to_recreate_deleted_profile_home(tmp_path, 
         reset_assistants()
 
 
+def test_secondary_profile_native_ticket_binds_config_and_secret_scope(tmp_path, monkeypatch):
+    """Verify native HTTP ticket for a secondary profile binds its own config and secret scope, never launch profile's (P1)."""
+    from fastapi import FastAPI, Request
+    from hermes_voice.server.api import _req_assistant, router
+
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir(parents=True, exist_ok=True)
+    (default_home / "config.yaml").write_text(
+        "model:\n  provider: openai\n  name: launch-gpt-4o\n  base_url: https://launch.example/v1\n",
+        encoding="utf-8",
+    )
+    (default_home / ".env").write_text("OPENAI_API_KEY=sk-launch-file-secret\n", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-launch-ambient-secret")
+    monkeypatch.setattr("hermes_cli.config.get_process_hermes_home", lambda: default_home)
+    monkeypatch.setattr("hermes_constants.get_routing_process_hermes_home", lambda: default_home)
+
+    # Secondary profile A: has its own model config, NO API key
+    tenant_a = default_home / "profiles" / "tenant_no_key"
+    tenant_a.mkdir(parents=True, exist_ok=True)
+    (tenant_a / "config.yaml").write_text(
+        "model:\n  provider: openai\n  name: tenant-a-model\n  base_url: https://tenant-a.example/v1\n",
+        encoding="utf-8",
+    )
+    (tenant_a / ".env").write_text("# no keys configured\n", encoding="utf-8")
+
+    # Secondary profile B: has its own model config AND its own API key
+    tenant_b = default_home / "profiles" / "tenant_own_key"
+    tenant_b.mkdir(parents=True, exist_ok=True)
+    (tenant_b / "config.yaml").write_text(
+        "model:\n  provider: openai\n  name: tenant-b-model\n  base_url: https://tenant-b.example/v1\n",
+        encoding="utf-8",
+    )
+    (tenant_b / ".env").write_text("OPENAI_API_KEY=sk-tenant-b-exclusive\n", encoding="utf-8")
+
+    reset_assistants()
+    try:
+        # 1. Direct _req_assistant construction for tenant_a must NOT inherit launch config or launch secrets
+        req_a = Request({"type": "http", "method": "GET", "path": "/status", "headers": [], "query_string": b""})
+        req_a.state.native_http_principal = {"profile_id": str(tenant_a)}
+        ast_a = _req_assistant(req_a)
+
+        assert ast_a.router.ollama_model == "tenant-a-model"
+        assert ast_a.router.remote_base_url == "https://tenant-a.example/v1"
+        assert ast_a.router.remote_api_key == ""
+
+        ast_a.set_allow_remote(True)
+        with pytest.raises(ValueError, match="Nessuna credenziale trovata per il provider 'openai'"):
+            ast_a.router.generate(prompt="Test question", provider="openai")
+
+        # 2. Full HTTP request lifecycle for tenant_b uses tenant_b's config and credentials exclusively
+        scoped_app = FastAPI()
+
+        @scoped_app.middleware("http")
+        async def _stamp_ticket(request: Request, call_next):
+            request.state.native_http_principal = {"profile_id": str(tenant_b)}
+            return await call_next(request)
+
+        scoped_app.include_router(router, prefix="/api/plugins/voice-document-assistant")
+        scoped_client = TestClient(scoped_app)
+
+        pdf_b = tenant_b / "doc_b.pdf"
+        create_sample_italian_pdf(pdf_b)
+
+        res_up = scoped_client.post(
+            "/api/plugins/voice-document-assistant/upload",
+            json={"file_path": str(pdf_b)},
+        )
+        assert res_up.status_code == 200
+
+        res_priv = scoped_client.post(
+            "/api/plugins/voice-document-assistant/config/privacy",
+            json={"allow_remote": True},
+        )
+        assert res_priv.status_code == 200
+
+        captured_calls = []
+
+        class MockOpenAIResp:
+            is_redirect = False
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Il sistema adotta un processore Intel Core Ultra 7 [Pagina 1]."
+                            }
+                        }
+                    ]
+                }
+
+        def mock_post(url, **kwargs):
+            captured_calls.append((url, kwargs.get("headers", {}), kwargs.get("json", {})))
+            return MockOpenAIResp()
+
+        monkeypatch.setattr("requests.post", mock_post)
+
+        res_ask = scoped_client.post(
+            "/api/plugins/voice-document-assistant/ask",
+            json={"question": "Che processore viene utilizzato?"},
+        )
+        assert res_ask.status_code == 200
+        assert len(captured_calls) == 1
+        called_url, called_headers, called_payload = captured_calls[0]
+        assert called_url == "https://tenant-b.example/v1/chat/completions"
+        assert called_headers.get("Authorization") == "Bearer sk-tenant-b-exclusive"
+        assert called_payload.get("model") == "tenant-b-model"
+    finally:
+        reset_assistants()
+
+
 
 
 

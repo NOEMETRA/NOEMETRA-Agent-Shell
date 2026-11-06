@@ -14,22 +14,38 @@ import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusResponse, ReadingBookmark
 from hermes_voice.profile import (
     PROFILE_ID_RE,
+    bind_voice_profile_scope,
     ensure_voice_dir,
     register_served_profile_home,
     resolve_voice_profile_dir,
     validate_path_profile_ownership,
 )
-from hermes_voice.server.state import get_assistant
+from hermes_voice.server.state import _evict_dead_assistants, get_assistant
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+
+async def _bind_authorized_request_scope(request: Request):
+    """Bind the authorized profile home and secret scope across assistant construction and route execution."""
+    profile_name, authorized_home = _resolve_authorized_context(request)
+    request.state._voice_resolved_context = (profile_name, authorized_home)
+    try:
+        with bind_voice_profile_scope(home_dir=authorized_home, profile=profile_name):
+            yield
+    except FileNotFoundError as e:
+        _evict_dead_assistants()
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+router = APIRouter(dependencies=[Depends(_bind_authorized_request_scope)])
 
 
 def _sanitize_filename(name: str) -> str:
@@ -207,9 +223,14 @@ def _req_profile(request: Request) -> str:
 
 
 def _req_assistant(request: Request) -> HermesVoiceAssistant:
-    profile_name, authorized_home = _resolve_authorized_context(request)
+    ctx = getattr(request.state, "_voice_resolved_context", None)
+    if ctx is not None:
+        profile_name, authorized_home = ctx
+    else:
+        profile_name, authorized_home = _resolve_authorized_context(request)
     try:
-        return get_assistant(profile=profile_name, home_dir=authorized_home)
+        with bind_voice_profile_scope(home_dir=authorized_home, profile=profile_name):
+            return get_assistant(profile=profile_name, home_dir=authorized_home)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:

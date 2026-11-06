@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Iterator, Optional, Union
 
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -77,6 +78,90 @@ def ensure_voice_dir(path: Union[str, Path]) -> Path:
     assert_voice_home_live(target)
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+@contextmanager
+def bind_voice_profile_scope(
+    home_dir: Optional[Union[str, Path]] = None,
+    profile: Optional[str] = None,
+) -> Iterator[Path]:
+    """Bind the authorized profile's HERMES_HOME override and secret scope for the active context.
+
+    Ensures load_config() and agent.secret_scope.get_secret() strictly read the authorized
+    profile's configuration and credentials rather than borrowing from the gateway's launch
+    profile (AGENTS.md:13, plugins/AGENTS.md:104-110).
+    """
+    if home_dir is not None:
+        target_home = Path(home_dir).resolve()
+        assert_voice_home_live(target_home)
+    else:
+        target_home = resolve_voice_profile_dir(profile=profile).parent.resolve()
+
+    home_token = None
+    mux_token = None
+    secret_token = None
+    try:
+        try:
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+            has_home_override = True
+        except (ImportError, ModuleNotFoundError):
+            has_home_override = False
+
+        if has_home_override:
+            home_token = set_hermes_home_override(str(target_home))
+
+        try:
+            from agent.secret_scope import (
+                _is_process_home,
+                build_profile_secret_scope,
+                current_secret_scope,
+                current_secret_scope_home,
+                reset_multiplex_context,
+                reset_secret_scope,
+                set_multiplex_context,
+                set_secret_scope,
+            )
+            has_secret_scope = True
+        except (ImportError, ModuleNotFoundError):
+            has_secret_scope = False
+
+        if has_secret_scope:
+            is_routed = not _is_process_home(target_home)
+            if is_routed:
+                mux_token = set_multiplex_context(True)
+
+            already_bound_home = current_secret_scope_home()
+            already_matches = False
+            if current_secret_scope() is not None and already_bound_home:
+                try:
+                    already_matches = Path(already_bound_home).resolve() == target_home
+                except OSError:
+                    already_matches = False
+
+            if not already_matches:
+                if is_routed:
+                    try:
+                        from hermes_cli.env_loader import hydrate_profile_secret_sources
+                        hydrate_profile_secret_sources(target_home)
+                    except Exception:
+                        pass
+                    secrets = build_profile_secret_scope(target_home)
+                else:
+                    try:
+                        from tui_gateway.launch_profile_policy import owner_secret_scope
+                        secrets = owner_secret_scope(target_home)
+                    except Exception:
+                        secrets = build_profile_secret_scope(target_home)
+                secret_token = set_secret_scope(secrets, profile_home=str(target_home))
+
+        yield target_home
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        if mux_token is not None:
+            reset_multiplex_context(mux_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 def resolve_voice_profile_dir(

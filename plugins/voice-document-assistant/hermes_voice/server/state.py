@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from hermes_voice.pipeline import HermesVoiceAssistant
-from hermes_voice.profile import assert_voice_home_live, resolve_voice_profile_dir
+from hermes_voice.profile import (
+    assert_voice_home_live,
+    bind_voice_profile_scope,
+    resolve_voice_profile_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,13 +82,14 @@ def get_assistant(
     with _lock:
         if canonical_key not in _assistants:
             logger.info("Inizializzazione HermesVoiceAssistant per identità '%s' (profilo: %s)...", canonical_key, resolved_profile)
-            _assistants[canonical_key] = HermesVoiceAssistant(
-                bookmark_path=prof_dir / "reading_state.json",
-                library_path=prof_dir / "voice_library.json",
-                cache_dir=prof_dir / "audio_cache",
-                profile=resolved_profile,
-                home_dir=prof_dir.parent,
-            )
+            with bind_voice_profile_scope(home_dir=prof_dir.parent, profile=resolved_profile):
+                _assistants[canonical_key] = HermesVoiceAssistant(
+                    bookmark_path=prof_dir / "reading_state.json",
+                    library_path=prof_dir / "voice_library.json",
+                    cache_dir=prof_dir / "audio_cache",
+                    profile=resolved_profile,
+                    home_dir=prof_dir.parent,
+                )
         return _assistants[canonical_key]
 
 
