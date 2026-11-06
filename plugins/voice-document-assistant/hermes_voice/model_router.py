@@ -96,6 +96,11 @@ class ModelRouter:
         # Resolve Ollama endpoint
         if ollama_base_url is not None:
             self.ollama_base_url = ollama_base_url.rstrip("/")
+        elif cfg_base_url and (cfg_provider and cfg_provider.lower().strip() == "ollama"):
+            endpoint = cfg_base_url
+            if endpoint.endswith("/v1"):
+                endpoint = endpoint[:-3]
+            self.ollama_base_url = endpoint.rstrip("/")
         elif cfg_base_url and self.default_provider == "ollama" and is_local_endpoint(cfg_base_url):
             endpoint = cfg_base_url
             if endpoint.endswith("/v1"):
@@ -138,13 +143,16 @@ class ModelRouter:
             self.remote_api_key = cfg_api_key
         else:
             prov_key = f"{self.default_provider.upper()}_API_KEY" if self.default_provider else None
-            self.remote_api_key = (
-                (prov_key and _get_profile_scoped_secret(prov_key))
-                or _get_profile_scoped_secret("OPENROUTER_API_KEY")
-                or _get_profile_scoped_secret("OPENAI_API_KEY")
-                or _get_profile_scoped_secret("ANTHROPIC_API_KEY")
-                or ""
-            )
+            if prov_key and prov_key not in ("OLLAMA_API_KEY", "OPENAI_COMPATIBLE_API_KEY"):
+                self.remote_api_key = _get_profile_scoped_secret(prov_key) or ""
+            elif self.default_provider in ("remote", "api"):
+                self.remote_api_key = (
+                    _get_profile_scoped_secret("REMOTE_API_KEY")
+                    or _get_profile_scoped_secret("OPENAI_API_KEY")
+                    or ""
+                )
+            else:
+                self.remote_api_key = ""
 
         self.allow_remote = allow_remote
 
@@ -290,15 +298,27 @@ class ModelRouter:
                 else:
                     target_url = "https://api.openai.com/v1"
 
-            target_key = self.remote_api_key
+            target_key = ""
+            if self.remote_api_key and self.default_provider in (selected_provider, "remote", "api"):
+                target_key = self.remote_api_key
+            elif self.remote_api_key and self.default_provider == "ollama":
+                target_key = self.remote_api_key
+
             if not target_key:
                 prov_key = f"{selected_provider.upper()}_API_KEY" if selected_provider else None
-                target_key = (
-                    (prov_key and _get_profile_scoped_secret(prov_key))
-                    or _get_profile_scoped_secret("OPENROUTER_API_KEY")
-                    or _get_profile_scoped_secret("OPENAI_API_KEY")
-                    or _get_profile_scoped_secret("ANTHROPIC_API_KEY")
-                    or ""
+                if prov_key:
+                    target_key = _get_profile_scoped_secret(prov_key) or ""
+                if not target_key and selected_provider in ("remote", "api"):
+                    target_key = (
+                        _get_profile_scoped_secret("REMOTE_API_KEY")
+                        or _get_profile_scoped_secret("OPENAI_API_KEY")
+                        or ""
+                    )
+
+            if not target_key and selected_provider in ("openai", "anthropic", "openrouter"):
+                raise ValueError(
+                    f"Nessuna credenziale trovata per il provider '{selected_provider}'. "
+                    f"Configurare {selected_provider.upper()}_API_KEY nel profilo per procedere."
                 )
 
             target_model = model or self.ollama_model

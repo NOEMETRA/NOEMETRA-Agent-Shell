@@ -368,6 +368,75 @@ def test_model_router_resolves_credentials_from_secret_scope_not_os_environ(monk
     assert router2.remote_api_key == "scoped-profile-key"
 
 
+def test_provider_credentials_remain_strictly_scoped_to_intended_provider(monkeypatch):
+    """Verify that credentials from one provider are never forwarded to another provider (P1)."""
+    # Only OPENAI_API_KEY is configured in profile secrets
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret",
+        lambda name, default=None: "sk-openai-secret-token" if name == "OPENAI_API_KEY" else None,
+    )
+    fake_config = {
+        "model": {
+            "provider": "openrouter",
+            "name": "anthropic/claude-3.5-sonnet",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    router = ModelRouter(allow_remote=True)
+    # The router must NOT fall back to OpenAI's key when provider is openrouter
+    assert router.remote_api_key == ""
+
+    # Invoking generate for openrouter without OPENROUTER_API_KEY must raise ValueError rather than leak OpenAI key
+    with pytest.raises(ValueError, match="Nessuna credenziale trovata per il provider 'openrouter'"):
+        router.generate(prompt="Explain document", provider="openrouter")
+
+    # Invoking generate for anthropic without ANTHROPIC_API_KEY must raise ValueError rather than leak OpenAI key
+    with pytest.raises(ValueError, match="Nessuna credenziale trovata per il provider 'anthropic'"):
+        router.generate(prompt="Explain document", provider="anthropic")
+
+
+def test_configured_non_loopback_ollama_endpoint_preserved(monkeypatch):
+    """Verify that configured non-loopback Ollama base URL is preserved and requires remote consent (P2)."""
+    fake_config = {
+        "model": {
+            "provider": "ollama",
+            "base_url": "http://192.168.1.100:11434",
+            "name": "gemma4:12b",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    router = ModelRouter()
+    # Non-loopback endpoint must NOT be discarded or replaced with 127.0.0.1:11434
+    assert router.ollama_base_url == "http://192.168.1.100:11434"
+
+    # Default allow_remote=False must block remote Ollama call with PermissionError
+    with pytest.raises(PermissionError, match="VIOLAZIONE VINCOLO PRIVACY: L'endpoint Ollama"):
+        router.generate(prompt="Test prompt", provider="ollama")
+
+    # When user grants consent allow_remote=True, the configured endpoint is targeted
+    router.set_allow_remote(True)
+    captured_url = []
+
+    class MockOllamaResponse:
+        is_redirect = False
+        status_code = 200
+
+        def json(self):
+            return {"response": "Answer from remote Ollama server"}
+
+    def mock_post(url, **kwargs):
+        captured_url.append(url)
+        return MockOllamaResponse()
+
+    monkeypatch.setattr("requests.post", mock_post)
+    res = router.generate(prompt="Test prompt", provider="ollama")
+    assert res == "Answer from remote Ollama server"
+    assert captured_url == ["http://192.168.1.100:11434/api/generate"]
+
+
+
 
 
 
