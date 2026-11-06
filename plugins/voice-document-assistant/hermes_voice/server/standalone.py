@@ -7,6 +7,7 @@ Mounts:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from pathlib import Path
 from urllib.parse import urlparse
@@ -24,7 +25,27 @@ app = FastAPI(
     description="Deterministic multi-agent voice document assistant",
 )
 
-ALLOWED_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "testserver"}
+ALLOWED_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "testserver", "testclient"}
+
+
+def is_loopback_address(host_or_ip: str) -> bool:
+    """Validate whether an address or hostname refers strictly to a local loopback interface."""
+    if not host_or_ip or not host_or_ip.strip():
+        return False
+    h = host_or_ip.strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if ":" in h and not h.startswith("["):
+        parts = h.split(":")
+        if len(parts) == 2:
+            h = parts[0]
+    if h in ALLOWED_LOOPBACK_HOSTS:
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+        return ip.is_loopback
+    except ValueError:
+        return False
 
 
 def is_allowed_loopback_host(host_header: str) -> bool:
@@ -38,7 +59,7 @@ def is_allowed_loopback_host(host_header: str) -> bool:
             h = h[1:closing]
     elif ":" in h:
         h = h.split(":", 1)[0]
-    return h.lower() in ALLOWED_LOOPBACK_HOSTS
+    return is_loopback_address(h)
 
 
 def is_loopback_host(url_or_origin: str) -> bool:
@@ -50,7 +71,7 @@ def is_loopback_host(url_or_origin: str) -> bool:
         if not parsed.netloc and not parsed.scheme:
             parsed = urlparse(f"http://{url_or_origin}")
         hostname = (parsed.hostname or "").lower()
-        return hostname in ALLOWED_LOOPBACK_HOSTS
+        return is_loopback_address(hostname)
     except Exception:
         return False
 
@@ -98,6 +119,11 @@ async def csrf_and_origin_protection(request: Request, call_next):
     Any other web application served on a different localhost port is a different origin and must not
     be able to read private document data or mutate playback state (AGENTS.md:22-24).
     """
+    # 0. Reject requests from non-loopback peer client addresses to prevent remote access (AGENTS.md:22-24)
+    client_host = request.client.host if request.client else ""
+    if client_host and not is_loopback_address(client_host):
+        return Response(content="Forbidden: remote client access not permitted", status_code=403)
+
     # 1. Reject requests whose Host is not an explicitly allowed loopback host, including for GET requests (DNS Rebinding Guard)
     host_header = request.headers.get("host") or ""
     if not is_allowed_loopback_host(host_header):
@@ -147,7 +173,12 @@ if STATIC_DIR.exists():
 
 
 def run(host: str = "127.0.0.1", port: int = 8080) -> None:
-    """Run server via Uvicorn."""
+    """Run server via Uvicorn strictly restricted to loopback host."""
+    if not is_loopback_address(host):
+        raise ValueError(
+            f"The standalone voice server can only bind to loopback addresses (127.0.0.1, ::1, localhost) "
+            f"to prevent exposing unauthenticated document APIs to remote clients. Received host: {host!r}."
+        )
     import uvicorn
     uvicorn.run(app, host=host, port=port, log_level="info")
 
