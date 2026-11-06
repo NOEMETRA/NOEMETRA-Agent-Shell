@@ -39,6 +39,7 @@ from hermes_voice.player import DocumentPlayer
 from hermes_voice.profile import (
     assert_voice_home_live,
     bind_voice_profile_scope,
+    compute_home_fingerprint,
     ensure_voice_dir,
     resolve_voice_profile_dir,
     validate_path_profile_ownership,
@@ -295,6 +296,7 @@ class HermesVoiceAssistant:
             speed=self.player.speed,
             client_playback=self.player.client_playback,
             allow_remote=self.router.allow_remote,
+            home_fingerprint=compute_home_fingerprint(self.home_dir),
             agents=self._agents_status,
             last_answer=self._last_answer,
         )
