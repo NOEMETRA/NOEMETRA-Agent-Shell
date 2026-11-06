@@ -23,6 +23,9 @@ import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'voice-document-assistant'
+const ASK_REQUEST_TIMEOUT_MS = 240000
+const AUDIO_SYNTH_TIMEOUT_MS = 120000
+const DOCUMENT_LOAD_TIMEOUT_MS = 120000
 
 // Custom styling adhering to Hermes theme CSS variables
 const CSS = `
@@ -456,7 +459,9 @@ function VoiceDocumentPage({ ctx }) {
               }
               try {
                 const currentSentIdx = s.current_sentence_index
-                const audioData = await ctx.rest(`/audio/sentence/${currentSentIdx}?format=json`)
+                const audioData = await ctx.rest(`/audio/sentence/${currentSentIdx}?format=json`, {
+                  timeoutMs: AUDIO_SYNTH_TIMEOUT_MS
+                })
 
                 // Discard audio fetched for an obsolete playback state or unmounted view (AGENTS.md:59-62)
                 if (disposed || currentGen !== pollGenRef.current) {
@@ -641,7 +646,6 @@ function VoiceDocumentPage({ ctx }) {
     try {
       await ctx.rest('/playback/play', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: { output: 'client' },
       })
     } catch (err) {
@@ -665,7 +669,6 @@ function VoiceDocumentPage({ ctx }) {
     try {
       await ctx.rest('/playback/resume', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: { output: 'client' },
       })
     } catch (err) {
@@ -737,9 +740,12 @@ function VoiceDocumentPage({ ctx }) {
         fetchingTargetRef.current = ''
         await ctx.rest('/select_document', {
           method: 'POST',
-          body: { doc_id: docId }
+          body: { doc_id: docId },
+          timeoutMs: DOCUMENT_LOAD_TIMEOUT_MS
         })
-        const switched = await ctx.rest(`/document/${docId}`)
+        const switched = await ctx.rest(`/document/${docId}`, {
+          timeoutMs: DOCUMENT_LOAD_TIMEOUT_MS
+        })
         setDocData(switched)
       }
       handleSeekPage(page)
@@ -753,7 +759,8 @@ function VoiceDocumentPage({ ctx }) {
     try {
       await ctx.rest('/playback/config', {
         method: 'POST',
-        body: { tts_model }
+        body: { tts_model },
+        timeoutMs: AUDIO_SYNTH_TIMEOUT_MS
       })
       host.notify({ kind: 'info', message: `Modello Pocket TTS impostato su: ${tts_model}` })
     } catch (err) {
@@ -809,7 +816,8 @@ function VoiceDocumentPage({ ctx }) {
           body: {
             filename: file.name,
             content_base64: base64Data
-          }
+          },
+          timeoutMs: DOCUMENT_LOAD_TIMEOUT_MS
         })
         if (res && res.document) {
           pollGenRef.current++
@@ -844,7 +852,8 @@ function VoiceDocumentPage({ ctx }) {
     try {
       const res = await ctx.rest('/select_document', {
         method: 'POST',
-        body: { doc_id: docId }
+        body: { doc_id: docId },
+        timeoutMs: DOCUMENT_LOAD_TIMEOUT_MS
       })
       if (res && res.document) {
         setDocData(res.document)
@@ -870,7 +879,8 @@ function VoiceDocumentPage({ ctx }) {
     try {
       const answer = await ctx.rest('/ask', {
         method: 'POST',
-        body: { question: q }
+        body: { question: q },
+        timeoutMs: ASK_REQUEST_TIMEOUT_MS
       })
       const assistantMsg = {
         role: 'assistant',
