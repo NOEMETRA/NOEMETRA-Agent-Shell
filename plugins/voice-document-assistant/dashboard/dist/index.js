@@ -207,14 +207,15 @@
 
     const handleAsk = async (e) => {
       if (e) e.preventDefault();
-      if (!question.trim()) return;
+      const targetDocId = status?.doc_id || null;
+      if (!question.trim() || !targetDocId) return;
       setLoading(true);
       setError(null);
       try {
         const res = await fetchJSON("/api/plugins/voice-document-assistant/ask", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question }),
+          body: JSON.stringify({ question, doc_id: targetDocId }),
         });
         setAnswer(res);
       } catch (err) {
@@ -415,8 +416,15 @@
               { style: { display: "flex", gap: "0.5rem", alignItems: "center", fontSize: "0.75rem" } },
               h(
                 "span",
-                { style: { color: answer.is_grounded ? "#22c55e" : "#ef4444", fontWeight: 600 } },
-                answer.is_grounded ? "✓ Verificata dal Verificatore" : "⚠ Non verificata"
+                {
+                  style: {
+                    color: (answer.verification ? answer.verification.is_valid : answer.is_grounded) ? "#22c55e" : "#ef4444",
+                    fontWeight: 600,
+                  },
+                },
+                (answer.verification ? answer.verification.is_valid : answer.is_grounded)
+                  ? "✓ Verificata dal Verificatore"
+                  : "⚠ Non verificata"
               ),
               answer.citations &&
                 answer.citations.length > 0 &&

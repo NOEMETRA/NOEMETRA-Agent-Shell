@@ -1045,6 +1045,79 @@ def test_fetching_sentence_audio_does_not_mutate_server_playback_mode(monkeypatc
             assistant.player.client_playback = prev_client
 
 
+def test_ask_binds_question_to_requested_document_across_concurrent_switch(monkeypatch):
+    """Verify /ask resolves the explicit doc_id even after another view switches the active document (P2)."""
+    import pymupdf
+
+    assistant = get_assistant()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_alpha = Path(tmpdir) / "alpha.pdf"
+        doc_a = pymupdf.open()
+        page_a = doc_a.new_page()
+        page_a.insert_text((72, 72), "Il parametro riservato Alfa vale esattamente novemila.")
+        doc_a.save(str(pdf_alpha))
+        doc_a.close()
+
+        pdf_beta = Path(tmpdir) / "beta.pdf"
+        doc_b = pymupdf.open()
+        page_b = doc_b.new_page()
+        page_b.insert_text((72, 72), "Il coefficiente operativo Beta misura quarantadue.")
+        doc_b.save(str(pdf_beta))
+        doc_b.close()
+
+        up_a = client.post("/api/plugins/voice-document-assistant/upload", json={"file_path": str(pdf_alpha)})
+        assert up_a.status_code == 200
+        doc_alpha_id = up_a.json()["document"]["doc_id"]
+
+        # Another view switches active document to Beta before /ask for Alpha arrives
+        up_b = client.post("/api/plugins/voice-document-assistant/upload", json={"file_path": str(pdf_beta)})
+        assert up_b.status_code == 200
+        doc_beta_id = up_b.json()["document"]["doc_id"]
+        assert doc_alpha_id != doc_beta_id
+        assert assistant.current_document.doc_id == doc_beta_id
+
+        # Evict Alpha from in-memory cache to verify library-backed resolution without falling back to Beta
+        assistant._doc_cache.pop(doc_alpha_id, None)
+
+        seen_excerpts = []
+
+        def mock_answer(question, excerpts):
+            seen_excerpts.extend([e.text for e in excerpts])
+            return GroundedAnswer(
+                question=question,
+                answer='Il parametro riservato Alfa vale esattamente "novemila" [Pagina 1].',
+                citations=[
+                    Citation(
+                        page_number=1,
+                        verbatim_quote="novemila",
+                    )
+                ],
+                model_used="mock-local",
+            )
+
+        monkeypatch.setattr(assistant.analyst, "answer_question", mock_answer)
+
+        res_ask = client.post(
+            "/api/plugins/voice-document-assistant/ask",
+            json={"question": "Quanto vale il parametro Alfa?", "doc_id": doc_alpha_id},
+        )
+        assert res_ask.status_code == 200
+        payload = res_ask.json()
+        assert payload["doc_id"] == doc_alpha_id
+        assert payload["verification"]["is_valid"] is True
+        assert any("novemila" in txt for txt in seen_excerpts)
+        assert not any("quarantadue" in txt for txt in seen_excerpts)
+        assert assistant.current_document.doc_id == doc_beta_id
+
+        # Unknown doc_id must return 404 instead of silently answering against Beta
+        res_missing = client.post(
+            "/api/plugins/voice-document-assistant/ask",
+            json={"question": "Domanda su documento rimosso", "doc_id": "nonexistent_doc_id_999"},
+        )
+        assert res_missing.status_code == 404
+
+
+
 
 
 

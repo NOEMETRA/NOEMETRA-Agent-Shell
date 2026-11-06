@@ -103,6 +103,8 @@ class VerificationResult(BaseModel):
 
 class GroundedAnswer(BaseModel):
     """Response to user question with evidence and page citations."""
+    doc_id: str = ""
+    doc_title: str = ""
     question: str
     answer: str
     citations: List[Citation] = Field(default_factory=list)

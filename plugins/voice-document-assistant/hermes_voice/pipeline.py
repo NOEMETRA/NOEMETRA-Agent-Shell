@@ -207,6 +207,7 @@ class HermesVoiceAssistant:
         library = self.get_library()
         entry = next((e for e in library if e.doc_id == doc_id), None)
         if entry and Path(entry.file_path).exists():
+            validate_path_profile_ownership(entry.file_path, profile=self.profile, home_dir=self.home_dir)
             doc = self.extractor.extract(entry.file_path)
             self._doc_cache[doc.doc_id] = doc
             return doc
@@ -300,48 +301,65 @@ class HermesVoiceAssistant:
 
     def ask(self, question: str, doc_id: Optional[str] = None) -> GroundedAnswer:
         """Execute full multi-agent question answering flow with verification,
-        pinned to the document context to prevent cross-document races.
+        pinned to the requested document context to prevent cross-document races.
         """
-        doc = None
-        if doc_id and doc_id in self._doc_cache:
-            doc = self._doc_cache[doc_id]
-        if not doc:
+        cleaned_doc_id = (doc_id or "").strip() or None
+        if cleaned_doc_id is not None:
+            doc = self.get_document_by_id(cleaned_doc_id)
+            if not doc:
+                raise FileNotFoundError(
+                    f"Documento ID '{cleaned_doc_id}' non presente nella biblioteca."
+                )
+        else:
             doc = self.current_document
-        if not doc:
-            raise ValueError("Nessun documento caricato. Utilizzare load_document() prima di formulare domande.")
+            if not doc:
+                raise ValueError(
+                    "Nessun documento caricato. Utilizzare load_document() prima di formulare domande."
+                )
 
-        logger.info(f"Domanda ricevuta per documento '{doc.title}': '{question}'")
+        logger.info(f"Domanda ricevuta per documento '{doc.title}' ({doc.doc_id}): '{question}'")
+
+        def _is_active_doc() -> bool:
+            return bool(self.current_document and self.current_document.doc_id == doc.doc_id)
 
         # Request-local retrieval and verification agents bound to target doc to eliminate cross-document races
         librarian = LibrarianAgent(doc)
         verifier = VerifierAgent(doc)
 
         # Step 1: Bibliotecario retrieves relevant evidence
-        self._agents_status.librarian = "searching"
-        self._agents_status.detail = "Bibliotecario: ricerca estratti pertinenti..."
+        if _is_active_doc():
+            self._agents_status.librarian = "searching"
+            self._agents_status.detail = "Bibliotecario: ricerca estratti pertinenti..."
         excerpts = librarian.search(question, top_k=3)
-        self._agents_status.librarian = "ready"
+        if _is_active_doc():
+            self._agents_status.librarian = "ready"
         logger.info(f"Bibliotecario ha individuato {len(excerpts)} estratti pertinenti.")
 
         # Step 2: Analista formulates answer with citations
-        self._agents_status.analyst = "generating"
-        self._agents_status.detail = "Analista: formulazione risposta grounded..."
+        if _is_active_doc():
+            self._agents_status.analyst = "generating"
+            self._agents_status.detail = "Analista: formulazione risposta grounded..."
         with bind_voice_profile_scope(home_dir=self.home_dir, profile=self.profile):
             grounded_answer = self.analyst.answer_question(question, excerpts)
-        self._agents_status.analyst = "ready"
+        grounded_answer.doc_id = doc.doc_id
+        grounded_answer.doc_title = doc.title
+        if _is_active_doc():
+            self._agents_status.analyst = "ready"
         logger.info(f"Analista ha generato la risposta con {len(grounded_answer.citations)} citazioni.")
 
         # Step 3: Verificatore validates citations against source text
-        self._agents_status.verifier = "verifying"
-        self._agents_status.detail = "Verificatore: controllo fedeltà citazioni..."
+        if _is_active_doc():
+            self._agents_status.verifier = "verifying"
+            self._agents_status.detail = "Verificatore: controllo fedeltà citazioni..."
         verification = verifier.verify(grounded_answer)
 
-        if verification.is_valid:
-            self._agents_status.verifier = "valid"
-            self._agents_status.detail = f"Verifica completata: {verification.notes}"
-        else:
-            self._agents_status.verifier = "invalid"
-            self._agents_status.detail = f"Attenzione: {verification.notes}"
+        if _is_active_doc():
+            if verification.is_valid:
+                self._agents_status.verifier = "valid"
+                self._agents_status.detail = f"Verifica completata: {verification.notes}"
+            else:
+                self._agents_status.verifier = "invalid"
+                self._agents_status.detail = f"Attenzione: {verification.notes}"
 
         logger.info(
             f"Verificatore: stato={'CONFERMATO' if verification.is_valid else 'ANOMALIA'}, "
@@ -349,6 +367,6 @@ class HermesVoiceAssistant:
         )
 
         # Associate result with current document only if document did not switch mid-flight
-        if self.current_document and self.current_document.doc_id == doc.doc_id:
+        if _is_active_doc():
             self._last_answer = grounded_answer
         return grounded_answer

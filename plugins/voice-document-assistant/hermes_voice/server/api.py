@@ -266,6 +266,7 @@ class ConfigRequest(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
+    doc_id: Optional[str] = None
 
 
 class PrivacyRequest(BaseModel):
@@ -611,16 +612,24 @@ async def configure_playback(req: ConfigRequest, request: Request):
 @router.post("/ask")
 async def ask_question(req: AskRequest, request: Request):
     """Ask question to document using Bibliotecario, Analista, and Verificatore.
-    Dispatched off the event loop via asyncio.to_thread and pinned to active document context.
+    Dispatched off the event loop via asyncio.to_thread and pinned to requested or active document context.
     """
     assistant = _req_assistant(request)
-    if not assistant.current_document:
-        raise HTTPException(status_code=400, detail="Nessun documento attivo. Caricare un PDF prima di interrogare gli agenti.")
+    requested_doc_id = (req.doc_id or "").strip() or None
+    if not requested_doc_id and not assistant.current_document:
+        raise HTTPException(
+            status_code=400,
+            detail="Nessun documento attivo. Caricare un PDF prima di interrogare gli agenti.",
+        )
 
-    target_doc_id = assistant.current_document.doc_id
+    target_doc_id = requested_doc_id or assistant.current_document.doc_id
     try:
         grounded_answer = await asyncio.to_thread(assistant.ask, req.question, target_doc_id)
         return grounded_answer.model_dump()
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Errore durante l'interrogazione della Triade: {e}")
         raise HTTPException(status_code=500, detail=str(e))

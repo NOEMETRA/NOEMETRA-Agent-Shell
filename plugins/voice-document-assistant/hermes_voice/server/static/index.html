@@ -974,7 +974,8 @@
     // Q&A Chat
     async function ask() {
       const q = questionInput.value.trim();
-      if (!q || isAsking) return;
+      const targetDocId = (currentDocData && currentDocData.doc_id) || (currentStatus && currentStatus.doc_id) || null;
+      if (!q || isAsking || !targetDocId) return;
 
       isAsking = true;
       askBtn.disabled = true;
@@ -991,7 +992,7 @@
       try {
         const answer = await api('/ask', {
           method: 'POST',
-          body: JSON.stringify({ question: q })
+          body: JSON.stringify({ question: q, doc_id: targetDocId })
         });
 
         const asstDiv = document.createElement('div');
@@ -1011,14 +1012,17 @@
           label.textContent = 'Riferimenti verificabili:';
           citRow.appendChild(label);
 
-          const sourceDocId = currentDocData ? currentDocData.doc_id : null;
+          const sourceDocId = answer.doc_id || targetDocId;
           answer.citations.forEach(cit => {
             const btn = document.createElement('button');
             btn.className = 'citation-badge';
             btn.textContent = `[Pagina ${cit.page_number}]`;
             btn.title = `Clicca per aprire Pagina ${cit.page_number}\n"${cit.verbatim_quote}"`;
             btn.onclick = async () => {
-              if (sourceDocId && currentDocData && currentDocData.doc_id !== sourceDocId) {
+              const needsSwitch = Boolean(
+                sourceDocId && (!currentDocData || currentDocData.doc_id !== sourceDocId || (currentStatus && currentStatus.doc_id !== sourceDocId))
+              );
+              if (needsSwitch) {
                 await api('/select_document', {
                   method: 'POST',
                   body: JSON.stringify({ doc_id: sourceDocId })
