@@ -32,9 +32,11 @@ class DocumentExtractor:
 
     def __init__(self, ocr_language: str = "ita"):
         self.ocr_language = ocr_language
-        # Regex for Italian sentence splitting preserving delimiters
-        # Splits after . ! ? followed by whitespace or quotes
-        self._sentence_regex = re.compile(r'([^\.!?]+[\.!?]+(?:[\'"]|\s+|$))', re.UNICODE)
+        # Regex for Italian sentence splitting preserving delimiters, decimals (e.g. 2.6), and closing quotes
+        self._sentence_regex = re.compile(
+            r'.+?[\.!?]+[\'"”»\)\]]*(?:[\.!?]+[\'"”»\)\]]*)*(?:\s+|$)',
+            re.UNICODE,
+        )
 
     def extract(self, file_path: str | Path) -> ExtractedDocument:
         """Extract all pages and segment into verbatim sentences."""
@@ -195,8 +197,29 @@ class DocumentExtractor:
         return " ".join(lines)
 
     def _split_into_sentences(self, text: str) -> List[str]:
-        """Split text into sentences while respecting Italian abbreviations."""
-        raw_chunks = self._sentence_regex.findall(text)
+        """Split text into sentences while respecting Italian abbreviations and preserving trailing text."""
+        raw_chunks: List[str] = []
+        cursor = 0
+
+        for match in self._sentence_regex.finditer(text):
+            if match.start() > cursor:
+                gap = text[cursor:match.start()]
+                if gap.strip():
+                    if raw_chunks and not any(ch.isalnum() for ch in gap):
+                        raw_chunks[-1] += gap
+                    else:
+                        raw_chunks.append(gap)
+            raw_chunks.append(match.group(0))
+            cursor = match.end()
+
+        if cursor < len(text):
+            tail = text[cursor:]
+            if tail.strip():
+                if raw_chunks and not any(ch.isalnum() for ch in tail):
+                    raw_chunks[-1] += tail
+                else:
+                    raw_chunks.append(tail)
+
         if not raw_chunks:
             return [text.strip()] if text.strip() else []
 
