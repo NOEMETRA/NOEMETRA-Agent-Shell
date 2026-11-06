@@ -821,6 +821,35 @@ def test_secondary_profile_native_ticket_binds_config_and_secret_scope(tmp_path,
         reset_assistants()
 
 
+def test_playback_ack_ignores_stale_doc_id():
+    """Verify that client playback acknowledgements carrying a stale doc_id do not advance a newly selected document (P2)."""
+    assistant = get_assistant()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc_current.pdf"
+        create_sample_italian_pdf(pdf_path)
+        assistant.load_document(pdf_path)
+        active_doc_id = assistant.current_document.doc_id
+
+        assistant.player._client_started_event.clear()
+        assistant.player._client_ended_event.clear()
+
+        # Stale ack for a previous document at the same sentence_index=0 must be ignored
+        res_stale = client.post(
+            "/api/plugins/voice-document-assistant/playback/ack",
+            json={"doc_id": "stale_previous_doc_id", "sentence_index": 0, "event": "ended"},
+        )
+        assert res_stale.status_code == 200
+        assert not assistant.player._client_ended_event.is_set()
+
+        # Matching doc_id ack is honored
+        res_valid = client.post(
+            "/api/plugins/voice-document-assistant/playback/ack",
+            json={"doc_id": active_doc_id, "sentence_index": 0, "event": "ended"},
+        )
+        assert res_valid.status_code == 200
+        assert assistant.player._client_ended_event.is_set()
+
+
 
 
 

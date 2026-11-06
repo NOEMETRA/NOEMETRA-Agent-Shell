@@ -332,9 +332,17 @@ class DocumentPlayer:
         sf.write(buffer, audio_data, sr, format="WAV")
         return buffer.getvalue()
 
-    def handle_client_ack(self, sentence_index: int, event: str, offset_seconds: Optional[float] = None) -> None:
+    def handle_client_ack(
+        self,
+        sentence_index: int,
+        event: str,
+        offset_seconds: Optional[float] = None,
+        doc_id: Optional[str] = None,
+    ) -> None:
         """Process client playback progress and completion events."""
         with self._lock:
+            if doc_id and self._document and self._document.doc_id != doc_id:
+                return
             self.client_playback = True
             if sentence_index == self._current_sent_idx:
                 if event == "started":

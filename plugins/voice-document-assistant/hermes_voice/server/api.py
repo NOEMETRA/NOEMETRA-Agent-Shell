@@ -247,6 +247,7 @@ class SeekRequest(BaseModel):
 
 
 class PlaybackAckRequest(BaseModel):
+    doc_id: Optional[str] = None
     sentence_index: int
     event: str = "started"  # "started" | "ended" | "progress"
     offset_seconds: Optional[float] = None
@@ -553,6 +554,7 @@ async def ack_playback(req: PlaybackAckRequest, request: Request):
         sentence_index=req.sentence_index,
         event=req.event,
         offset_seconds=req.offset_seconds,
+        doc_id=req.doc_id,
     )
     return {"status": "success", "bookmark": assistant.player.get_bookmark().model_dump()}
 
