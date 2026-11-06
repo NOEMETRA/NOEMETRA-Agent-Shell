@@ -450,7 +450,7 @@ function VoiceDocumentPage({ ctx }) {
           const playTargetKey = `${targetDocId}:${s.current_sentence_index}`
 
           // Client-side local audio streaming for desktop playback via profile-aware ctx.rest gateway bridge
-          if (isPlaying) {
+          if (isPlaying && s.client_playback !== false) {
             if (playTargetKey !== lastPlayedTargetRef.current && fetchingTargetRef.current !== playTargetKey) {
               fetchingTargetRef.current = playTargetKey
               if (clientAudioRef.current) {
@@ -477,6 +477,7 @@ function VoiceDocumentPage({ ctx }) {
                   currentGen !== pollGenRef.current ||
                   !fresh ||
                   fresh.state !== 'playing' ||
+                  fresh.client_playback === false ||
                   `${freshDocId}:${fresh.current_sentence_index}` !== playTargetKey
                 ) {
                   fetchingTargetRef.current = ''
