@@ -110,6 +110,12 @@ pytest tests/ -v
 
 ## 🚀 Come Utilizzare l'Applicazione (Zero CLI)
 
+Le dipendenze Python opzionali del pacchetto vocale sono gestite dall'extra `voice-document-assistant` di Hermes:
+```powershell
+hermes pm install --extra voice-document-assistant
+# In caso di ripristino o dipendenze danneggiate: hermes pm repair
+```
+
 ### Opzione A: Tramite Hermes Desktop
 1. Avviare Hermes Desktop:
    ```powershell

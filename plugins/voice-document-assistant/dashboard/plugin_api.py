@@ -24,8 +24,23 @@ except (ImportError, ModuleNotFoundError) as err:
     async def _missing_deps():
         return {
             "error": "missing_dependencies",
-            "detail": f"Dipendenze Python mancanti ({_missing_err_msg}). Eseguire: hermes plugins install voice-document-assistant",
+            "state": "error",
+            "detail": (
+                f"Dipendenze Python del plugin vocale non trovate ({_missing_err_msg}). "
+                "Per completare l'installazione, eseguire: 'hermes pm install --extra voice-document-assistant' "
+                "(oppure 'hermes pm repair'), quindi riavviare l'applicazione desktop o il gateway Hermes."
+            ),
+            "repair_command": "hermes pm install --extra voice-document-assistant",
+            "restart_required": True,
         }
+
+    @router.get("/library")
+    async def _missing_deps_library():
+        return {"documents": [], "error": "missing_dependencies"}
+
+    @router.get("/models")
+    async def _missing_deps_models():
+        return {"error": "missing_dependencies", "default_provider": "ollama", "models": []}
 
 __all__ = ["router"]
 

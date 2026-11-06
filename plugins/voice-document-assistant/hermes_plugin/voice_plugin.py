@@ -19,7 +19,8 @@ def _get_assistant():
     except (ImportError, ModuleNotFoundError) as err:
         raise RuntimeError(
             f"Dipendenze Python mancanti per voice-document-assistant ({err}). "
-            "Installare con: hermes plugins install voice-document-assistant"
+            "Installare con: 'hermes pm install --extra voice-document-assistant' (oppure 'hermes pm repair'), "
+            "quindi riavviare Hermes."
         ) from err
 
 
