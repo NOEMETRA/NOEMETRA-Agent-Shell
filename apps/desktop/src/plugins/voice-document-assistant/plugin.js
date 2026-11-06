@@ -423,18 +423,18 @@ function VoiceDocumentPage({ ctx }) {
   const clientAudioRef = useRef(null)
   const lastPlayedTargetRef = useRef('')
   const fetchingTargetRef = useRef('')
+  const pollGenRef = useRef(0)
 
   // Poll backend status and synchronize client-side audio playback
   useEffect(() => {
     let disposed = false
     let timer = null
-    let pollGen = 0
 
     const poll = async () => {
       try {
-        const currentGen = ++pollGen
+        const currentGen = ++pollGenRef.current
         const s = await ctx.rest('/status')
-        if (disposed || currentGen !== pollGen) return
+        if (disposed || currentGen !== pollGenRef.current) return
         setStatus(s)
         if (s && s.current_page) {
           const isPlaying = s.state === 'playing'
@@ -459,17 +459,31 @@ function VoiceDocumentPage({ ctx }) {
                 const audioData = await ctx.rest(`/audio/sentence/${currentSentIdx}?format=json`)
 
                 // Discard audio fetched for an obsolete playback state or unmounted view (AGENTS.md:59-62)
-                if (disposed || currentGen !== pollGen) {
+                if (disposed || currentGen !== pollGenRef.current) {
+                  fetchingTargetRef.current = ''
+                  return
+                }
+
+                // Re-validate playback state after audio synthesis
+                const fresh = await ctx.rest('/status')
+                if (
+                  disposed ||
+                  currentGen !== pollGenRef.current ||
+                  !fresh ||
+                  fresh.state !== 'playing' ||
+                  `${targetDocId}:${fresh.current_sentence_index}` !== playTargetKey
+                ) {
                   fetchingTargetRef.current = ''
                   return
                 }
 
                 if (audioData && audioData.audio_base64) {
                   const audio = new Audio(`data:audio/wav;base64,${audioData.audio_base64}`)
-                  if (s.speed) {
-                    audio.playbackRate = s.speed
+                  const effectiveSpeed = fresh.speed || s.speed
+                  if (effectiveSpeed) {
+                    audio.playbackRate = effectiveSpeed
                   }
-                  const startOffset = s.audio_seconds_offset || 0
+                  const startOffset = fresh.audio_seconds_offset !== undefined ? fresh.audio_seconds_offset : (s.audio_seconds_offset || 0)
                   if (startOffset > 0.05) {
                     const setOffset = () => {
                       try {
@@ -520,7 +534,7 @@ function VoiceDocumentPage({ ctx }) {
                   }, { once: true })
 
                   // Re-verify freshness before initiating audio playback
-                  if (disposed || currentGen !== pollGen) {
+                  if (disposed || currentGen !== pollGenRef.current) {
                     fetchingTargetRef.current = ''
                     return
                   }
@@ -577,7 +591,7 @@ function VoiceDocumentPage({ ctx }) {
     poll()
     return () => {
       disposed = true
-      ++pollGen
+      pollGenRef.current++
       fetchingTargetRef.current = ''
       lastPlayedTargetRef.current = ''
       if (timer) clearTimeout(timer)
@@ -618,6 +632,7 @@ function VoiceDocumentPage({ ctx }) {
 
   // Playback handlers
   const handlePlay = async () => {
+    pollGenRef.current++
     try {
       await ctx.rest('/playback/play', {
         method: 'POST',
@@ -630,6 +645,8 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handlePause = async () => {
+    pollGenRef.current++
+    fetchingTargetRef.current = ''
     if (clientAudioRef.current) clientAudioRef.current.pause()
     try {
       await ctx.rest('/playback/pause', { method: 'POST' })
@@ -639,6 +656,7 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleResume = async () => {
+    pollGenRef.current++
     try {
       await ctx.rest('/playback/resume', {
         method: 'POST',
@@ -651,6 +669,7 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleStop = async () => {
+    pollGenRef.current++
     if (clientAudioRef.current) {
       clientAudioRef.current.pause()
       clientAudioRef.current = null
@@ -665,6 +684,7 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleSeekSentence = async (sentenceIdx) => {
+    pollGenRef.current++
     if (clientAudioRef.current) {
       clientAudioRef.current.pause()
       clientAudioRef.current = null
@@ -682,6 +702,7 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleSeekPage = async (page) => {
+    pollGenRef.current++
     if (clientAudioRef.current) {
       clientAudioRef.current.pause()
       clientAudioRef.current = null
@@ -700,6 +721,7 @@ function VoiceDocumentPage({ ctx }) {
   }
 
   const handleSeekCitation = async (docId, page) => {
+    pollGenRef.current++
     try {
       if (docId && docData && docData.doc_id !== docId) {
         if (clientAudioRef.current) {
@@ -785,6 +807,7 @@ function VoiceDocumentPage({ ctx }) {
           }
         })
         if (res && res.document) {
+          pollGenRef.current++
           if (clientAudioRef.current) {
             clientAudioRef.current.pause()
             clientAudioRef.current = null
@@ -806,6 +829,7 @@ function VoiceDocumentPage({ ctx }) {
   const handleSelectDoc = async (e) => {
     const docId = e.target.value
     if (!docId) return
+    pollGenRef.current++
     if (clientAudioRef.current) {
       clientAudioRef.current.pause()
       clientAudioRef.current = null

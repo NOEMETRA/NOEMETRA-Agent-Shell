@@ -54,6 +54,17 @@
               fetchingTargetRef.current = "";
               return;
             }
+            // Re-validate playback state after audio synthesis
+            const fresh = await fetchJSON("/api/plugins/voice-document-assistant/status");
+            const freshPlaying = fresh && (fresh.state === "playing" || fresh.player_state === "PLAYING");
+            if (
+              currentGen !== pollGenRef.current ||
+              !freshPlaying ||
+              `${fresh.doc_id || ""}:${fresh.current_sentence_index}` !== playTargetKey
+            ) {
+              fetchingTargetRef.current = "";
+              return;
+            }
             const audio = new Audio(`data:audio/wav;base64,${audioData.audio_base64}`);
             audio.addEventListener("error", () => {
               fetchingTargetRef.current = "";
@@ -167,10 +178,11 @@
     }, [refreshStatus, refreshLibrary]);
 
     const handleAction = async (endpoint, body = {}) => {
+      pollGenRef.current++;
       const normalizedEndpoint = (endpoint === "play" || endpoint === "pause" || endpoint === "resume" || endpoint === "stop" || endpoint === "seek" || endpoint === "config")
         ? `playback/${endpoint}`
         : endpoint;
-      if (normalizedEndpoint === "playback/pause" || normalizedEndpoint === "playback/stop" || normalizedEndpoint === "playback/seek") {
+      if (normalizedEndpoint === "playback/pause" || normalizedEndpoint === "playback/stop" || normalizedEndpoint === "playback/seek" || normalizedEndpoint === "select_document") {
         lastPlayedTargetRef.current = "";
         fetchingTargetRef.current = "";
         if (clientAudioRef.current) clientAudioRef.current.pause();
