@@ -88,32 +88,35 @@
               else audio.addEventListener("loadedmetadata", setOffset, { once: true });
             }
             audio.addEventListener("play", () => {
+              if (lastPlayedTargetRef.current !== playTargetKey) return;
               fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ sentence_index: currentSentIdx, event: "started" })
+                body: JSON.stringify({ doc_id: fresh.doc_id || targetDocId, sentence_index: currentSentIdx, event: "started" })
               }).catch(() => {});
             }, { once: true });
             let lastProgressAck = 0;
             audio.addEventListener("timeupdate", () => {
+              if (lastPlayedTargetRef.current !== playTargetKey) return;
               const now = Date.now();
               if (now - lastProgressAck > 300) {
                 lastProgressAck = now;
                 fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ sentence_index: currentSentIdx, event: "progress", offset_seconds: audio.currentTime })
+                  body: JSON.stringify({ doc_id: fresh.doc_id || targetDocId, sentence_index: currentSentIdx, event: "progress", offset_seconds: audio.currentTime })
                 }).catch(() => {});
               }
             });
             audio.addEventListener("ended", () => {
               const sendEndedAck = (retryCount = 0) => {
+                if (lastPlayedTargetRef.current !== playTargetKey) return;
                 fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ sentence_index: currentSentIdx, event: "ended" })
+                  body: JSON.stringify({ doc_id: fresh.doc_id || targetDocId, sentence_index: currentSentIdx, event: "ended" })
                 }).catch(() => {
-                  if (retryCount < 2) {
+                  if (retryCount < 2 && lastPlayedTargetRef.current === playTargetKey) {
                     setTimeout(() => sendEndedAck(retryCount + 1), 1000);
                   }
                 });

@@ -464,14 +464,15 @@ function VoiceDocumentPage({ ctx }) {
                   return
                 }
 
-                // Re-validate playback state after audio synthesis
+                // Re-validate playback state and active document ID after audio synthesis
                 const fresh = await ctx.rest('/status')
+                const freshDocId = fresh && fresh.doc_id ? fresh.doc_id : ''
                 if (
                   disposed ||
                   currentGen !== pollGenRef.current ||
                   !fresh ||
                   fresh.state !== 'playing' ||
-                  `${targetDocId}:${fresh.current_sentence_index}` !== playTargetKey
+                  `${freshDocId}:${fresh.current_sentence_index}` !== playTargetKey
                 ) {
                   fetchingTargetRef.current = ''
                   return
@@ -499,19 +500,22 @@ function VoiceDocumentPage({ ctx }) {
                     }
                   }
                   audio.addEventListener('play', () => {
+                    if (disposed || lastPlayedTargetRef.current !== playTargetKey) return
                     ctx.rest('/playback/ack', {
                       method: 'POST',
-                      body: { sentence_index: currentSentIdx, event: 'started' }
+                      body: { doc_id: freshDocId || targetDocId, sentence_index: currentSentIdx, event: 'started' }
                     }).catch(() => {})
                   }, { once: true })
                   let lastProgressAck = 0
                   audio.addEventListener('timeupdate', () => {
+                    if (disposed || lastPlayedTargetRef.current !== playTargetKey) return
                     const now = Date.now()
                     if (now - lastProgressAck > 300) {
                       lastProgressAck = now
                       ctx.rest('/playback/ack', {
                         method: 'POST',
                         body: {
+                          doc_id: freshDocId || targetDocId,
                           sentence_index: currentSentIdx,
                           event: 'progress',
                           offset_seconds: audio.currentTime
@@ -521,11 +525,12 @@ function VoiceDocumentPage({ ctx }) {
                   })
                   audio.addEventListener('ended', () => {
                     const sendEndedAck = (retryCount = 0) => {
+                      if (disposed || lastPlayedTargetRef.current !== playTargetKey) return
                       ctx.rest('/playback/ack', {
                         method: 'POST',
-                        body: { sentence_index: currentSentIdx, event: 'ended' }
+                        body: { doc_id: freshDocId || targetDocId, sentence_index: currentSentIdx, event: 'ended' }
                       }).catch(() => {
-                        if (retryCount < 2 && !disposed) {
+                        if (retryCount < 2 && !disposed && lastPlayedTargetRef.current === playTargetKey) {
                           setTimeout(() => sendEndedAck(retryCount + 1), 1000)
                         }
                       })

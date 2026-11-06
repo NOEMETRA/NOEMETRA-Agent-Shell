@@ -565,7 +565,7 @@
     const privacyConsentToggle = document.getElementById('privacyConsentToggle');
 
     let clientAudio = null;
-    let lastPlayedSentence = -1;
+    let lastPlayedTarget = '';
 
     // API Helper
     async function api(path, options = {}) {
@@ -735,8 +735,10 @@
 
       // Standalone browser client-side audio streaming
       if (s.state === 'playing') {
-        if (s.current_sentence_index !== lastPlayedSentence) {
-          lastPlayedSentence = s.current_sentence_index;
+        const targetDocId = s.doc_id || '';
+        const targetKey = `${targetDocId}:${s.current_sentence_index}`;
+        if (targetKey !== lastPlayedTarget) {
+          lastPlayedTarget = targetKey;
           if (clientAudio) {
             clientAudio.pause();
             clientAudio = null;
@@ -753,15 +755,17 @@
           }
           const sentIdx = s.current_sentence_index;
           audio.addEventListener('play', () => {
+            if (lastPlayedTarget !== targetKey) return;
             api('/playback/ack', {
               method: 'POST',
-              body: JSON.stringify({ sentence_index: sentIdx, event: 'started' })
+              body: JSON.stringify({ doc_id: targetDocId, sentence_index: sentIdx, event: 'started' })
             }).catch(() => {});
           }, { once: true });
           audio.addEventListener('ended', () => {
+            if (lastPlayedTarget !== targetKey) return;
             api('/playback/ack', {
               method: 'POST',
-              body: JSON.stringify({ sentence_index: sentIdx, event: 'ended' })
+              body: JSON.stringify({ doc_id: targetDocId, sentence_index: sentIdx, event: 'ended' })
             }).catch(() => {});
           }, { once: true });
           clientAudio = audio;
@@ -770,7 +774,7 @@
           if (s.speed && clientAudio.playbackRate !== s.speed) {
             clientAudio.playbackRate = s.speed;
           }
-          if (clientAudio.paused) {
+          if (clientAudio.paused && !clientAudio.ended) {
             if (s.audio_seconds_offset !== undefined && Math.abs(clientAudio.currentTime - s.audio_seconds_offset) > 0.3) {
               try { clientAudio.currentTime = s.audio_seconds_offset; } catch (_) {}
             }
@@ -782,7 +786,7 @@
           clientAudio.pause();
         }
         if (s.state === 'stopped' || s.state === 'finished') {
-          lastPlayedSentence = -1;
+          lastPlayedTarget = '';
           clientAudio = null;
         }
       }
@@ -817,7 +821,7 @@
         clientAudio.pause();
         clientAudio = null;
       }
-      lastPlayedSentence = -1;
+      lastPlayedTarget = '';
       try { await api('/playback/stop', { method: 'POST' }); } catch (err) { alert(err.message); }
     }
 
