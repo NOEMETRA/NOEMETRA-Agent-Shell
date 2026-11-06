@@ -56,6 +56,7 @@ class DocumentPlayer:
         self._client_started_event = threading.Event()
         self._client_ended_event = threading.Event()
         self._audio_fetched_sent_idx: int = -1
+        self._playback_generation: int = 0
 
     @property
     def state(self) -> PlayerState:
@@ -92,6 +93,7 @@ class DocumentPlayer:
                 raise RuntimeError("Il worker di riproduzione precedente è ancora attivo. Riprovare.")
 
         with self._lock:
+            self._playback_generation += 1
             self._document = document
             self._current_sent_idx = 0
             self._sample_offset = 0
@@ -133,6 +135,7 @@ class DocumentPlayer:
 
         worker_to_join = None
         with self._lock:
+            self._playback_generation += 1
             if not self._document or not self._document.all_sentences:
                 raise ValueError("Nessun documento caricato per la riproduzione.")
 
@@ -219,6 +222,7 @@ class DocumentPlayer:
         """Stop playback completely."""
         worker_to_join = None
         with self._lock:
+            self._playback_generation += 1
             self._stop_event.set()
             self._pause_event.set()
 
@@ -254,6 +258,7 @@ class DocumentPlayer:
         with self._lock:
             if not self._document:
                 raise ValueError("Nessun documento caricato.")
+            self._playback_generation += 1
             self._current_sent_idx = max(0, min(sentence_index, len(self._document.all_sentences) - 1))
             self._sample_offset = 0
             self._current_audio = None
@@ -410,6 +415,8 @@ class DocumentPlayer:
 
                     sentence = self._document.all_sentences[self._current_sent_idx]
                     current_doc_id = self._document.doc_id
+                    current_sent_idx = self._current_sent_idx
+                    current_gen = self._playback_generation
                     effective_speed = self._speed
 
                 if self.on_sentence_change:
@@ -423,8 +430,13 @@ class DocumentPlayer:
                     try:
                         audio_data, sr = self.tts.synthesize(sentence.text)
                         with self._lock:
-                            # Verify document has not changed while synthesizing
-                            if self._document and self._document.doc_id == current_doc_id:
+                            # Verify document, sentence index and playback generation have not changed while synthesizing
+                            if (
+                                self._document
+                                and self._document.doc_id == current_doc_id
+                                and self._current_sent_idx == current_sent_idx
+                                and self._playback_generation == current_gen
+                            ):
                                 self._current_audio = audio_data
                                 self._current_sr = sr
                     except Exception as e:
@@ -436,6 +448,13 @@ class DocumentPlayer:
 
                 if self._stop_event.is_set() or self._pause_event.is_set():
                     break
+
+                with self._lock:
+                    if self._playback_generation != current_gen:
+                        break
+
+                if self._current_audio is None:
+                    continue
 
                 # Prepare audio slice starting from sample_offset
                 audio_to_play = self._current_audio[self._sample_offset:]
@@ -509,6 +528,8 @@ class DocumentPlayer:
 
                     sentence = self._document.all_sentences[self._current_sent_idx]
                     current_doc_id = self._document.doc_id
+                    current_sent_idx = self._current_sent_idx
+                    current_gen = self._playback_generation
                     effective_speed = self._speed
 
                 if self.on_sentence_change:
@@ -517,20 +538,33 @@ class DocumentPlayer:
                     except Exception:
                         pass
 
+                words = sentence.text.split()
+                fallback_duration = max(0.4, (len(words) * 0.25) / effective_speed)
+
                 # Synthesize sentence to get exact audio duration and cache for client streaming
                 if self._current_audio is None:
                     try:
                         audio_data, sr = self.tts.synthesize(sentence.text)
                         with self._lock:
-                            if self._document and self._document.doc_id == current_doc_id:
+                            if (
+                                self._document
+                                and self._document.doc_id == current_doc_id
+                                and self._current_sent_idx == current_sent_idx
+                                and self._playback_generation == current_gen
+                            ):
                                 self._current_audio = audio_data
                                 self._current_sr = sr
                     except Exception as e:
                         logger.warning(f"Errore sintesi TTS in virtual playback: {e}")
-                        words = sentence.text.split()
                         audio_data = None
                         sr = 24000
-                        fallback_duration = max(0.4, (len(words) * 0.25) / effective_speed)
+
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+
+                with self._lock:
+                    if self._playback_generation != current_gen:
+                        break
 
                 # In client playback mode, progress and sentence completion are driven
                 # STRICTLY by client acknowledgements, never advancing past unheard audio on a simulated timer.
