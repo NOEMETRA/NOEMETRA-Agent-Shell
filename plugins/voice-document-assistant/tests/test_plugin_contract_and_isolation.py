@@ -255,3 +255,18 @@ def test_client_playback_does_not_advance_on_audio_fetch():
         assert player._client_started_event.is_set()
 
 
+def test_implicit_storage_resolution_from_active_hermes_home(monkeypatch):
+    """Verify that omitting profile resolves storage directly under active Hermes home, not profiles/custom (P1)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        custom_home = Path(tmpdir) / "custom_home"
+        custom_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(custom_home))
+
+        # Calling resolve_voice_profile_dir() with no arguments or None/empty
+        resolved = resolve_voice_profile_dir()
+        assert resolved == (custom_home / "voice_assistant").resolve()
+        assert "profiles" not in str(resolved)
+        assert resolved.exists()
+
+
+

@@ -48,21 +48,25 @@ def resolve_voice_profile_dir(
 
     prof = (profile or "").strip()
     if not prof:
+        # Implicit storage resolution from the active Hermes home path (AGENTS.md:13)
         try:
-            from hermes_constants import get_hermes_home_override
-            home_override = get_hermes_home_override()
-            if home_override:
-                target_dir = Path(home_override).resolve() / "voice_assistant"
-                target_dir.mkdir(parents=True, exist_ok=True)
-                return target_dir
+            from hermes_constants import get_hermes_home
+            active_home = get_hermes_home().resolve()
+            target_dir = active_home / "voice_assistant"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            return target_dir
         except Exception:
             pass
 
-        try:
-            from hermes_cli.profiles import current_profile_name
-            prof = current_profile_name() or "default"
-        except Exception:
-            prof = os.environ.get("HERMES_PROFILE_NAME") or os.environ.get("HERMES_PROFILE") or "default"
+        hermes_home = os.environ.get("HERMES_HOME")
+        if hermes_home and hermes_home.strip():
+            target_dir = Path(hermes_home).resolve() / "voice_assistant"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            return target_dir
+
+        target_dir = (Path.home() / ".hermes" / "voice_assistant").resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir
 
     prof = prof.strip().lower()
     if not PROFILE_ID_RE.match(prof):
