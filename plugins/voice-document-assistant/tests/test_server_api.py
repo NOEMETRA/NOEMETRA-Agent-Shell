@@ -924,6 +924,59 @@ def test_standalone_api_resolves_hermes_home_when_core_modules_unavailable(monke
         reset_assistants()
 
 
+def test_standalone_browser_reports_and_persists_playback_progress():
+    """Verify standalone static UI wires periodic timeupdate progress acks and pause offset persistence (P2)."""
+    static_html = (
+        Path(__file__).resolve().parents[1]
+        / "hermes_voice"
+        / "server"
+        / "static"
+        / "index.html"
+    ).read_text(encoding="utf-8")
+
+    assert "addEventListener('timeupdate'" in static_html
+    assert "event: 'progress'" in static_html
+    assert "offset_seconds: audio.currentTime" in static_html
+
+    assistant = get_assistant()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc_progress_ack.pdf"
+        create_sample_italian_pdf(pdf_path)
+        assistant.load_document(pdf_path)
+        doc_id = assistant.current_document.doc_id
+
+        try:
+            res_play = client.post(
+                "/api/plugins/voice-document-assistant/playback/play",
+                json={"output": "client"},
+            )
+            assert res_play.status_code == 200
+
+            res_ack = client.post(
+                "/api/plugins/voice-document-assistant/playback/ack",
+                json={
+                    "doc_id": doc_id,
+                    "sentence_index": 0,
+                    "event": "progress",
+                    "offset_seconds": 1.35,
+                },
+            )
+            assert res_ack.status_code == 200
+
+            res_pause = client.post("/api/plugins/voice-document-assistant/playback/pause")
+            assert res_pause.status_code == 200
+            paused_bm = res_pause.json()["bookmark"]
+            assert paused_bm["current_sentence_index"] == 0
+            assert abs(paused_bm["audio_seconds_offset"] - 1.35) < 0.05
+
+            res_status = client.get("/api/plugins/voice-document-assistant/status")
+            assert res_status.status_code == 200
+            assert abs(res_status.json()["audio_seconds_offset"] - 1.35) < 0.05
+        finally:
+            assistant.player.stop()
+
+
+
 
 
 

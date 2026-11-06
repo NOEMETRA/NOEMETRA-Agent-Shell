@@ -761,12 +761,36 @@
               body: JSON.stringify({ doc_id: targetDocId, sentence_index: sentIdx, event: 'started' })
             }).catch(() => {});
           }, { once: true });
-          audio.addEventListener('ended', () => {
+          let lastProgressAck = 0;
+          audio.addEventListener('timeupdate', () => {
             if (lastPlayedTarget !== targetKey) return;
-            api('/playback/ack', {
-              method: 'POST',
-              body: JSON.stringify({ doc_id: targetDocId, sentence_index: sentIdx, event: 'ended' })
-            }).catch(() => {});
+            const now = Date.now();
+            if (now - lastProgressAck > 300) {
+              lastProgressAck = now;
+              api('/playback/ack', {
+                method: 'POST',
+                body: JSON.stringify({
+                  doc_id: targetDocId,
+                  sentence_index: sentIdx,
+                  event: 'progress',
+                  offset_seconds: audio.currentTime
+                })
+              }).catch(() => {});
+            }
+          });
+          audio.addEventListener('ended', () => {
+            const sendEndedAck = (retryCount = 0) => {
+              if (lastPlayedTarget !== targetKey) return;
+              api('/playback/ack', {
+                method: 'POST',
+                body: JSON.stringify({ doc_id: targetDocId, sentence_index: sentIdx, event: 'ended' })
+              }).catch(() => {
+                if (retryCount < 2 && lastPlayedTarget === targetKey) {
+                  setTimeout(() => sendEndedAck(retryCount + 1), 1000);
+                }
+              });
+            };
+            sendEndedAck();
           }, { once: true });
           clientAudio = audio;
           audio.play().catch(() => {});
@@ -803,7 +827,22 @@
     }
 
     async function pause() {
-      if (clientAudio) clientAudio.pause();
+      let currentOffset = null;
+      if (clientAudio) {
+        currentOffset = clientAudio.currentTime;
+        clientAudio.pause();
+      }
+      if (currentOffset !== null && currentOffset > 0 && currentStatus && currentStatus.doc_id) {
+        await api('/playback/ack', {
+          method: 'POST',
+          body: JSON.stringify({
+            doc_id: currentStatus.doc_id,
+            sentence_index: currentStatus.current_sentence_index,
+            event: 'progress',
+            offset_seconds: currentOffset
+          })
+        }).catch(() => {});
+      }
       try { await api('/playback/pause', { method: 'POST' }); } catch (err) { alert(err.message); }
     }
 
@@ -826,6 +865,11 @@
     }
 
     async function seekSentence(idx) {
+      if (clientAudio) {
+        clientAudio.pause();
+        clientAudio = null;
+      }
+      lastPlayedTarget = '';
       try {
         await api('/playback/seek', {
           method: 'POST',
@@ -835,6 +879,11 @@
     }
 
     async function jumpToPage(pageNum) {
+      if (clientAudio) {
+        clientAudio.pause();
+        clientAudio = null;
+      }
+      lastPlayedTarget = '';
       renderDocumentPage(pageNum);
       try {
         await api('/playback/seek', {
@@ -877,12 +926,17 @@
     librarySelect.onchange = async () => {
       const docId = librarySelect.value;
       if (!docId) return;
+      if (clientAudio) {
+        clientAudio.pause();
+        clientAudio = null;
+      }
+      lastPlayedTarget = '';
       try {
         const res = await api('/select_document', {
           method: 'POST',
           body: JSON.stringify({ doc_id: docId })
         });
-        loadDocumentDetails(docId, 1);
+        loadDocumentDetails(docId, (res.bookmark && res.bookmark.current_page) || 1);
       } catch (err) { alert(err.message); }
     };
 
@@ -893,6 +947,11 @@
 
       const reader = new FileReader();
       reader.onload = async () => {
+        if (clientAudio) {
+          clientAudio.pause();
+          clientAudio = null;
+        }
+        lastPlayedTarget = '';
         try {
           const base64 = reader.result.split(',')[1];
           const res = await api('/upload', {
@@ -903,7 +962,7 @@
             })
           });
           if (res.document) {
-            loadDocumentDetails(res.document.doc_id, 1);
+            loadDocumentDetails(res.document.doc_id, (res.bookmark && res.bookmark.current_page) || 1);
           }
         } catch (err) {
           alert('Errore caricamento PDF: ' + err.message);

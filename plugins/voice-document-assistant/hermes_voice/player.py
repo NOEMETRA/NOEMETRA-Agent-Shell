@@ -392,8 +392,11 @@ class DocumentPlayer:
                     self._client_ended_event.set()
                 elif event == "progress" and offset_seconds is not None:
                     sr = self._current_sr or 24000
+                    computed_samples = max(0, int(float(offset_seconds) * sr))
                     if self._current_audio is not None:
-                        self._sample_offset = min(len(self._current_audio), int(offset_seconds * sr))
+                        self._sample_offset = min(len(self._current_audio), computed_samples)
+                    else:
+                        self._sample_offset = computed_samples
                     self._save_bookmark()
 
     def _save_bookmark(self) -> ReadingBookmark:
