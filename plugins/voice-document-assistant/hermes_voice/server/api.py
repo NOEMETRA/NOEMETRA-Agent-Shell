@@ -374,6 +374,8 @@ async def upload_document(request: Request):
             # Enforce AGENTS.md:13 profile isolation: validate path ownership against all served and foreign profile homes
             served_homes: list[Path] = []
             try:
+                from hermes_voice.profile import get_gateway_served_profile_homes
+                served_homes.extend(get_gateway_served_profile_homes().keys())
                 app_state = getattr(getattr(request, "app", None), "state", None)
                 runner = getattr(app_state, "gateway_runner", None)
                 if runner:

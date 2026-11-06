@@ -174,7 +174,13 @@ class HermesVoiceAssistant:
     def load_document(self, file_path: Union[str, Path], resume_bookmark: bool = True) -> ReadingBookmark:
         """Extract PDF document and set up player and agents atomically."""
         assert_voice_home_live(self.library_path)
-        validate_path_profile_ownership(file_path, profile=self.profile, home_dir=self.home_dir)
+        from hermes_voice.profile import get_gateway_served_profile_homes
+        validate_path_profile_ownership(
+            file_path,
+            profile=self.profile,
+            home_dir=self.home_dir,
+            served_homes=get_gateway_served_profile_homes(),
+        )
         with self._activation_lock:
             logger.info(f"Caricamento documento da '{file_path}'...")
             doc = self.extractor.extract(file_path)
@@ -208,7 +214,13 @@ class HermesVoiceAssistant:
         library = self.get_library()
         entry = next((e for e in library if e.doc_id == doc_id), None)
         if entry and Path(entry.file_path).exists():
-            validate_path_profile_ownership(entry.file_path, profile=self.profile, home_dir=self.home_dir)
+            from hermes_voice.profile import get_gateway_served_profile_homes
+            validate_path_profile_ownership(
+                entry.file_path,
+                profile=self.profile,
+                home_dir=self.home_dir,
+                served_homes=get_gateway_served_profile_homes(),
+            )
             doc = self.extractor.extract(entry.file_path)
             self._doc_cache[doc.doc_id] = doc
             return doc

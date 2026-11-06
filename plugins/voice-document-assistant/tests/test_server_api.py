@@ -1,5 +1,6 @@
 """Tests for backend FastAPI REST API routes."""
 
+import json
 import tempfile
 from pathlib import Path
 import pytest
@@ -503,7 +504,7 @@ def test_standalone_allows_trusted_same_origin_and_direct_requests():
     assert res_direct_get.status_code == 200
 
 
-def test_custom_home_cannot_access_another_custom_home_files():
+def test_custom_home_cannot_access_another_custom_home_files(monkeypatch):
     """Verify that a session in one custom HERMES_HOME cannot upload/access files from another custom HERMES_HOME."""
     with tempfile.TemporaryDirectory() as tmpdir:
         home_a = Path(tmpdir) / "custom_home_a"
@@ -546,6 +547,26 @@ def test_custom_home_cannot_access_another_custom_home_files():
                 home_dir=home_b,
             )
         assert "outside the authorized home directory" in str(exc_info2.value)
+
+        # Test tool voice_load_document against gateway served custom homes before any Voice API call
+        from types import SimpleNamespace
+        import gateway.run_api as run_api
+        from hermes_plugin.voice_plugin import voice_load_document
+
+        fake_auth_a = SimpleNamespace(profile_id=str(home_a.resolve()), retiring=False)
+        fake_reg = SimpleNamespace(serving=lambda: [fake_auth_a])
+        fake_runner = SimpleNamespace(session_authorities=fake_reg, config=SimpleNamespace(_runtime_profile_homes=[]))
+        monkeypatch.setattr(run_api, "_ACTIVE_RUNNER", fake_runner)
+
+        # Loading home_a PDF from home_b via voice_load_document must be rejected
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        reset_assistants()
+        try:
+            res_tool = json.loads(voice_load_document({"pdf_path": str(victim_pdf)}))
+            assert "error" in res_tool
+            assert "Access denied" in res_tool["error"]
+        finally:
+            reset_assistants()
 
 
 def test_models_endpoint_dispatched():
