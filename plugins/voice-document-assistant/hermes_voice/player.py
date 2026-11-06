@@ -135,12 +135,13 @@ class DocumentPlayer:
 
         worker_to_join = None
         with self._lock:
-            self._playback_generation += 1
             if not self._document or not self._document.all_sentences:
                 raise ValueError("Nessun documento caricato per la riproduzione.")
 
             if self._state == PlayerState.PLAYING:
                 return self.get_bookmark()
+
+            self._playback_generation += 1
 
             # Ensure previous worker thread is finished and wait for it
             if self._worker_thread and self._worker_thread.is_alive():

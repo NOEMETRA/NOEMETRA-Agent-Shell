@@ -185,3 +185,33 @@ def test_player_discards_stale_synthesized_audio_after_seek():
             player.stop()
 
 
+def test_repeated_play_call_does_not_bump_generation_or_interrupt_playback():
+    """Verify idempotent play() call when already PLAYING does not bump generation (P2)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc.pdf"
+        bm_path = Path(tmpdir) / "state.json"
+        create_sample_italian_pdf(pdf_path)
+        doc = DocumentExtractor().extract(pdf_path)
+
+        player = DocumentPlayer(bookmark_path=bm_path, virtual_playback=True)
+        player.load_document(doc)
+
+        try:
+            player.play()
+            assert player.state == PlayerState.PLAYING
+            gen_first = player._playback_generation
+
+            # Call play() again while active
+            player.play()
+            assert player.state == PlayerState.PLAYING
+            assert player._playback_generation == gen_first
+
+            # Call resume() while active
+            player.resume()
+            assert player.state == PlayerState.PLAYING
+            assert player._playback_generation == gen_first
+        finally:
+            player.stop()
+
+
+

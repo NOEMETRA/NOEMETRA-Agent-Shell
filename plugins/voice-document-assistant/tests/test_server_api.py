@@ -9,7 +9,7 @@ from hermes_voice.extractor import create_sample_italian_pdf
 from hermes_voice.models import Citation, GroundedAnswer
 from hermes_voice.pipeline import HermesVoiceAssistant
 from hermes_voice.server.standalone import app
-from hermes_voice.server.state import get_assistant
+from hermes_voice.server.state import get_assistant, reset_assistants
 
 client = TestClient(app)
 
@@ -278,7 +278,7 @@ def test_missing_dependencies_status_endpoint_returns_json():
 def test_state_keys_assistants_consistently_across_name_and_home_dir():
     """Verify that accessing by profile name and by authorized home path returns the identical singleton instance."""
     from hermes_cli.profiles import get_profile_dir
-    from hermes_voice.server.state import get_assistant, reset_assistants
+    from hermes_voice.server.state import get_assistant, reset_assistants, reset_assistants
 
     profile_name = "test_unified_identity"
     home_dir = get_profile_dir(profile_name)
@@ -574,6 +574,34 @@ def test_custom_homes_with_same_basename_are_strictly_isolated(tmp_path):
     clear_registered_served_profile_homes()
     with pytest.raises(PermissionError):
         validate_path_profile_ownership(pdf_in_2, home_dir=home_1, served_homes=[home_1, home_2])
+
+
+def test_unscoped_request_with_custom_hermes_home_preserves_process_home(monkeypatch):
+    """Verify unscoped requests under custom HERMES_HOME operate in process home, not profiles/custom (P1)."""
+    from hermes_voice.profile import clear_registered_served_profile_homes
+    with tempfile.TemporaryDirectory() as tmpdir:
+        custom_proc_home = (Path(tmpdir) / "custom_tenant_workspace").resolve()
+        custom_proc_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(custom_proc_home))
+
+        reset_assistants()
+        clear_registered_served_profile_homes()
+
+        client = TestClient(app)
+
+        # 1. An unscoped request operates directly in custom_proc_home
+        resp = client.get("/api/plugins/voice-document-assistant/status")
+        assert resp.status_code == 200
+
+        # Verify assistant was anchored to custom_proc_home / voice_assistant
+        expected_dir = custom_proc_home / "voice_assistant"
+        assert expected_dir.exists()
+
+        # 2. A request attempting to access a profile named 'custom' is rejected with 403 Forbidden
+        cross_resp = client.get("/api/plugins/voice-document-assistant/status?profile=custom")
+        assert cross_resp.status_code == 403
+        assert "Access denied" in cross_resp.json()["detail"]
+
 
 
 

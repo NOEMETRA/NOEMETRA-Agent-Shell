@@ -126,22 +126,39 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
     # If still unbound, anchor strictly to the gateway server's process-level home (AGENTS.md:13)
     if not authorized_home and not bound_profile:
         try:
-            from hermes_cli.profiles import current_profile_name, get_profile_dir
-            srv_prof = current_profile_name()
-            if srv_prof:
-                bound_profile = srv_prof
-                authorized_home = get_profile_dir(srv_prof).resolve()
+            from hermes_constants import get_hermes_home
+            authorized_home = get_hermes_home().resolve()
         except Exception:
             pass
 
-    if not authorized_home and not bound_profile:
+        if not authorized_home:
+            hermes_home = os.environ.get("HERMES_HOME")
+            if hermes_home and hermes_home.strip():
+                authorized_home = Path(hermes_home).resolve()
+
+        if not authorized_home:
+            try:
+                from hermes_cli.profiles import _get_default_hermes_home
+                authorized_home = _get_default_hermes_home().resolve()
+            except Exception:
+                authorized_home = (Path.home() / ".hermes").resolve()
+
+        # Map authorized_home to bound_profile ONLY if it is a canonical named profile in profiles_root or default home
         try:
-            from hermes_cli.profiles import _get_default_hermes_home
-            authorized_home = _get_default_hermes_home().resolve()
-            bound_profile = "default"
+            from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root
+            default_h = _get_default_hermes_home().resolve()
+            prof_root = _get_profiles_root().resolve()
+            if authorized_home == default_h:
+                bound_profile = "default"
+            elif authorized_home.parent == prof_root and PROFILE_ID_RE.match(authorized_home.name.lower()):
+                bound_profile = authorized_home.name.lower()
+            elif authorized_home.is_relative_to(prof_root):
+                rel = authorized_home.relative_to(prof_root)
+                bound_profile = rel.parts[0].lower() if rel.parts else None
+            else:
+                bound_profile = None
         except Exception:
-            authorized_home = Path.home() / ".hermes"
-            bound_profile = "default"
+            bound_profile = None
 
     untrusted_profile = request.headers.get("X-Hermes-Profile") or request.query_params.get("profile") or None
     if untrusted_profile:
