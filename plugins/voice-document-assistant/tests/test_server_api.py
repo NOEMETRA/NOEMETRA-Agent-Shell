@@ -895,6 +895,36 @@ def test_api_headless_server_playback_requires_client_output(monkeypatch):
             assistant.player.client_playback = prev_client
 
 
+def test_standalone_api_resolves_hermes_home_when_core_modules_unavailable(monkeypatch, tmp_path):
+    """Verify standalone fallback in server/api.py resolves HERMES_HOME via os.environ without NameError when hermes_constants is absent (P2)."""
+    import sys
+    from fastapi import Request
+    from hermes_voice.server.api import _resolve_authorized_context
+    from hermes_voice.server.state import reset_assistants
+
+    standalone_home = tmp_path / "standalone_hermes_home"
+    standalone_home.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(standalone_home))
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.profiles", None)
+
+    reset_assistants()
+    try:
+        req = Request({"type": "http", "method": "GET", "path": "/status", "headers": [], "query_string": b""})
+        prof_name, auth_home = _resolve_authorized_context(req)
+        assert auth_home == standalone_home.resolve()
+        assert prof_name == standalone_home.name
+
+        res = client.get("/api/plugins/voice-document-assistant/status")
+        assert res.status_code == 200
+        data = res.json()
+        assert "state" in data
+    finally:
+        reset_assistants()
+
+
+
 
 
 

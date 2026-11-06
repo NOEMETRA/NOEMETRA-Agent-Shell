@@ -32,21 +32,151 @@ def is_local_endpoint(url: str) -> bool:
         return False
 
 
+_PLACEHOLDER_SECRETS = frozenset({
+    "*", "**", "***", "changeme", "your_api_key", "your_api_key_here",
+    "your-api-key", "placeholder", "example", "dummy", "null", "none",
+})
+
+
+def _is_usable_secret(value: Optional[str]) -> bool:
+    """Return True when *value* is a non-empty credential rather than a template placeholder."""
+    if value is None or not isinstance(value, str):
+        return False
+    cleaned = value.strip()
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    if lowered in _PLACEHOLDER_SECRETS:
+        return False
+    if lowered.startswith("your_") and lowered.endswith("_here"):
+        return False
+    for prefix in ("sk-", "ghp_", "hf_"):
+        if lowered.startswith(prefix):
+            tail = lowered[len(prefix):]
+            if tail and all(ch == "x" for ch in tail):
+                return False
+    return True
+
+
+def _url_origin_tuple(url: Optional[str]) -> Optional[tuple[str, str]]:
+    if not url or not str(url).strip():
+        return None
+    try:
+        parsed = urlparse(str(url).strip())
+        if parsed.scheme and parsed.netloc:
+            return (parsed.scheme.lower(), parsed.netloc.lower())
+    except Exception:
+        pass
+    return None
+
+
+def _host_matches_domain(url: Optional[str], domain: str) -> bool:
+    try:
+        host = (urlparse(str(url or "").strip()).hostname or "").lower()
+    except Exception:
+        return False
+    dom = domain.lower().lstrip(".")
+    return bool(host) and (host == dom or host.endswith(f".{dom}"))
+
+
 def _get_profile_scoped_secret(name: str) -> Optional[str]:
     """Resolve a credential within the active profile's secret scope (AGENTS.md:104-110).
 
     Strictly avoids reading ambient os.environ directly when multiplexing profiles,
     preventing cross-profile credential leaks in multi-tenant gateways.
     """
+    if not name or not str(name).strip():
+        return None
+    key_name = str(name).strip()
     try:
         from agent.secret_scope import get_secret
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
+        has_scope_mod = True
+    except (ImportError, ModuleNotFoundError):
+        has_scope_mod = False
+
+    if has_scope_mod:
+        try:
+            val = get_secret(key_name)
+            if val is not None and _is_usable_secret(str(val)):
+                return str(val).strip()
+        except Exception:
+            pass
+        return None
+
+    val = os.environ.get(key_name)
+    if val is not None and _is_usable_secret(str(val)):
+        return str(val).strip()
     return None
 
+
+
+def _is_entry_enabled(entry: Dict[str, Any]) -> bool:
+    enabled = entry.get("enabled", True)
+    if isinstance(enabled, bool):
+        return enabled
+    if isinstance(enabled, str):
+        return enabled.strip().lower() not in ("false", "0", "no", "off")
+    return bool(enabled)
+
+
+def _match_custom_provider_entry(
+    cfg: Dict[str, Any],
+    raw_provider: str,
+    cfg_base_url: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Locate an enabled custom provider entry in config.yaml matching provider name or base_url."""
+    if not isinstance(cfg, dict):
+        return None
+
+    prov_norm = (raw_provider or "").strip().lower()
+    prov_slug = prov_norm.split(":", 1)[1].strip() if prov_norm.startswith("custom:") else prov_norm
+    prov_slug_dashed = prov_slug.replace(" ", "-")
+    norm_url = (cfg_base_url or "").strip().rstrip("/")
+    allow_url_match = prov_norm in ("custom", "openai_compatible", "lmstudio", "vllm", "codex") and bool(norm_url)
+
+    def _extract(entry: Dict[str, Any], key_hint: str = "") -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict) or not _is_entry_enabled(entry):
+            return None
+        entry_url = str(entry.get("base_url") or entry.get("url") or entry.get("api") or "").strip()
+        if not entry_url:
+            return None
+        names = set()
+        for candidate in (key_hint, entry.get("provider_key"), entry.get("name")):
+            if isinstance(candidate, str) and candidate.strip():
+                c_low = candidate.strip().lower()
+                names.add(c_low)
+                names.add(c_low.replace(" ", "-"))
+        matched_by_name = bool(prov_slug) and (prov_slug in names or prov_slug_dashed in names)
+        matched_by_url = allow_url_match and entry_url.rstrip("/") == norm_url
+        if not (matched_by_name or matched_by_url):
+            return None
+        key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+        api_key = str(entry.get("api_key") or "").strip()
+        key_cmd = str(entry.get("key_cmd") or "").strip()
+        model_name = str(entry.get("default_model") or entry.get("model") or "").strip()
+        return {
+            "base_url": entry_url,
+            "model": model_name,
+            "api_key": api_key,
+            "key_env": key_env,
+            "declares_credential": bool(api_key or key_env or key_cmd),
+        }
+
+    providers_map = cfg.get("providers")
+    if isinstance(providers_map, dict):
+        for ep_key, entry in providers_map.items():
+            found = _extract(entry, str(ep_key))
+            if found is not None:
+                return found
+
+    legacy_list = cfg.get("custom_providers")
+    if isinstance(legacy_list, list):
+        for entry in legacy_list:
+            found = _extract(entry)
+            if found is not None:
+                return found
+
+    return None
 
 
 class ModelRouter:
@@ -92,19 +222,29 @@ class ModelRouter:
         allow_remote: bool = False,
     ) -> None:
         # Resolve model, provider and endpoint from hermes config if not explicitly provided
-        cfg_model = None
-        cfg_provider = None
-        cfg_base_url = None
-        cfg_api_key = None
+        cfg: Dict[str, Any] = {}
+        cfg_model: Any = None
+        cfg_provider: Optional[str] = None
+        cfg_base_url: Optional[str] = None
+        cfg_api_key: Optional[str] = None
+        cfg_key_env: Optional[str] = None
         try:
             from hermes_cli.config import load_config
-            cfg = load_config()
+            loaded = load_config()
+            if isinstance(loaded, dict):
+                cfg = loaded
             model_cfg = cfg.get("model")
             if isinstance(model_cfg, dict):
-                cfg_model = model_cfg.get("default") or model_cfg.get("name") or ""
-                cfg_provider = model_cfg.get("provider")
+                raw_default = model_cfg.get("default") or model_cfg.get("name") or model_cfg.get("model") or ""
+                if isinstance(raw_default, dict):
+                    cfg_model = raw_default.get("model") or raw_default.get("name") or raw_default.get("default") or ""
+                    cfg_provider = model_cfg.get("provider") or raw_default.get("provider")
+                else:
+                    cfg_model = raw_default
+                    cfg_provider = model_cfg.get("provider")
                 cfg_base_url = model_cfg.get("base_url") or model_cfg.get("endpoint") or model_cfg.get("api_base")
                 cfg_api_key = model_cfg.get("api_key")
+                cfg_key_env = model_cfg.get("key_env") or model_cfg.get("api_key_env")
             elif isinstance(model_cfg, str):
                 cfg_model = model_cfg
         except Exception:
@@ -112,29 +252,66 @@ class ModelRouter:
 
         # Resolve provider
         if default_provider is not None:
-            resolved_provider = default_provider.lower().strip()
-        elif cfg_provider and cfg_provider.lower().strip() not in ("auto", "default", ""):
-            resolved_provider = cfg_provider.lower().strip()
+            raw_provider = default_provider.lower().strip()
+        elif cfg_provider and str(cfg_provider).lower().strip() not in ("auto", "default", ""):
+            raw_provider = str(cfg_provider).lower().strip()
         else:
-            resolved_provider = "ollama"
+            raw_provider = "ollama"
 
-        if resolved_provider in ("custom", "lmstudio", "vllm", "openai_compatible", "codex"):
+        matched_custom = None
+        if raw_provider not in ("ollama", "remote", "api", "openai", "anthropic", "openrouter"):
+            matched_custom = _match_custom_provider_entry(cfg, raw_provider, cfg_base_url)
+            if matched_custom is not None:
+                if not cfg_base_url and matched_custom.get("base_url"):
+                    cfg_base_url = matched_custom["base_url"]
+                if not cfg_model and matched_custom.get("model"):
+                    cfg_model = matched_custom["model"]
+
+        if (
+            raw_provider in ("custom", "lmstudio", "vllm", "openai_compatible", "codex")
+            or raw_provider.startswith("custom:")
+            or matched_custom is not None
+        ):
             resolved_provider = "openai_compatible"
-        elif resolved_provider not in ("remote", "api", "openai", "anthropic", "openrouter"):
+        elif raw_provider not in ("remote", "api", "openai", "anthropic", "openrouter"):
             resolved_provider = "ollama"
+        else:
+            resolved_provider = raw_provider
 
+        self._raw_provider = raw_provider
+        self._explicit_codex_api_key = (
+            codex_api_key.strip()
+            if isinstance(codex_api_key, str) and _is_usable_secret(codex_api_key)
+            else None
+        )
+        self._cfg_base_url = (
+            str(cfg_base_url).strip()
+            if isinstance(cfg_base_url, str) and str(cfg_base_url).strip()
+            else None
+        )
+        self._cfg_api_key = (
+            cfg_api_key.strip()
+            if isinstance(cfg_api_key, str) and _is_usable_secret(cfg_api_key)
+            else None
+        )
+        self._cfg_key_env = (
+            str(cfg_key_env).strip()
+            if isinstance(cfg_key_env, str) and str(cfg_key_env).strip()
+            else None
+        )
+        self._custom_entry = matched_custom
         self.default_provider = resolved_provider
 
         # Resolve Ollama endpoint
         if ollama_base_url is not None:
             self.ollama_base_url = ollama_base_url.rstrip("/")
-        elif cfg_base_url and (cfg_provider and cfg_provider.lower().strip() == "ollama"):
-            endpoint = cfg_base_url
+        elif cfg_base_url and (cfg_provider and str(cfg_provider).lower().strip() == "ollama"):
+            endpoint = str(cfg_base_url)
             if endpoint.endswith("/v1"):
                 endpoint = endpoint[:-3]
             self.ollama_base_url = endpoint.rstrip("/")
-        elif cfg_base_url and self.default_provider == "ollama" and is_local_endpoint(cfg_base_url):
-            endpoint = cfg_base_url
+        elif cfg_base_url and self.default_provider == "ollama" and is_local_endpoint(str(cfg_base_url)):
+            endpoint = str(cfg_base_url)
             if endpoint.endswith("/v1"):
                 endpoint = endpoint[:-3]
             self.ollama_base_url = endpoint.rstrip("/")
@@ -142,18 +319,26 @@ class ModelRouter:
             self.ollama_base_url = "http://127.0.0.1:11434"
 
         # Resolve model name
-        resolved_model = (ollama_model or cfg_model or "").strip()
+        resolved_model = str(ollama_model or cfg_model or "").strip()
         self.ollama_model = resolved_model or "gemma4:12b"
 
         # Resolve OpenAI-compatible / local server endpoint (LM Studio, vLLM, Codex)
         if codex_base_url is not None:
             self.codex_base_url = codex_base_url
         elif cfg_base_url and self.default_provider in ("openai_compatible", "codex"):
-            self.codex_base_url = cfg_base_url
+            self.codex_base_url = str(cfg_base_url)
+        elif raw_provider == "lmstudio":
+            self.codex_base_url = _get_profile_scoped_secret("LM_BASE_URL") or "http://127.0.0.1:1234/v1"
+        elif raw_provider == "custom":
+            self.codex_base_url = _get_profile_scoped_secret("CUSTOM_BASE_URL") or "http://127.0.0.1:8000/v1"
         else:
             self.codex_base_url = "http://127.0.0.1:8000/v1"
 
-        self.codex_api_key = codex_api_key or cfg_api_key or "local"
+        self.codex_api_key = self._resolve_openai_compatible_api_key(
+            provider_hint=raw_provider,
+            target_url=self.codex_base_url,
+        )
+        self._initial_codex_api_key = self.codex_api_key
 
         # Resolve remote provider settings (OpenAI, Anthropic, OpenRouter, Remote)
         if remote_base_url is not None:
@@ -187,6 +372,76 @@ class ModelRouter:
                 self.remote_api_key = ""
 
         self.allow_remote = allow_remote
+
+    def _resolve_openai_compatible_api_key(
+        self,
+        provider_hint: Optional[str] = None,
+        target_url: Optional[str] = None,
+    ) -> str:
+        """Resolve bearer credential for an OpenAI-compatible endpoint via profile-scoped secrets."""
+        if self._explicit_codex_api_key:
+            return self._explicit_codex_api_key
+
+        norm_target = (target_url or "").strip().rstrip("/")
+        norm_cfg = (self._cfg_base_url or "").strip().rstrip("/")
+        same_cfg_url = (not norm_cfg) or (norm_target == norm_cfg)
+
+        if same_cfg_url and self._cfg_api_key:
+            return self._cfg_api_key
+
+        if same_cfg_url and self._cfg_key_env:
+            scoped = _get_profile_scoped_secret(self._cfg_key_env)
+            return scoped or "local"
+
+        entry = self._custom_entry
+        if isinstance(entry, dict):
+            entry_url = str(entry.get("base_url") or "").strip().rstrip("/")
+            if not entry_url or entry_url == norm_target:
+                if entry.get("key_env"):
+                    scoped = _get_profile_scoped_secret(entry["key_env"])
+                    if scoped:
+                        return scoped
+                if entry.get("api_key") and _is_usable_secret(entry["api_key"]):
+                    return str(entry["api_key"]).strip()
+                if entry.get("declares_credential"):
+                    return "local"
+
+        # Guard against forwarding OpenAI/custom keys to rival built-in cloud domains
+        if _host_matches_domain(target_url, "openrouter.ai"):
+            return _get_profile_scoped_secret("OPENROUTER_API_KEY") or "local"
+        if _host_matches_domain(target_url, "anthropic.com") or _host_matches_domain(target_url, "claude.com"):
+            return _get_profile_scoped_secret("ANTHROPIC_API_KEY") or "local"
+
+        hint = (provider_hint or self._raw_provider or "").strip().lower()
+        env_candidates: List[str] = []
+        if hint.startswith("custom:"):
+            slug = "".join(ch if ch.isalnum() else "_" for ch in hint.split(":", 1)[1]).strip("_").upper()
+            if slug:
+                env_candidates.append(f"HERMES_CUSTOM_{slug}_API_KEY")
+            env_candidates.append("CUSTOM_API_KEY")
+        elif hint == "lmstudio":
+            env_candidates.append("LM_API_KEY")
+        elif hint == "vllm":
+            env_candidates.append("VLLM_API_KEY")
+        elif hint == "codex":
+            env_candidates.append("CODEX_API_KEY")
+        elif hint in ("custom", "openai_compatible"):
+            env_candidates.append("CUSTOM_API_KEY")
+
+        for var_name in env_candidates:
+            scoped_val = _get_profile_scoped_secret(var_name)
+            if scoped_val:
+                return scoped_val
+
+        openai_key = _get_profile_scoped_secret("OPENAI_API_KEY")
+        if openai_key:
+            env_openai_base = _get_profile_scoped_secret("OPENAI_BASE_URL")
+            bound_origin = _url_origin_tuple(env_openai_base)
+            target_origin = _url_origin_tuple(target_url)
+            if bound_origin is None or (target_origin is not None and bound_origin == target_origin):
+                return openai_key
+
+        return "local"
 
     def set_allow_remote(self, allowed: bool) -> None:
         """Update explicit user authorization for remote network transmission."""
@@ -332,7 +587,10 @@ class ModelRouter:
                 max_tokens=max_tokens,
             )
 
-        elif selected_provider in ("codex", "openai_compatible", "custom", "lmstudio", "vllm"):
+        elif (
+            selected_provider in ("codex", "openai_compatible", "custom", "lmstudio", "vllm")
+            or selected_provider.startswith("custom:")
+        ):
             target_url = self.codex_base_url or "http://127.0.0.1:8000/v1"
             if not is_local_endpoint(target_url) and not self.allow_remote:
                 raise PermissionError(
@@ -341,9 +599,17 @@ class ModelRouter:
                     "Abilitare esplicitamente allow_remote con il consenso dell'utente."
                 )
 
+            if self.codex_api_key != getattr(self, "_initial_codex_api_key", self.codex_api_key):
+                effective_key = self.codex_api_key
+            else:
+                effective_key = self._resolve_openai_compatible_api_key(
+                    provider_hint=provider or self._raw_provider or selected_provider,
+                    target_url=target_url,
+                )
+
             return self._call_openai_compatible(
                 base_url=target_url,
-                api_key=self.codex_api_key or "local",
+                api_key=effective_key or "local",
                 model=model or self.ollama_model or "local-model",
                 prompt=prompt,
                 system_prompt=system_prompt,
