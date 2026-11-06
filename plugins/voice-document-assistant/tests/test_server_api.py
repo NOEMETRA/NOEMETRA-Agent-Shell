@@ -436,7 +436,7 @@ def test_custom_home_matching_profile_basename_cannot_access_named_profile_files
 
 
 def test_standalone_rejects_untrusted_cross_origin_requests():
-    """Verify that standalone mutating requests from untrusted origins or cross-site contexts are blocked."""
+    """Verify that standalone mutating and reading requests from untrusted origins or different localhost ports are blocked."""
     # Untrusted Origin header
     res_origin = client.post(
         "/api/plugins/voice-document-assistant/playback/stop",
@@ -461,7 +461,7 @@ def test_standalone_rejects_untrusted_cross_origin_requests():
     assert res_ref.status_code == 403
     assert "Untrusted referer forbidden" in res_ref.text
 
-    # Cross-site Sec-Fetch-Site without verified loopback origin
+    # Cross-site Sec-Fetch-Site
     res_sec = client.post(
         "/api/plugins/voice-document-assistant/playback/stop",
         headers={"Sec-Fetch-Site": "cross-site"},
@@ -469,29 +469,38 @@ def test_standalone_rejects_untrusted_cross_origin_requests():
     assert res_sec.status_code == 403
     assert "Cross-origin request forbidden" in res_sec.text
 
-
-def test_standalone_allows_trusted_loopback_and_safe_requests():
-    """Verify that loopback origins and read-only GET requests pass through."""
-    # Loopback origin on 127.0.0.1
-    res_loopback = client.post(
-        "/api/plugins/voice-document-assistant/playback/stop",
-        headers={"Origin": "http://127.0.0.1:8080"},
-    )
-    assert res_loopback.status_code == 200
-
-    # Loopback origin on localhost:3000 (desktop dev server)
-    res_dev = client.post(
-        "/api/plugins/voice-document-assistant/playback/stop",
+    # Unrelated localhost origin on a different port attempting to read API data
+    res_foreign_localhost = client.get(
+        "/api/plugins/voice-document-assistant/status",
         headers={"Origin": "http://localhost:3000"},
     )
-    assert res_dev.status_code == 200
+    assert res_foreign_localhost.status_code == 403
+    assert "Untrusted origin forbidden" in res_foreign_localhost.text
 
-    # GET requests are safe and not blocked by mutating CSRF guard
-    res_get = client.get(
-        "/api/plugins/voice-document-assistant/status",
-        headers={"Origin": "https://evil.com"},
+
+def test_standalone_allows_trusted_same_origin_and_direct_requests():
+    """Verify that only the serving origin or direct browser navigation can access API endpoints."""
+    # TestClient default host header is 'testserver' (port 80)
+    # Direct same-origin request
+    res_same_origin = client.post(
+        "/api/plugins/voice-document-assistant/playback/stop",
+        headers={"Origin": "http://testserver"},
     )
-    assert res_get.status_code == 200
+    assert res_same_origin.status_code == 200
+
+    # Direct same-origin request with explicit matching Host and Origin
+    res_matching = client.post(
+        "/api/plugins/voice-document-assistant/playback/stop",
+        headers={"Host": "127.0.0.1:8080", "Origin": "http://127.0.0.1:8080"},
+    )
+    assert res_matching.status_code == 200
+
+    # Direct tool/CLI call without browser Origin header
+    res_direct_get = client.get(
+        "/api/plugins/voice-document-assistant/status",
+        headers={"Host": "127.0.0.1:8080"},
+    )
+    assert res_direct_get.status_code == 200
 
 
 def test_custom_home_cannot_access_another_custom_home_files():

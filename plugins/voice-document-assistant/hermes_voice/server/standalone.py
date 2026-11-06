@@ -11,7 +11,6 @@ import logging
 from pathlib import Path
 from urllib.parse import urlparse
 from fastapi import FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -24,16 +23,6 @@ app = FastAPI(
     version="1.0.0",
     description="Deterministic multi-agent voice document assistant",
 )
-
-# Enable CORS restricted to localhost/127.0.0.1 origins only to prevent cross-origin attacks
-ALLOWED_ORIGINS = [
-    "http://127.0.0.1:8080",
-    "http://localhost:8080",
-    "http://127.0.0.1:8000",
-    "http://localhost:8000",
-    "http://127.0.0.1:3000",
-    "http://localhost:3000",
-]
 
 ALLOWED_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "testserver"}
 
@@ -66,42 +55,76 @@ def is_loopback_host(url_or_origin: str) -> bool:
         return False
 
 
+def _normalize_netloc(host: str, scheme: str = "http") -> str:
+    """Normalize host[:port] into a canonical lowercase netloc with explicit port."""
+    h = (host or "").strip().lower()
+    if not h:
+        return ""
+    default_port = "443" if scheme == "https" else "80"
+    if h.startswith("["):
+        closing = h.find("]")
+        if closing == -1:
+            return ""
+        hostname = h[: closing + 1]
+        rest = h[closing + 1 :]
+        port = rest[1:] if rest.startswith(":") and rest[1:] else default_port
+    elif h.count(":") == 1:
+        hostname, port = h.split(":", 1)
+        port = port or default_port
+    else:
+        hostname, port = h, default_port
+    return f"{hostname}:{port}"
+
+
+def is_same_origin(url_or_origin: str, host_header: str) -> bool:
+    """True only when the Origin/Referer exactly matches the standalone server's own serving origin."""
+    if not url_or_origin or url_or_origin.strip().lower() in ("null", "none"):
+        return False
+    try:
+        parsed = urlparse(url_or_origin.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False
+        origin_netloc = _normalize_netloc(parsed.netloc.rsplit("@", 1)[-1], parsed.scheme)
+        server_netloc = _normalize_netloc(host_header, parsed.scheme)
+        return bool(origin_netloc) and origin_netloc == server_netloc
+    except Exception:
+        return False
+
+
 @app.middleware("http")
 async def csrf_and_origin_protection(request: Request, call_next):
-    """Prevent DNS rebinding attacks and cross-origin state mutations on unauthenticated standalone endpoints."""
+    """Prevent DNS rebinding and restrict the unauthenticated API to the standalone server's own origin.
+
+    Any other web application served on a different localhost port is a different origin and must not
+    be able to read private document data or mutate playback state (AGENTS.md:22-24).
+    """
     # 1. Reject requests whose Host is not an explicitly allowed loopback host, including for GET requests (DNS Rebinding Guard)
     host_header = request.headers.get("host") or ""
     if not is_allowed_loopback_host(host_header):
         return Response(content="Untrusted Host header forbidden (DNS rebinding protection)", status_code=403)
 
-    # 2. Prevent cross-origin state mutations
-    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+    # 2. Same-origin enforcement for every API request (reads included) and every mutating request
+    is_api = request.url.path.startswith("/api/")
+    if is_api or request.method in ("POST", "PUT", "DELETE", "PATCH"):
         origin = request.headers.get("origin")
         referer = request.headers.get("referer")
-        sec_fetch_site = (request.headers.get("sec-fetch-site") or "").lower()
+        sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
 
         if origin is not None:
-            if not is_loopback_host(origin):
+            if not is_same_origin(origin, host_header):
                 return Response(content="Untrusted origin forbidden", status_code=403)
         elif referer is not None:
-            if not is_loopback_host(referer):
+            if not is_same_origin(referer, host_header):
                 return Response(content="Untrusted referer forbidden", status_code=403)
 
-        if sec_fetch_site == "cross-site":
-            if not (origin and is_loopback_host(origin)):
-                return Response(content="Cross-origin request forbidden", status_code=403)
+        # Browsers send Sec-Fetch-Site on every request: only same-origin pages or direct user navigation are allowed
+        if sec_fetch_site and sec_fetch_site not in ("same-origin", "none"):
+            return Response(content="Cross-origin request forbidden", status_code=403)
 
     return await call_next(request)
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-    allow_headers=["*"],
-)
+# No CORSMiddleware: the bundled GUI is served from the same origin, so cross-origin reads stay blocked by the browser.
 
 # Mount plugin API router at official Hermes endpoint prefix
 app.include_router(plugin_router, prefix="/api/plugins/voice-document-assistant")
