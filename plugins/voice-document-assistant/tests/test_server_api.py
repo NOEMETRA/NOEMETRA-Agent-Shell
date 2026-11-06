@@ -603,6 +603,36 @@ def test_unscoped_request_with_custom_hermes_home_preserves_process_home(monkeyp
         assert "Access denied" in cross_resp.json()["detail"]
 
 
+def test_standalone_server_blocks_dns_rebinding_host_header():
+    """Verify that requests with untrusted Host headers are rejected (P1 DNS rebinding protection)."""
+    test_client = TestClient(app)
+
+    # 1. Attacker-controlled Host header on GET request must be rejected with 403
+    resp_get = test_client.get(
+        "/api/plugins/voice-document-assistant/status",
+        headers={"Host": "attacker-rebinding-domain.com"},
+    )
+    assert resp_get.status_code == 403
+    assert "DNS rebinding protection" in resp_get.text
+
+    # 2. Attacker-controlled Host header with port on POST request must be rejected with 403
+    resp_post = test_client.post(
+        "/api/plugins/voice-document-assistant/playback/play",
+        headers={"Host": "evil.org:8080"},
+    )
+    assert resp_post.status_code == 403
+    assert "DNS rebinding protection" in resp_post.text
+
+    # 3. Legitimate loopback Host headers succeed
+    for valid_host in ["localhost", "localhost:8000", "127.0.0.1", "127.0.0.1:8080", "[::1]", "[::1]:8080", "testserver"]:
+        resp_valid = test_client.get(
+            "/api/plugins/voice-document-assistant/status",
+            headers={"Host": valid_host},
+        )
+        assert resp_valid.status_code == 200
+
+
+
 
 
 
