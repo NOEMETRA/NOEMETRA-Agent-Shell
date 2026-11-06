@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusResponse, ReadingBookmark
 from hermes_voice.profile import (
     PROFILE_ID_RE,
+    ensure_voice_dir,
     register_served_profile_home,
     resolve_voice_profile_dir,
     validate_path_profile_ownership,
@@ -209,6 +210,8 @@ def _req_assistant(request: Request) -> HermesVoiceAssistant:
     profile_name, authorized_home = _resolve_authorized_context(request)
     try:
         return get_assistant(profile=profile_name, home_dir=authorized_home)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -283,10 +286,13 @@ async def upload_document(request: Request):
     profile_name, authorized_home = _resolve_authorized_context(request)
     try:
         assistant = get_assistant(profile=profile_name, home_dir=authorized_home)
-        upload_dir = (resolve_voice_profile_dir(profile=profile_name, home_dir=authorized_home) / "uploaded_pdfs").resolve()
+        upload_dir = ensure_voice_dir(
+            (resolve_voice_profile_dir(profile=profile_name, home_dir=authorized_home) / "uploaded_pdfs").resolve()
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    upload_dir.mkdir(parents=True, exist_ok=True)
 
     target_path: Optional[Path] = None
     content_type = request.headers.get("content-type", "").lower()
@@ -304,7 +310,11 @@ async def upload_document(request: Request):
             dest_file = (upload_dir / f"{content_hash}_{clean_name}").resolve()
             if not str(dest_file).startswith(str(upload_dir)):
                 raise HTTPException(status_code=400, detail="Destinazione non consentita.")
-            dest_file.write_bytes(content)
+            try:
+                ensure_voice_dir(upload_dir)
+                dest_file.write_bytes(content)
+            except FileNotFoundError as e:
+                raise HTTPException(status_code=404, detail=str(e))
             target_path = dest_file
     else:
         try:
@@ -375,7 +385,11 @@ async def upload_document(request: Request):
             dest_file = (upload_dir / f"{content_hash}_{clean_name}").resolve()
             if not str(dest_file).startswith(str(upload_dir)):
                 raise HTTPException(status_code=400, detail="Destinazione non consentita.")
-            dest_file.write_bytes(data)
+            try:
+                ensure_voice_dir(upload_dir)
+                dest_file.write_bytes(data)
+            except FileNotFoundError as e:
+                raise HTTPException(status_code=404, detail=str(e))
             target_path = dest_file
 
     if not target_path or not target_path.exists():
@@ -389,6 +403,8 @@ async def upload_document(request: Request):
             "bookmark": bm.model_dump(),
             "document": doc.model_dump() if doc else None,
         }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Errore estrazione PDF da {target_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Errore caricamento PDF: {e}")

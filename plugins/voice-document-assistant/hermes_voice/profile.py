@@ -28,6 +28,57 @@ def clear_registered_served_profile_homes() -> None:
     _REGISTERED_SERVED_HOMES.clear()
 
 
+def assert_voice_home_live(path: Union[str, Path]) -> None:
+    """Refuse missing or tombstoned named profile homes."""
+    target = Path(path)
+    try:
+        from hermes_constants import assert_named_profile_home_live
+        has_guard = True
+    except (ImportError, ModuleNotFoundError):
+        has_guard = False
+
+    if has_guard:
+        assert_named_profile_home_live(target)
+        return
+
+    # Standalone fallback when running outside full Hermes runtime
+    for candidate in (target, *target.parents):
+        if candidate.parent.name == "profiles" and not candidate.name.startswith("."):
+            root = candidate.parent.parent
+            is_profiles_root = (
+                root.name == ".hermes"
+                or (candidate.parent / ".deleted").is_dir()
+                or any((root / m).exists() for m in ("config.yaml", ".env", "state.db"))
+            )
+            if is_profiles_root:
+                tombstone = candidate.parent / ".deleted" / candidate.name
+                if tombstone.exists() or not candidate.exists():
+                    raise FileNotFoundError(
+                        f"Named profile home does not exist: {candidate}. "
+                        "Create the profile explicitly before using it."
+                    )
+                break
+        if candidate.name == ".hermes":
+            break
+
+
+def ensure_voice_dir(path: Union[str, Path]) -> Path:
+    """Create *path* via the profile-aware guard so deleted/missing named profiles are never recreated."""
+    target = Path(path)
+    try:
+        from hermes_constants import mkdir_under_hermes_home
+        has_mkdir_guard = True
+    except (ImportError, ModuleNotFoundError):
+        has_mkdir_guard = False
+
+    if has_mkdir_guard:
+        return mkdir_under_hermes_home(target)
+
+    assert_voice_home_live(target)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def resolve_voice_profile_dir(
     profile: Optional[str] = None,
     home_dir: Optional[Union[str, Path]] = None,
@@ -38,35 +89,35 @@ def resolve_voice_profile_dir(
     and voice libraries across multiple Hermes profiles and custom HERMES_HOME locations (AGENTS.md:13).
     When home_dir is specified (e.g. from an authorized native ticket or home override),
     it is preserved directly as the storage identity rather than routing through the profiles root.
+    Refuses to recreate deleted or missing named profile homes.
     Rejects invalid profile names (e.g. traversal tokens like '..').
     """
     if home_dir is not None:
         base_dir = Path(home_dir).resolve()
         target_dir = base_dir / "voice_assistant"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        return target_dir
+        return ensure_voice_dir(target_dir)
 
     prof = (profile or "").strip()
     if not prof:
         # Implicit storage resolution from the active Hermes home path (AGENTS.md:13)
         try:
             from hermes_constants import get_hermes_home
+            has_hermes_constants = True
+        except (ImportError, ModuleNotFoundError):
+            has_hermes_constants = False
+
+        if has_hermes_constants:
             active_home = get_hermes_home().resolve()
             target_dir = active_home / "voice_assistant"
-            target_dir.mkdir(parents=True, exist_ok=True)
-            return target_dir
-        except Exception:
-            pass
+            return ensure_voice_dir(target_dir)
 
         hermes_home = os.environ.get("HERMES_HOME")
         if hermes_home and hermes_home.strip():
             target_dir = Path(hermes_home).resolve() / "voice_assistant"
-            target_dir.mkdir(parents=True, exist_ok=True)
-            return target_dir
+            return ensure_voice_dir(target_dir)
 
         target_dir = (Path.home() / ".hermes" / "voice_assistant").resolve()
-        target_dir.mkdir(parents=True, exist_ok=True)
-        return target_dir
+        return ensure_voice_dir(target_dir)
 
     prof = prof.strip().lower()
     if not PROFILE_ID_RE.match(prof):
@@ -88,8 +139,7 @@ def resolve_voice_profile_dir(
             base_dir = Path.home() / ".hermes"
 
     target_dir = base_dir / "voice_assistant"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir
+    return ensure_voice_dir(target_dir)
 
 
 def validate_path_profile_ownership(

@@ -70,8 +70,14 @@ def test_tool_handlers_accept_registry_argument_dict():
         assert "status" in res_stop
 
 
-def test_profile_isolation_preserves_independent_state():
+def test_profile_isolation_preserves_independent_state(tmp_path, monkeypatch):
     """Verify multiple profiles in the same process maintain strict isolation of state and directories."""
+    default_home = tmp_path / ".hermes"
+    (default_home / "profiles" / "profile_alpha").mkdir(parents=True, exist_ok=True)
+    (default_home / "profiles" / "profile_beta").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
     reset_assistants()
     try:
         dir_prof_a = resolve_voice_profile_dir("profile_alpha")
@@ -121,14 +127,21 @@ def test_uncited_answer_preserves_empty_citations_and_fails_verification():
         assert "Nessuna citazione formale fornita" in res.unsupported_claims[0]
 
 
-def test_profile_validation_rejects_directory_traversal():
+def test_profile_validation_rejects_directory_traversal(tmp_path, monkeypatch):
     """Verify profile validation rejects path traversal, slashes, and illegal symbols with ValueError."""
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
     for bad in ["..", "../etc", "foo/bar", "foo\\bar", ".hidden", "bad spaces", "a" * 65]:
         with pytest.raises(ValueError, match="Invalid profile name"):
             resolve_voice_profile_dir(bad)
 
-    # Valid names should resolve cleanly
+    # Valid names should resolve cleanly when their profile homes exist
     for good in ["default", "agent_1", "profile-a", "user123"]:
+        if good != "default":
+            (default_home / "profiles" / good).mkdir(parents=True, exist_ok=True)
         resolved = resolve_voice_profile_dir(good)
         assert resolved.exists() or resolved.parent.exists()
 
@@ -195,8 +208,13 @@ def test_player_audio_stream_failure_preserves_sentence_index():
             assert player.current_sentence_index == 0
 
 
-def test_voice_load_document_rejects_cross_profile_path():
+def test_voice_load_document_rejects_cross_profile_path(tmp_path, monkeypatch):
     """Verify voice_load_document tool blocks loading a PDF belonging to another profile (P1)."""
+    default_home = tmp_path / ".hermes"
+    (default_home / "profiles" / "victim_profile").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
     reset_assistants()
     victim_dir = resolve_voice_profile_dir("victim_profile")
     victim_pdf = victim_dir / "secret.pdf"
@@ -208,15 +226,21 @@ def test_voice_load_document_rejects_cross_profile_path():
         assert "Access denied" in res["error"]
         assert "victim_profile" in res["error"]
     finally:
+        reset_assistants()
         if victim_pdf.exists():
             victim_pdf.unlink()
 
 
-def test_named_profile_can_load_own_file():
+def test_named_profile_can_load_own_file(tmp_path, monkeypatch):
     """Verify that a named profile can load a PDF located in its own profile directory without default-home collision (P2)."""
     from hermes_voice.profile import validate_path_profile_ownership, resolve_voice_profile_dir
 
+    default_home = tmp_path / ".hermes"
     named_prof = "custom_named_profile"
+    (default_home / "profiles" / named_prof).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
     prof_dir = resolve_voice_profile_dir(named_prof)
     my_pdf = prof_dir / "my_report.pdf"
     create_sample_italian_pdf(my_pdf)
@@ -267,6 +291,83 @@ def test_implicit_storage_resolution_from_active_hermes_home(monkeypatch):
         assert resolved == (custom_home / "voice_assistant").resolve()
         assert "profiles" not in str(resolved)
         assert resolved.exists()
+
+
+def test_refuses_to_recreate_deleted_or_missing_named_profile_home(tmp_path, monkeypatch):
+    """Verify deleted or missing named profile homes are never recreated by in-flight requests or tool calls (P2)."""
+    import shutil
+    from hermes_constants import (
+        mark_named_profile_deleted,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir(parents=True, exist_ok=True)
+    (default_home / "config.yaml").write_text("model: test\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    # 1. Missing named profile must raise FileNotFoundError and not create directory
+    missing_dir = default_home / "profiles" / "never_created"
+    with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
+        resolve_voice_profile_dir(profile="never_created")
+    assert not missing_dir.exists()
+
+    # 2. Live named profile resolves and creates voice_assistant subdirectory normally
+    worker_dir = default_home / "profiles" / "worker"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    (worker_dir / ".env").write_text("# profile\n", encoding="utf-8")
+    reset_assistants()
+    try:
+        voice_dir = resolve_voice_profile_dir(profile="worker")
+        assert voice_dir == (worker_dir / "voice_assistant").resolve()
+        assert voice_dir.is_dir()
+
+        # Instantiate cached assistant before profile deletion
+        ast = get_assistant(profile="worker")
+        assert ast.library_path.parent == voice_dir
+
+        # Simulate profile deletion while requests/tools are still in flight
+        mark_named_profile_deleted(worker_dir)
+        shutil.rmtree(worker_dir)
+        assert not worker_dir.exists()
+
+        # 2a. Explicit profile resolution refuses to recreate deleted home
+        with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
+            resolve_voice_profile_dir(profile="worker")
+        assert not worker_dir.exists()
+
+        # 2b. Explicit home_dir resolution (e.g. stale native ticket grant) refuses to recreate deleted home
+        with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
+            resolve_voice_profile_dir(home_dir=worker_dir)
+        assert not worker_dir.exists()
+
+        # 2c. Implicit-home resolution via context override (e.g. in-flight tool call) refuses to recreate deleted home
+        token = set_hermes_home_override(worker_dir)
+        try:
+            with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
+                resolve_voice_profile_dir()
+            with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
+                voice_get_status({})
+        finally:
+            reset_hermes_home_override(token)
+        assert not worker_dir.exists()
+
+        # 2d. Implicit-home resolution via HERMES_HOME env refuses to recreate deleted home
+        monkeypatch.setenv("HERMES_HOME", str(worker_dir))
+        with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
+            resolve_voice_profile_dir()
+        assert not worker_dir.exists()
+
+        # 2e. Late background bookmark/library save on pre-existing objects must not recreate deleted home
+        ast._save_library_catalog()
+        ast.player._save_bookmark()
+        assert not worker_dir.exists()
+    finally:
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        reset_assistants()
+
 
 
 

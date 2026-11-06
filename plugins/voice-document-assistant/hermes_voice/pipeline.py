@@ -36,7 +36,12 @@ from hermes_voice.models import (
 )
 from hermes_voice.model_router import ModelRouter
 from hermes_voice.player import DocumentPlayer
-from hermes_voice.profile import resolve_voice_profile_dir, validate_path_profile_ownership
+from hermes_voice.profile import (
+    assert_voice_home_live,
+    ensure_voice_dir,
+    resolve_voice_profile_dir,
+    validate_path_profile_ownership,
+)
 from hermes_voice.tts_engine import PocketTTSEngine
 
 logger = logging.getLogger(__name__)
@@ -62,7 +67,7 @@ class HermesVoiceAssistant:
         self.home_dir = Path(home_dir).resolve() if home_dir else None
 
         self.library_path = Path(library_path or prof_dir / "voice_library.json")
-        self.library_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_voice_dir(self.library_path.parent)
 
         bm_path = Path(bookmark_path or prof_dir / "reading_state.json")
         c_dir = Path(cache_dir or prof_dir / "audio_cache")
@@ -148,6 +153,7 @@ class HermesVoiceAssistant:
             "documents": [e.model_dump() for e in entries],
         }
         try:
+            ensure_voice_dir(self.library_path.parent)
             self.library_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"Impossibile salvare la biblioteca su {self.library_path}: {e}")
@@ -164,6 +170,7 @@ class HermesVoiceAssistant:
 
     def load_document(self, file_path: Union[str, Path], resume_bookmark: bool = True) -> ReadingBookmark:
         """Extract PDF document and set up player and agents atomically."""
+        assert_voice_home_live(self.library_path)
         validate_path_profile_ownership(file_path, profile=self.profile, home_dir=self.home_dir)
         with self._activation_lock:
             logger.info(f"Caricamento documento da '{file_path}'...")
