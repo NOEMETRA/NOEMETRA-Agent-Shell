@@ -174,9 +174,22 @@
       const interval = setInterval(refreshStatus, 3000);
       return () => {
         clearInterval(interval);
+        const wasPlaying = Boolean(
+          clientAudioRef.current && !clientAudioRef.current.paused && !clientAudioRef.current.ended
+        );
         fetchingTargetRef.current = "";
         lastPlayedTargetRef.current = "";
-        if (clientAudioRef.current) clientAudioRef.current.pause();
+        if (clientAudioRef.current) {
+          clientAudioRef.current.pause();
+          clientAudioRef.current = null;
+        }
+        if (wasPlaying) {
+          fetchJSON("/api/plugins/voice-document-assistant/playback/pause", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({})
+          }).catch(() => {});
+        }
       };
     }, [refreshStatus, refreshLibrary]);
 
