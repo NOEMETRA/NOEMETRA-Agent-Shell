@@ -40,3 +40,45 @@ def test_extractor_abbreviations():
     # Should not split on "dott.", "prof.", "art."
     assert len(sentences) == 1
     assert "dott. Rossi" in sentences[0]
+
+
+def test_extractor_preserves_trailing_text_without_terminal_punctuation():
+    """Verify text after the last sentence delimiter is preserved for TTS and retrieval (P1)."""
+    import pymupdf
+
+    extractor = DocumentExtractor()
+
+    # 1. Complete sentence followed by trailing clause without terminal punctuation
+    mixed = "Prima frase completa. Avvertenza importante senza punto finale"
+    assert extractor._split_into_sentences(mixed) == [
+        "Prima frase completa.",
+        "Avvertenza importante senza punto finale",
+    ]
+
+    # 2. Abbreviation followed by trailing text without terminal punctuation
+    abbrev_tail = "Gentile Dott. Mario Rossi"
+    assert extractor._split_into_sentences(abbrev_tail) == ["Gentile Dott. Mario Rossi"]
+
+    # 3. Quoted exclamation followed by closing punctuation and unpunctuated tail
+    quoted = 'Disse "Attenzione!". Nota operativa urgente'
+    assert extractor._split_into_sentences(quoted) == [
+        'Disse "Attenzione!".',
+        "Nota operativa urgente",
+    ]
+
+    # 4. End-to-end PDF block extraction preserves trailing unpunctuated text in all_sentences
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "trailing.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "Introduzione regolarmente punteggiata. Clausola finale critica")
+        doc.save(str(pdf_path))
+        doc.close()
+
+        extracted = extractor.extract(pdf_path)
+        texts = [s.text for s in extracted.all_sentences]
+        assert texts == [
+            "Introduzione regolarmente punteggiata.",
+            "Clausola finale critica",
+        ]
+
