@@ -179,6 +179,78 @@ def _match_custom_provider_entry(
     return None
 
 
+_OPENAI_COMPAT_LOCAL_ALIASES = frozenset({
+    "custom", "lmstudio", "vllm", "openai_compatible", "codex", "local",
+})
+_DIRECT_REMOTE_ALIASES = frozenset({
+    "remote", "api", "openai", "anthropic", "openrouter",
+})
+_LLAMACPP_LOCAL_ALIASES = frozenset({
+    "llamacpp", "llama.cpp", "llama-cpp",
+})
+
+
+def _resolve_hermes_provider_id(provider_name: Optional[str]) -> Optional[str]:
+    """Return canonical Hermes provider id when *provider_name* is a supported Hermes runtime provider."""
+    norm = (provider_name or "").strip().lower()
+    if (
+        not norm
+        or norm in ("auto", "default", "ollama")
+        or norm in _OPENAI_COMPAT_LOCAL_ALIASES
+        or norm.startswith("custom:")
+        or norm in ("remote", "api")
+    ):
+        return None
+    if norm in _LLAMACPP_LOCAL_ALIASES or norm == "moa":
+        return norm
+    try:
+        from hermes_cli.auth import resolve_provider
+
+        resolved = resolve_provider(norm)
+        if resolved and resolved not in ("auto", "custom"):
+            return resolved
+    except Exception:
+        return None
+    return None
+
+
+def _is_foreign_builtin_endpoint(canonical_provider: str, url: Optional[str]) -> bool:
+    """Return True when *url* belongs to a different built-in provider (e.g. leftover openrouter.ai default)."""
+    if not url or not str(url).strip():
+        return False
+    if canonical_provider != "openrouter" and _host_matches_domain(url, "openrouter.ai"):
+        return True
+    try:
+        from hermes_cli.runtime_provider import is_foreign_provider_endpoint
+
+        return bool(is_foreign_provider_endpoint(canonical_provider, url))
+    except Exception:
+        return False
+
+
+def _is_hermes_provider_configured_offline(canonical_provider: str) -> bool:
+    """Check whether a Hermes provider has credentials configured without making network requests."""
+    if not canonical_provider:
+        return False
+    try:
+        from hermes_cli import auth as auth_mod
+
+        if canonical_provider == "nous":
+            return bool(auth_mod.get_nous_auth_status_local().get("logged_in"))
+        if canonical_provider == "bedrock":
+            from agent.bedrock_adapter import has_aws_credentials
+
+            return bool(has_aws_credentials(instance_metadata=False))
+        if canonical_provider == "vertex":
+            return bool(
+                _get_profile_scoped_secret("GOOGLE_APPLICATION_CREDENTIALS")
+                or _get_profile_scoped_secret("VERTEX_CREDENTIALS_PATH")
+            )
+        return bool(auth_mod.get_auth_status(canonical_provider).get("logged_in"))
+    except Exception:
+        return False
+
+
 class ModelRouter:
     """Routes LLM generation requests with local-first privacy enforcement."""
 
@@ -251,15 +323,46 @@ class ModelRouter:
             pass
 
         # Resolve provider
-        if default_provider is not None:
+        env_inf_prov = _get_profile_scoped_secret("HERMES_INFERENCE_PROVIDER")
+        if default_provider is not None and default_provider.lower().strip() not in ("auto", "default", ""):
             raw_provider = default_provider.lower().strip()
         elif cfg_provider and str(cfg_provider).lower().strip() not in ("auto", "default", ""):
             raw_provider = str(cfg_provider).lower().strip()
+        elif env_inf_prov and env_inf_prov.lower().strip() not in ("auto", "default", ""):
+            raw_provider = env_inf_prov.lower().strip()
         else:
             raw_provider = "ollama"
 
+        # Prevent config fields from an unrelated provider in config.yaml from bleeding into an overridden provider
+        cfg_prov_norm = str(cfg_provider or "").strip().lower()
+        if default_provider is not None and default_provider.lower().strip() not in ("auto", "default", ""):
+            same_cfg_prov = (
+                bool(cfg_prov_norm)
+                and cfg_prov_norm not in ("auto", "default")
+                and (
+                    raw_provider == cfg_prov_norm
+                    or (
+                        _resolve_hermes_provider_id(raw_provider) is not None
+                        and _resolve_hermes_provider_id(raw_provider) == _resolve_hermes_provider_id(cfg_prov_norm)
+                    )
+                )
+            )
+            if not same_cfg_prov:
+                cfg_model = None
+                cfg_base_url = None
+                cfg_api_key = None
+                cfg_key_env = None
+        elif raw_provider != "ollama" and cfg_prov_norm in ("auto", "default"):
+            cfg_model = None
+            cfg_base_url = None
+
+        hermes_provider_id = _resolve_hermes_provider_id(raw_provider)
         matched_custom = None
-        if raw_provider not in ("ollama", "remote", "api", "openai", "anthropic", "openrouter"):
+        if (
+            raw_provider in _OPENAI_COMPAT_LOCAL_ALIASES
+            or raw_provider.startswith("custom:")
+            or (raw_provider not in ("ollama", *_DIRECT_REMOTE_ALIASES) and hermes_provider_id is None)
+        ):
             matched_custom = _match_custom_provider_entry(cfg, raw_provider, cfg_base_url)
             if matched_custom is not None:
                 if not cfg_base_url and matched_custom.get("base_url"):
@@ -268,13 +371,11 @@ class ModelRouter:
                     cfg_model = matched_custom["model"]
 
         if (
-            raw_provider in ("custom", "lmstudio", "vllm", "openai_compatible", "codex")
+            raw_provider in _OPENAI_COMPAT_LOCAL_ALIASES
             or raw_provider.startswith("custom:")
             or matched_custom is not None
         ):
             resolved_provider = "openai_compatible"
-        elif raw_provider not in ("remote", "api", "openai", "anthropic", "openrouter"):
-            resolved_provider = "ollama"
         else:
             resolved_provider = raw_provider
 
@@ -282,6 +383,16 @@ class ModelRouter:
         self._explicit_codex_api_key = (
             codex_api_key.strip()
             if isinstance(codex_api_key, str) and _is_usable_secret(codex_api_key)
+            else None
+        )
+        self._explicit_remote_base_url = (
+            remote_base_url.strip()
+            if isinstance(remote_base_url, str) and remote_base_url.strip()
+            else None
+        )
+        self._explicit_remote_api_key = (
+            remote_api_key.strip()
+            if isinstance(remote_api_key, str) and _is_usable_secret(remote_api_key)
             else None
         )
         self._cfg_base_url = (
@@ -320,7 +431,9 @@ class ModelRouter:
 
         # Resolve model name
         resolved_model = str(ollama_model or cfg_model or "").strip()
+        self._configured_model: Optional[str] = resolved_model or None
         self.ollama_model = resolved_model or "gemma4:12b"
+        self.last_model_used: Optional[str] = None
 
         # Resolve OpenAI-compatible / local server endpoint (LM Studio, vLLM, Codex)
         if codex_base_url is not None:
@@ -340,10 +453,10 @@ class ModelRouter:
         )
         self._initial_codex_api_key = self.codex_api_key
 
-        # Resolve remote provider settings (OpenAI, Anthropic, OpenRouter, Remote)
+        # Resolve remote provider settings (OpenAI, Anthropic, OpenRouter, Remote, and Hermes runtime providers)
         if remote_base_url is not None:
             self.remote_base_url = remote_base_url
-        elif cfg_base_url and self.default_provider in ("remote", "api", "openai", "anthropic", "openrouter"):
+        elif cfg_base_url and self.default_provider in _DIRECT_REMOTE_ALIASES:
             self.remote_base_url = cfg_base_url
         elif self.default_provider == "openrouter":
             self.remote_base_url = _get_profile_scoped_secret("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
@@ -351,25 +464,58 @@ class ModelRouter:
             self.remote_base_url = _get_profile_scoped_secret("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1"
         elif self.default_provider in ("openai", "remote", "api"):
             self.remote_base_url = _get_profile_scoped_secret("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        elif hermes_provider_id and hermes_provider_id not in _LLAMACPP_LOCAL_ALIASES:
+            if cfg_base_url and not _is_foreign_builtin_endpoint(hermes_provider_id, str(cfg_base_url)):
+                self.remote_base_url = str(cfg_base_url)
+            else:
+                self.remote_base_url = None
+                try:
+                    from hermes_cli.auth import PROVIDER_REGISTRY
+
+                    pconfig = PROVIDER_REGISTRY.get(hermes_provider_id)
+                    if pconfig is not None:
+                        env_url = (
+                            _get_profile_scoped_secret(pconfig.base_url_env_var)
+                            if getattr(pconfig, "base_url_env_var", "")
+                            else None
+                        )
+                        self.remote_base_url = env_url or pconfig.inference_base_url or pconfig.portal_base_url or None
+                except Exception:
+                    pass
         else:
             self.remote_base_url = None
 
         if remote_api_key is not None:
             self.remote_api_key = remote_api_key
-        elif cfg_api_key:
-            self.remote_api_key = cfg_api_key
+        elif cfg_api_key and _is_usable_secret(str(cfg_api_key)):
+            self.remote_api_key = str(cfg_api_key).strip()
+        elif self._cfg_key_env and (self.default_provider in _DIRECT_REMOTE_ALIASES or hermes_provider_id is not None):
+            self.remote_api_key = _get_profile_scoped_secret(self._cfg_key_env) or ""
         else:
-            prov_key = f"{self.default_provider.upper()}_API_KEY" if self.default_provider else None
-            if prov_key and prov_key not in ("OLLAMA_API_KEY", "OPENAI_COMPATIBLE_API_KEY"):
-                self.remote_api_key = _get_profile_scoped_secret(prov_key) or ""
-            elif self.default_provider in ("remote", "api"):
-                self.remote_api_key = (
-                    _get_profile_scoped_secret("REMOTE_API_KEY")
-                    or _get_profile_scoped_secret("OPENAI_API_KEY")
-                    or ""
-                )
-            else:
-                self.remote_api_key = ""
+            resolved_key = ""
+            if hermes_provider_id is not None and self.default_provider not in _DIRECT_REMOTE_ALIASES:
+                try:
+                    from hermes_cli.auth import PROVIDER_REGISTRY
+
+                    pconfig = PROVIDER_REGISTRY.get(hermes_provider_id)
+                    if pconfig is not None and pconfig.auth_type == "api_key":
+                        for var_name in getattr(pconfig, "api_key_env_vars", ()):
+                            candidate = _get_profile_scoped_secret(var_name)
+                            if candidate:
+                                resolved_key = candidate
+                                break
+                except Exception:
+                    pass
+            if not resolved_key:
+                if self.default_provider in ("openai", "anthropic", "openrouter"):
+                    resolved_key = _get_profile_scoped_secret(f"{self.default_provider.upper()}_API_KEY") or ""
+                elif self.default_provider in ("remote", "api"):
+                    resolved_key = (
+                        _get_profile_scoped_secret("REMOTE_API_KEY")
+                        or _get_profile_scoped_secret("OPENAI_API_KEY")
+                        or ""
+                    )
+            self.remote_api_key = resolved_key
 
         self.allow_remote = allow_remote
 
@@ -449,10 +595,11 @@ class ModelRouter:
         logger.info(f"Autorizzazione provider remoti aggiornata a: {self.allow_remote}")
 
     def set_model(self, model_name: str) -> None:
-        """Explicitly switch the local model used for question answering."""
+        """Explicitly switch the model used for question answering."""
         if model_name and model_name.strip():
             self.ollama_model = model_name.strip()
-            logger.info("Modello Ollama aggiornato a: %s", self.ollama_model)
+            self._configured_model = self.ollama_model
+            logger.info("Modello aggiornato a: %s", self.ollama_model)
 
     def select_installed_model(self) -> str:
         """Autodetect and select an installed Ollama model if the configured target model is missing."""
@@ -508,14 +655,25 @@ class ModelRouter:
         with self._profile_scope():
             ollama_health = self.check_ollama_health()
             has_remote_key = bool(self.remote_api_key)
-            if not has_remote_key and self.default_provider in ("openai", "anthropic", "openrouter", "remote", "api"):
+            hermes_id = _resolve_hermes_provider_id(self.default_provider)
+            if not has_remote_key and self.default_provider in _DIRECT_REMOTE_ALIASES:
                 if self.default_provider in ("remote", "api"):
                     has_remote_key = bool(
                         _get_profile_scoped_secret("REMOTE_API_KEY")
                         or _get_profile_scoped_secret("OPENAI_API_KEY")
                     )
                 else:
-                    has_remote_key = bool(_get_profile_scoped_secret(f"{self.default_provider.upper()}_API_KEY"))
+                    has_remote_key = bool(
+                        _get_profile_scoped_secret(f"{self.default_provider.upper()}_API_KEY")
+                        or (hermes_id and _is_hermes_provider_configured_offline(hermes_id))
+                    )
+            elif not has_remote_key and hermes_id and hermes_id not in _LLAMACPP_LOCAL_ALIASES:
+                has_remote_key = _is_hermes_provider_configured_offline(hermes_id)
+
+            remote_configured = bool(
+                (self.remote_base_url and has_remote_key)
+                or (hermes_id and hermes_id not in _LLAMACPP_LOCAL_ALIASES and has_remote_key)
+            )
             return {
                 "default_provider": self.default_provider,
                 "allow_remote": self.allow_remote,
@@ -533,7 +691,7 @@ class ModelRouter:
                     "is_local": is_local_endpoint(self.codex_base_url or "http://127.0.0.1:8000/v1"),
                 },
                 "remote_api": {
-                    "configured": bool(self.remote_base_url and has_remote_key),
+                    "configured": remote_configured,
                     "url": self.remote_base_url,
                     "is_local": False,
                     "authorized": self.allow_remote,
@@ -569,7 +727,7 @@ class ModelRouter:
         max_tokens: int = 512,
         temperature: float = 0.2,
     ) -> str:
-        selected_provider = (provider or self.default_provider).lower()
+        selected_provider = (provider or self.default_provider).lower().strip()
 
         if selected_provider == "ollama":
             if not is_local_endpoint(self.ollama_base_url) and not self.allow_remote:
@@ -579,6 +737,7 @@ class ModelRouter:
                     "Abilitare esplicitamente allow_remote con il consenso dell'utente."
                 )
             target_model = model or self.select_installed_model()
+            self.last_model_used = target_model
             return self._call_ollama(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -588,7 +747,7 @@ class ModelRouter:
             )
 
         elif (
-            selected_provider in ("codex", "openai_compatible", "custom", "lmstudio", "vllm")
+            selected_provider in _OPENAI_COMPAT_LOCAL_ALIASES
             or selected_provider.startswith("custom:")
         ):
             target_url = self.codex_base_url or "http://127.0.0.1:8000/v1"
@@ -607,16 +766,18 @@ class ModelRouter:
                     target_url=target_url,
                 )
 
+            target_model = model or self.ollama_model or "local-model"
+            self.last_model_used = target_model
             return self._call_openai_compatible(
                 base_url=target_url,
                 api_key=effective_key or "local",
-                model=model or self.ollama_model or "local-model",
+                model=target_model,
                 prompt=prompt,
                 system_prompt=system_prompt,
                 temperature=temperature,
             )
 
-        elif selected_provider in ("remote", "api", "openai", "anthropic", "openrouter"):
+        elif selected_provider in _DIRECT_REMOTE_ALIASES:
             if not self.allow_remote:
                 raise PermissionError(
                     "VIOLAZIONE VINCOLO PRIVACY: L'invio di dati documentali a provider remoti "
@@ -651,6 +812,17 @@ class ModelRouter:
                     )
 
             if not target_key and selected_provider in ("openai", "anthropic", "openrouter"):
+                canonical_direct = _resolve_hermes_provider_id(selected_provider)
+                if canonical_direct and _is_hermes_provider_configured_offline(canonical_direct):
+                    return self._call_hermes_runtime_provider(
+                        provider_name=selected_provider,
+                        canonical_provider=canonical_direct,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
                 raise ValueError(
                     f"Nessuna credenziale trovata per il provider '{selected_provider}'. "
                     f"Configurare {selected_provider.upper()}_API_KEY nel profilo per procedere."
@@ -665,6 +837,7 @@ class ModelRouter:
                 else:
                     target_model = "gpt-4o-mini"
 
+            self.last_model_used = target_model
             if selected_provider == "anthropic" or "anthropic.com" in target_url:
                 return self._call_anthropic(
                     base_url=target_url,
@@ -673,6 +846,7 @@ class ModelRouter:
                     prompt=prompt,
                     system_prompt=system_prompt,
                     temperature=temperature,
+                    max_tokens=max_tokens,
                 )
 
             return self._call_openai_compatible(
@@ -685,7 +859,145 @@ class ModelRouter:
             )
 
         else:
+            canonical_hermes = _resolve_hermes_provider_id(selected_provider)
+            if canonical_hermes is not None:
+                candidate_url = (
+                    self._explicit_remote_base_url
+                    if self._explicit_remote_base_url and selected_provider == self.default_provider
+                    else (
+                        self._cfg_base_url
+                        if self._cfg_base_url
+                        and (
+                            selected_provider == self.default_provider
+                            or canonical_hermes == _resolve_hermes_provider_id(self.default_provider)
+                        )
+                        and not _is_foreign_builtin_endpoint(canonical_hermes, self._cfg_base_url)
+                        else None
+                    )
+                )
+                is_local_runtime = canonical_hermes in _LLAMACPP_LOCAL_ALIASES or (
+                    bool(candidate_url) and is_local_endpoint(candidate_url)
+                )
+                if not is_local_runtime and not self.allow_remote:
+                    raise PermissionError(
+                        f"VIOLAZIONE VINCOLO PRIVACY: Il provider '{selected_provider}' è remoto. "
+                        "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita. "
+                        "Per abilitarlo, impostare esplicitamente allow_remote=True con il consenso dell'utente."
+                    )
+                return self._call_hermes_runtime_provider(
+                    provider_name=selected_provider,
+                    canonical_provider=canonical_hermes,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    explicit_base_url=candidate_url,
+                )
+
             raise ValueError(f"Provider sconosciuto: {selected_provider}")
+
+    def _call_hermes_runtime_provider(
+        self,
+        provider_name: str,
+        canonical_provider: str,
+        prompt: str,
+        system_prompt: Optional[str],
+        model: Optional[str],
+        temperature: float,
+        max_tokens: int,
+        explicit_base_url: Optional[str] = None,
+    ) -> str:
+        """Execute generation via Hermes's official provider runtime (API key / OAuth / cloud SDK)."""
+        try:
+            from agent import auxiliary_client as aux_mod
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RuntimeError(
+                f"Il runtime del provider '{provider_name}' non è disponibile senza i moduli core di Hermes."
+            ) from exc
+
+        same_default = (
+            provider_name == self.default_provider
+            or canonical_provider == _resolve_hermes_provider_id(self.default_provider)
+        )
+        requested_model = model or (self._configured_model if same_default else None)
+
+        explicit_key: Optional[str] = None
+        if same_default:
+            if self._explicit_remote_api_key:
+                explicit_key = self._explicit_remote_api_key
+            elif self._cfg_api_key:
+                explicit_key = self._cfg_api_key
+            elif self._cfg_key_env:
+                explicit_key = _get_profile_scoped_secret(self._cfg_key_env)
+
+        client, resolved_model = aux_mod.resolve_provider_client(
+            provider_name,
+            model=requested_model,
+            explicit_base_url=explicit_base_url,
+            explicit_api_key=explicit_key,
+        )
+        if client is None:
+            raise ValueError(
+                f"Nessuna credenziale valida trovata per il provider '{provider_name}'. "
+                "Configurare l'autenticazione ufficiale del provider in Hermes (`hermes auth` / `hermes model`) per procedere."
+            )
+
+        client_base_url = str(getattr(client, "base_url", "") or explicit_base_url or "")
+        if (
+            client_base_url.startswith(("http://", "https://"))
+            and not is_local_endpoint(client_base_url)
+            and not self.allow_remote
+        ):
+            raise PermissionError(
+                f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint '{client_base_url}' per il provider '{provider_name}' è remoto. "
+                "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
+            )
+
+        final_model = str(resolved_model or requested_model or "").strip()
+        if not final_model:
+            raise ValueError(
+                f"Nessun modello configurato o risolto per il provider '{provider_name}'."
+            )
+
+        messages: List[Dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        codex_cls = getattr(aux_mod, "CodexAuxiliaryClient", ())
+        no_progress_timeout = (
+            aux_mod._get_task_no_progress_timeout(None)
+            if codex_cls and isinstance(client, codex_cls)
+            else None
+        )
+        call_kwargs = aux_mod._build_call_kwargs(
+            canonical_provider,
+            final_model,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=60.0,
+            base_url=client_base_url or None,
+            no_progress_timeout=no_progress_timeout,
+        )
+        response = client.chat.completions.create(**call_kwargs)
+        validated = aux_mod._validate_llm_response(
+            response,
+            task="voice_document_qa",
+            provider=canonical_provider,
+            base_url=client_base_url or None,
+        )
+        self.last_model_used = final_model
+        msg = validated.choices[0].message
+        content = getattr(msg, "content", None)
+        if isinstance(content, list):
+            parts = [
+                b.get("text", "") if isinstance(b, dict) else str(getattr(b, "text", ""))
+                for b in content
+            ]
+            return "".join(parts).strip()
+        return str(content or "").strip()
 
     def _call_ollama(
         self,

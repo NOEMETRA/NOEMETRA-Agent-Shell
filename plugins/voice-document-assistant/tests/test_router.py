@@ -574,6 +574,79 @@ def test_authenticated_custom_and_lmstudio_endpoints_resolve_scoped_credentials(
     assert router_keyless.codex_api_key == "local"
 
 
+def test_configured_hermes_providers_nous_and_gemini_preserved_and_routed_via_runtime(monkeypatch):
+    """Verify supported Hermes providers outside legacy hardcoded list (Nous, Gemini) do not fall back to Ollama (P2)."""
+    from types import SimpleNamespace
+
+    resolve_calls = []
+
+    class MockCompletions:
+        def create(self, **kwargs):
+            resolve_calls.append(("create", kwargs))
+            return SimpleNamespace(
+                model=kwargs["model"],
+                choices=[SimpleNamespace(message=SimpleNamespace(content="Risposta da provider ufficiale Hermes [Pagina 1]."))],
+            )
+
+    class MockRuntimeClient:
+        def __init__(self, base_url: str):
+            self.base_url = base_url
+            self.chat = SimpleNamespace(completions=MockCompletions())
+
+    def mock_resolve_provider_client(provider, model=None, explicit_base_url=None, explicit_api_key=None, **kwargs):
+        resolve_calls.append(("resolve", provider, model, explicit_base_url, explicit_api_key))
+        if provider == "nous":
+            return MockRuntimeClient("https://inference-api.nousresearch.com/v1"), model or "hermes-4-405b"
+        if provider == "gemini":
+            return MockRuntimeClient("https://generativelanguage.googleapis.com/v1beta"), model or "gemini-2.5-flash"
+        return None, None
+
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", mock_resolve_provider_client)
+
+    # 1. Nous configured in config.yaml: preserved as default_provider (never silently overwritten with 'ollama')
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"provider": "nous", "default": "hermes-4-405b"}},
+    )
+    router_nous = ModelRouter(allow_remote=False)
+    assert router_nous.default_provider == "nous"
+
+    # Privacy guard blocks BEFORE resolving credentials or exchanging OAuth tokens
+    with pytest.raises(PermissionError, match="VIOLAZIONE VINCOLO PRIVACY"):
+        router_nous.generate(prompt="Domanda riservata")
+    assert len(resolve_calls) == 0
+
+    router_nous.set_allow_remote(True)
+    ans_nous = router_nous.generate(prompt="Sintetizza il paragrafo", system_prompt="Istruzioni analista")
+    assert "Risposta da provider ufficiale Hermes" in ans_nous
+    assert router_nous.last_model_used == "hermes-4-405b"
+    assert resolve_calls[0][:3] == ("resolve", "nous", "hermes-4-405b")
+
+    # 2. Gemini configured in config.yaml (with leftover openrouter base_url ignored)
+    resolve_calls.clear()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "gemini",
+                "default": "gemini-2.5-pro",
+                "base_url": "https://openrouter.ai/api/v1",
+            }
+        },
+    )
+    router_gemini = ModelRouter(allow_remote=True)
+    assert router_gemini.default_provider == "gemini"
+    ans_gemini = router_gemini.generate(prompt="Domanda Gemini")
+    assert "Risposta da provider ufficiale Hermes" in ans_gemini
+    assert router_gemini.last_model_used == "gemini-2.5-pro"
+    assert resolve_calls[0] == ("resolve", "gemini", "gemini-2.5-pro", None, None)
+
+    # 3. Unknown provider names still fail deterministically rather than falling back to Ollama
+    with pytest.raises(ValueError, match="Provider sconosciuto"):
+        router_gemini.generate(prompt="Test", provider="invalid_nonexistent_xyz")
+
+
+
 
 
 

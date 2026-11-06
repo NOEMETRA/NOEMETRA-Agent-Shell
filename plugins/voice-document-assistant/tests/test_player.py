@@ -248,5 +248,60 @@ def test_player_refuses_headless_server_playback_without_advancing_bookmark():
         assert player.current_sentence_index == 2
 
 
+def test_tts_engine_clears_model_on_voice_initialization_failure_and_recovers(monkeypatch):
+    """Verify PocketTTSEngine publishes _model only after _voice_state succeeds and retries cleanly after failure (P2)."""
+    import sys
+    from types import SimpleNamespace
+    from hermes_voice.tts_engine import PocketTTSEngine
+
+    attempts = {"load_model": 0, "voice_prompt": 0}
+
+    class FakeTTSModel:
+        config = SimpleNamespace(mimi=SimpleNamespace(sample_rate=24000))
+
+        def to(self, device: str):
+            return self
+
+        def get_state_for_audio_prompt(self, voice: str):
+            attempts["voice_prompt"] += 1
+            if attempts["voice_prompt"] == 1:
+                raise ConnectionError("Simulated interrupted voice prompt download")
+            return {"voice": voice, "ready": True}
+
+        def generate_audio(self, model_state, text_to_generate: str, copy_state: bool = True):
+            assert model_state is not None and model_state.get("ready") is True
+            return np.ones(2400, dtype=np.float32) * 0.1
+
+    class FakeTTSModelFactory:
+        @staticmethod
+        def load_model(language: str, quantize: bool = False):
+            attempts["load_model"] += 1
+            return FakeTTSModel()
+
+    monkeypatch.setitem(sys.modules, "pocket_tts", SimpleNamespace(TTSModel=FakeTTSModelFactory))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        engine = PocketTTSEngine(cache_dir=Path(tmpdir) / "tts_cache", lazy_load=True)
+
+        # First call fails during voice conditioning; _model and _voice_state must remain unpublished (None)
+        with pytest.raises(ConnectionError, match="Simulated interrupted voice prompt download"):
+            engine.synthesize("Prima frase di prova.", use_cache=False)
+
+        assert engine._model is None
+        assert engine._voice_state is None
+        assert attempts["load_model"] == 1
+        assert attempts["voice_prompt"] == 1
+
+        # Subsequent call after connectivity recovery re-runs full initialization and succeeds
+        audio_np, sr = engine.synthesize("Prima frase di prova.", use_cache=False)
+        assert sr == 24000
+        assert len(audio_np) == 2400
+        assert engine._model is not None
+        assert engine._voice_state == {"voice": "giovanni", "ready": True}
+        assert attempts["load_model"] == 2
+        assert attempts["voice_prompt"] == 2
+
+
+
 
 
