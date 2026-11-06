@@ -12,12 +12,14 @@
  */
 
 import {
+  atom,
   Codicon,
   host,
   PALETTE_AREA,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
-  STATUSBAR_AREAS
+  STATUSBAR_AREAS,
+  useValue
 } from '@hermes/plugin-sdk'
 import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -413,210 +415,399 @@ const CSS = `
 }
 `
 
-function VoiceDocumentPage({ ctx }) {
-  const [status, setStatus] = useState(null)
-  const [library, setLibrary] = useState([])
-  const [docData, setDocData] = useState(null)
-  const [viewPage, setViewPage] = useState(1)
-  const [chatMessages, setChatMessages] = useState([])
-  const [questionInput, setQuestionInput] = useState('')
-  const [isAsking, setIsAsking] = useState(false)
-  const [isRecording, setIsRecording] = useState(false)
-  const fileInputRef = useRef(null)
-  const clientAudioRef = useRef(null)
-  const lastPlayedTargetRef = useRef('')
-  const fetchingTargetRef = useRef('')
-  const pollGenRef = useRef(0)
+function createVoicePlaybackController(ctx) {
+  const status = atom(null)
+  const docData = atom(null)
+  const viewPage = atom(1)
+  const chatMessages = atom([])
+  const isAsking = atom(false)
 
-  // Poll backend status and synchronize client-side audio playback
-  useEffect(() => {
-    let disposed = false
-    let timer = null
+  let disposed = false
+  let cancelTimer = null
+  let clientAudio = null
+  let lastPlayedTarget = ''
+  let fetchingTarget = ''
+  let loadingDocId = ''
+  let pollGen = 0
 
-    const poll = async () => {
+  const scheduleTimeout = (fn, ms) => {
+    if (typeof ctx.setTimeout === 'function') {
+      return ctx.setTimeout(fn, ms)
+    }
+    const id = setTimeout(fn, ms)
+    return () => clearTimeout(id)
+  }
+
+  const currentScopeKey = () => {
+    const conn = host?.state?.connectionId?.get?.() || 'local'
+    const prof = host?.state?.profile?.get?.() || 'default'
+    return `${conn}::${prof}`
+  }
+
+  let activeScope = currentScopeKey()
+  const scope = atom(activeScope)
+
+  const releaseClientAudio = () => {
+    if (clientAudio) {
       try {
-        const currentGen = ++pollGenRef.current
-        const s = await ctx.rest('/status')
-        if (disposed || currentGen !== pollGenRef.current) return
-        setStatus(s)
-        if (s && s.current_page) {
-          const isPlaying = s.state === 'playing'
-          if (!docData || isPlaying) {
-            setViewPage(s.current_page)
-          }
+        clientAudio.pause()
+        clientAudio.removeAttribute('src')
+        if (typeof clientAudio.load === 'function') {
+          clientAudio.load()
+        }
+      } catch (_) {}
+      clientAudio = null
+    }
+  }
 
-          // Composite key tracking both document ID and sentence index to prevent cross-document audio leakage
-          const targetDocId = s.doc_id || (docData ? docData.doc_id : '')
-          const playTargetKey = `${targetDocId}:${s.current_sentence_index}`
+  const resetPlaybackTargets = () => {
+    pollGen++
+    releaseClientAudio()
+    lastPlayedTarget = ''
+    fetchingTarget = ''
+  }
 
-          // Client-side local audio streaming for desktop playback via profile-aware ctx.rest gateway bridge
-          if (isPlaying && s.client_playback !== false) {
-            if (playTargetKey !== lastPlayedTargetRef.current && fetchingTargetRef.current !== playTargetKey) {
-              fetchingTargetRef.current = playTargetKey
-              if (clientAudioRef.current) {
-                clientAudioRef.current.pause()
-                clientAudioRef.current = null
+  const scheduleNextPoll = (delayMs = 600) => {
+    if (disposed) return
+    if (cancelTimer) {
+      cancelTimer()
+      cancelTimer = null
+    }
+    cancelTimer = scheduleTimeout(() => {
+      cancelTimer = null
+      void poll()
+    }, delayMs)
+  }
+
+  const poll = async () => {
+    if (disposed) return
+    const scopeAtPoll = currentScopeKey()
+    const currentGen = ++pollGen
+    try {
+      const s = await ctx.rest('/status')
+      if (disposed || currentGen !== pollGen || currentScopeKey() !== scopeAtPoll) return
+      status.set(s)
+
+      if (s && s.doc_id) {
+        const curDoc = docData.get()
+        if ((!curDoc || curDoc.doc_id !== s.doc_id) && loadingDocId !== s.doc_id) {
+          const expectedDocId = s.doc_id
+          loadingDocId = expectedDocId
+          ctx.rest(`/document/${expectedDocId}`, {
+            timeoutMs: DOCUMENT_LOAD_TIMEOUT_MS
+          }).then(d => {
+            if (disposed || currentScopeKey() !== scopeAtPoll) return
+            if (d && d.doc_id === expectedDocId && status.get()?.doc_id === expectedDocId) {
+              docData.set(d)
+              if (s.current_page) viewPage.set(s.current_page)
+            }
+          }).catch(() => {}).finally(() => {
+            if (loadingDocId === expectedDocId) loadingDocId = ''
+          })
+        }
+      }
+
+      if (s && s.current_page) {
+        const isPlaying = s.state === 'playing'
+        const curDoc = docData.get()
+        if (!curDoc || isPlaying) {
+          viewPage.set(s.current_page)
+        }
+
+        // Composite key tracking both document ID and sentence index to prevent cross-document audio leakage
+        const targetDocId = s.doc_id || (curDoc ? curDoc.doc_id : '')
+        const playTargetKey = `${targetDocId}:${s.current_sentence_index}`
+
+        // Client-side local audio streaming kept alive across route/pane visibility changes (apps/desktop/AGENTS.md:130-131)
+        if (isPlaying && s.client_playback !== false) {
+          if (playTargetKey !== lastPlayedTarget && fetchingTarget !== playTargetKey) {
+            fetchingTarget = playTargetKey
+            releaseClientAudio()
+            try {
+              const currentSentIdx = s.current_sentence_index
+              const audioData = await ctx.rest(`/audio/sentence/${currentSentIdx}?format=json`, {
+                timeoutMs: AUDIO_SYNTH_TIMEOUT_MS
+              })
+
+              if (disposed || currentGen !== pollGen || currentScopeKey() !== scopeAtPoll) {
+                fetchingTarget = ''
+                return
               }
-              try {
-                const currentSentIdx = s.current_sentence_index
-                const audioData = await ctx.rest(`/audio/sentence/${currentSentIdx}?format=json`, {
-                  timeoutMs: AUDIO_SYNTH_TIMEOUT_MS
-                })
 
-                // Discard audio fetched for an obsolete playback state or unmounted view (AGENTS.md:59-62)
-                if (disposed || currentGen !== pollGenRef.current) {
-                  fetchingTargetRef.current = ''
-                  return
+              // Re-validate playback state and active document ID after audio synthesis
+              const fresh = await ctx.rest('/status')
+              const freshDocId = fresh && fresh.doc_id ? fresh.doc_id : ''
+              if (
+                disposed ||
+                currentGen !== pollGen ||
+                currentScopeKey() !== scopeAtPoll ||
+                !fresh ||
+                fresh.state !== 'playing' ||
+                fresh.client_playback === false ||
+                `${freshDocId}:${fresh.current_sentence_index}` !== playTargetKey
+              ) {
+                fetchingTarget = ''
+                return
+              }
+
+              if (audioData && audioData.audio_base64) {
+                const audio = new Audio(`data:audio/wav;base64,${audioData.audio_base64}`)
+                const effectiveSpeed = fresh.speed || s.speed
+                if (effectiveSpeed) {
+                  audio.playbackRate = effectiveSpeed
                 }
-
-                // Re-validate playback state and active document ID after audio synthesis
-                const fresh = await ctx.rest('/status')
-                const freshDocId = fresh && fresh.doc_id ? fresh.doc_id : ''
-                if (
-                  disposed ||
-                  currentGen !== pollGenRef.current ||
-                  !fresh ||
-                  fresh.state !== 'playing' ||
-                  fresh.client_playback === false ||
-                  `${freshDocId}:${fresh.current_sentence_index}` !== playTargetKey
-                ) {
-                  fetchingTargetRef.current = ''
-                  return
+                const startOffset = fresh.audio_seconds_offset !== undefined ? fresh.audio_seconds_offset : (s.audio_seconds_offset || 0)
+                if (startOffset > 0.05) {
+                  const setOffset = () => {
+                    try {
+                      if (startOffset < audio.duration) {
+                        audio.currentTime = startOffset
+                      }
+                    } catch (_) {}
+                  }
+                  if (audio.readyState >= 1) {
+                    setOffset()
+                  } else {
+                    audio.addEventListener('loadedmetadata', setOffset, { once: true })
+                  }
                 }
-
-                if (audioData && audioData.audio_base64) {
-                  const audio = new Audio(`data:audio/wav;base64,${audioData.audio_base64}`)
-                  const effectiveSpeed = fresh.speed || s.speed
-                  if (effectiveSpeed) {
-                    audio.playbackRate = effectiveSpeed
-                  }
-                  const startOffset = fresh.audio_seconds_offset !== undefined ? fresh.audio_seconds_offset : (s.audio_seconds_offset || 0)
-                  if (startOffset > 0.05) {
-                    const setOffset = () => {
-                      try {
-                        if (startOffset < audio.duration) {
-                          audio.currentTime = startOffset
-                        }
-                      } catch (_) {}
-                    }
-                    if (audio.readyState >= 1) {
-                      setOffset()
-                    } else {
-                      audio.addEventListener('loadedmetadata', setOffset, { once: true })
-                    }
-                  }
-                  audio.addEventListener('play', () => {
-                    if (disposed || lastPlayedTargetRef.current !== playTargetKey) return
+                audio.addEventListener('play', () => {
+                  if (disposed || currentScopeKey() !== scopeAtPoll || lastPlayedTarget !== playTargetKey) return
+                  ctx.rest('/playback/ack', {
+                    method: 'POST',
+                    body: { doc_id: freshDocId || targetDocId, sentence_index: currentSentIdx, event: 'started' }
+                  }).catch(() => {})
+                }, { once: true })
+                let lastProgressAck = 0
+                audio.addEventListener('timeupdate', () => {
+                  if (disposed || currentScopeKey() !== scopeAtPoll || lastPlayedTarget !== playTargetKey) return
+                  const now = Date.now()
+                  if (now - lastProgressAck > 300) {
+                    lastProgressAck = now
                     ctx.rest('/playback/ack', {
                       method: 'POST',
-                      body: { doc_id: freshDocId || targetDocId, sentence_index: currentSentIdx, event: 'started' }
+                      body: {
+                        doc_id: freshDocId || targetDocId,
+                        sentence_index: currentSentIdx,
+                        event: 'progress',
+                        offset_seconds: audio.currentTime
+                      }
                     }).catch(() => {})
-                  }, { once: true })
-                  let lastProgressAck = 0
-                  audio.addEventListener('timeupdate', () => {
-                    if (disposed || lastPlayedTargetRef.current !== playTargetKey) return
-                    const now = Date.now()
-                    if (now - lastProgressAck > 300) {
-                      lastProgressAck = now
-                      ctx.rest('/playback/ack', {
-                        method: 'POST',
-                        body: {
-                          doc_id: freshDocId || targetDocId,
-                          sentence_index: currentSentIdx,
-                          event: 'progress',
-                          offset_seconds: audio.currentTime
-                        }
-                      }).catch(() => {})
-                    }
-                  })
-                  audio.addEventListener('ended', () => {
-                    const sendEndedAck = (retryCount = 0) => {
-                      if (disposed || lastPlayedTargetRef.current !== playTargetKey) return
-                      ctx.rest('/playback/ack', {
-                        method: 'POST',
-                        body: { doc_id: freshDocId || targetDocId, sentence_index: currentSentIdx, event: 'ended' }
-                      }).catch(() => {
-                        if (retryCount < 2 && !disposed && lastPlayedTargetRef.current === playTargetKey) {
-                          setTimeout(() => sendEndedAck(retryCount + 1), 1000)
-                        }
-                      })
-                    }
-                    sendEndedAck()
-                  }, { once: true })
-
-                  // Re-verify freshness before initiating audio playback
-                  if (disposed || currentGen !== pollGenRef.current) {
-                    fetchingTargetRef.current = ''
-                    return
                   }
-                  clientAudioRef.current = audio
-                  lastPlayedTargetRef.current = playTargetKey
-                  fetchingTargetRef.current = ''
-                  audio.play().catch(() => {})
-                } else {
-                  fetchingTargetRef.current = ''
+                })
+                audio.addEventListener('ended', () => {
+                  const sendEndedAck = (retryCount = 0) => {
+                    if (disposed || currentScopeKey() !== scopeAtPoll || lastPlayedTarget !== playTargetKey) return
+                    ctx.rest('/playback/ack', {
+                      method: 'POST',
+                      body: { doc_id: freshDocId || targetDocId, sentence_index: currentSentIdx, event: 'ended' }
+                    }).catch(() => {
+                      if (retryCount < 2 && !disposed && currentScopeKey() === scopeAtPoll && lastPlayedTarget === playTargetKey) {
+                        scheduleTimeout(() => sendEndedAck(retryCount + 1), 1000)
+                      }
+                    })
+                  }
+                  sendEndedAck()
+                }, { once: true })
+
+                if (disposed || currentGen !== pollGen || currentScopeKey() !== scopeAtPoll) {
+                  fetchingTarget = ''
+                  return
                 }
-              } catch (e) {
-                // Audio fetch failed or was aborted: clear fetching target to allow retry on next poll
-                fetchingTargetRef.current = ''
-                if (lastPlayedTargetRef.current === playTargetKey) {
-                  lastPlayedTargetRef.current = ''
-                }
+                clientAudio = audio
+                lastPlayedTarget = playTargetKey
+                fetchingTarget = ''
+                audio.play().catch(() => {
+                  if (lastPlayedTarget === playTargetKey) {
+                    lastPlayedTarget = ''
+                    if (clientAudio === audio) {
+                      releaseClientAudio()
+                    }
+                  }
+                })
+              } else {
+                fetchingTarget = ''
               }
-            } else if (clientAudioRef.current) {
-              // Synchronize speed if changed
-              if (s.speed && clientAudioRef.current.playbackRate !== s.speed) {
-                clientAudioRef.current.playbackRate = s.speed
-              }
-              if (clientAudioRef.current.paused && !clientAudioRef.current.ended) {
-                // Resume playback of existing audio within the same sentence at current bookmark offset (excluding ended)
-                if (s.audio_seconds_offset !== undefined && Math.abs(clientAudioRef.current.currentTime - s.audio_seconds_offset) > 0.3) {
-                  try {
-                    clientAudioRef.current.currentTime = s.audio_seconds_offset
-                  } catch (_) {}
-                }
-                clientAudioRef.current.play().catch(() => {})
+            } catch (e) {
+              fetchingTarget = ''
+              if (lastPlayedTarget === playTargetKey) {
+                lastPlayedTarget = ''
               }
             }
-          } else {
-            if (clientAudioRef.current && !clientAudioRef.current.paused) {
-              clientAudioRef.current.pause()
+          } else if (clientAudio) {
+            if (s.speed && clientAudio.playbackRate !== s.speed) {
+              clientAudio.playbackRate = s.speed
             }
-            if (s.state === 'stopped' || s.state === 'finished') {
-              lastPlayedTargetRef.current = ''
-              fetchingTargetRef.current = ''
-              if (clientAudioRef.current) {
-                clientAudioRef.current = null
+            if (clientAudio.paused && !clientAudio.ended) {
+              if (s.audio_seconds_offset !== undefined && Math.abs(clientAudio.currentTime - s.audio_seconds_offset) > 0.3) {
+                try {
+                  clientAudio.currentTime = s.audio_seconds_offset
+                } catch (_) {}
               }
+              clientAudio.play().catch(() => {})
             }
           }
-        }
-      } catch (err) {
-        // backend loading
-      } finally {
-        if (!disposed) {
-          timer = setTimeout(poll, 600)
+        } else {
+          if (clientAudio && !clientAudio.paused) {
+            clientAudio.pause()
+          }
+          if (s.state === 'stopped' || s.state === 'finished') {
+            lastPlayedTarget = ''
+            fetchingTarget = ''
+            releaseClientAudio()
+          }
         }
       }
-    }
-    poll()
-    return () => {
-      disposed = true
-      pollGenRef.current++
-      fetchingTargetRef.current = ''
-      lastPlayedTargetRef.current = ''
-      if (timer) clearTimeout(timer)
-      if (clientAudioRef.current) {
-        clientAudioRef.current.pause()
-        clientAudioRef.current = null
+    } catch (err) {
+      // backend loading or unavailable
+    } finally {
+      if (!disposed) {
+        scheduleNextPoll(600)
       }
     }
-  }, [ctx, docData])
+  }
 
-  // Load library
+  const handleScopeChange = () => {
+    const nextScope = currentScopeKey()
+    if (nextScope === activeScope) return
+    activeScope = nextScope
+    scope.set(nextScope)
+    resetPlaybackTargets()
+    loadingDocId = ''
+    status.set(null)
+    docData.set(null)
+    viewPage.set(1)
+    chatMessages.set([])
+    isAsking.set(false)
+    scheduleNextPoll(0)
+  }
+
+  const unsubConn = host?.state?.connectionId?.listen?.(handleScopeChange)
+  const unsubProf = host?.state?.profile?.listen?.(handleScopeChange)
+
+  // Start background synchronization without autoplay
+  scheduleNextPoll(0)
+
+  return {
+    scope,
+    status,
+    docData,
+    viewPage,
+    chatMessages,
+    isAsking,
+    currentScopeKey,
+    setDocData: (d) => docData.set(d),
+    setViewPage: (p) => viewPage.set(p),
+    setChatMessages: (updater) => {
+      const next = typeof updater === 'function' ? updater(chatMessages.get()) : updater
+      chatMessages.set(next)
+    },
+    setIsAsking: (v) => isAsking.set(v),
+    invalidatePlayback: resetPlaybackTargets,
+    play: async () => {
+      pollGen++
+      await ctx.rest('/playback/play', {
+        method: 'POST',
+        body: { output: 'client' }
+      })
+      scheduleNextPoll(0)
+    },
+    pause: async () => {
+      pollGen++
+      fetchingTarget = ''
+      if (clientAudio) clientAudio.pause()
+      const cur = status.get()
+      if (cur && cur.state === 'playing') {
+        status.set({ ...cur, state: 'paused' })
+      }
+      await ctx.rest('/playback/pause', { method: 'POST' })
+      scheduleNextPoll(0)
+    },
+    resume: async () => {
+      pollGen++
+      await ctx.rest('/playback/resume', {
+        method: 'POST',
+        body: { output: 'client' }
+      })
+      scheduleNextPoll(0)
+    },
+    stop: async () => {
+      resetPlaybackTargets()
+      await ctx.rest('/playback/stop', { method: 'POST' })
+      scheduleNextPoll(0)
+    },
+    seekSentence: async (sentenceIdx) => {
+      resetPlaybackTargets()
+      await ctx.rest('/playback/seek', {
+        method: 'POST',
+        body: { sentence_index: sentenceIdx }
+      })
+      scheduleNextPoll(0)
+    },
+    seekPage: async (page) => {
+      resetPlaybackTargets()
+      viewPage.set(page)
+      await ctx.rest('/playback/seek', {
+        method: 'POST',
+        body: { page_number: page }
+      })
+      scheduleNextPoll(0)
+    },
+    setSpeed: async (speed) => {
+      if (clientAudio && !isNaN(speed) && speed > 0) {
+        clientAudio.playbackRate = speed
+      }
+      await ctx.rest('/playback/config', {
+        method: 'POST',
+        body: { speed }
+      })
+    },
+    dispose: () => {
+      if (disposed) return
+      const curStatus = status.get()
+      const wasClientPlaying = Boolean(
+        (clientAudio && !clientAudio.paused && !clientAudio.ended) ||
+        (curStatus?.state === 'playing' && curStatus?.client_playback !== false)
+      )
+      disposed = true
+      pollGen++
+      fetchingTarget = ''
+      lastPlayedTarget = ''
+      loadingDocId = ''
+      if (cancelTimer) {
+        cancelTimer()
+        cancelTimer = null
+      }
+      unsubConn?.()
+      unsubProf?.()
+      releaseClientAudio()
+      status.set(null)
+      if (wasClientPlaying) {
+        ctx.rest('/playback/pause', { method: 'POST' }).catch(() => {})
+      }
+    }
+  }
+}
+
+function VoiceDocumentPage({ ctx, controller }) {
+  const status = useValue(controller.status)
+  const docData = useValue(controller.docData)
+  const viewPage = useValue(controller.viewPage)
+  const chatMessages = useValue(controller.chatMessages)
+  const isAsking = useValue(controller.isAsking)
+  const [library, setLibrary] = useState([])
+  const [questionInput, setQuestionInput] = useState('')
+  const [isRecording, setIsRecording] = useState(false)
+  const fileInputRef = useRef(null)
+
+  const activeScope = useValue(controller.scope)
+
+  // Load library for active profile/connection
   const refreshLibrary = async () => {
+    const scopeAtStart = controller.currentScopeKey()
     try {
       const res = await ctx.rest('/library')
+      if (controller.currentScopeKey() !== scopeAtStart) return
       if (res && res.documents) {
         setLibrary(res.documents)
       }
@@ -627,125 +818,64 @@ function VoiceDocumentPage({ ctx }) {
 
   useEffect(() => {
     refreshLibrary()
-  }, [])
+  }, [activeScope])
 
-  // When doc_id changes in status, load document text details
-  useEffect(() => {
-    let cancelled = false
-    if (status && status.doc_id) {
-      if (!docData || docData.doc_id !== status.doc_id) {
-        const expectedDocId = status.doc_id
-        ctx.rest(`/document/${expectedDocId}`).then(d => {
-          if (cancelled || !d || d.doc_id !== expectedDocId) return
-          setDocData(d)
-          if (status.current_page) setViewPage(status.current_page)
-        }).catch(() => {})
-      }
-    }
-    return () => { cancelled = true }
-  }, [status?.doc_id, ctx, docData])
-
-  // Playback handlers
+  // Playback handlers delegated to plugin-scoped controller
   const handlePlay = async () => {
-    pollGenRef.current++
     try {
-      await ctx.rest('/playback/play', {
-        method: 'POST',
-        body: { output: 'client' },
-      })
+      await controller.play()
     } catch (err) {
       host.notifyError(err, 'Errore avvio riproduzione audio')
     }
   }
 
   const handlePause = async () => {
-    pollGenRef.current++
-    fetchingTargetRef.current = ''
-    if (clientAudioRef.current) clientAudioRef.current.pause()
     try {
-      await ctx.rest('/playback/pause', { method: 'POST' })
+      await controller.pause()
     } catch (err) {
       host.notifyError(err, 'Errore pausa audio')
     }
   }
 
   const handleResume = async () => {
-    pollGenRef.current++
     try {
-      await ctx.rest('/playback/resume', {
-        method: 'POST',
-        body: { output: 'client' },
-      })
+      await controller.resume()
     } catch (err) {
       host.notifyError(err, 'Errore ripresa audio')
     }
   }
 
   const handleStop = async () => {
-    pollGenRef.current++
-    if (clientAudioRef.current) {
-      clientAudioRef.current.pause()
-      clientAudioRef.current = null
-    }
-    lastPlayedTargetRef.current = ''
-    fetchingTargetRef.current = ''
     try {
-      await ctx.rest('/playback/stop', { method: 'POST' })
+      await controller.stop()
     } catch (err) {
       host.notifyError(err, 'Errore stop audio')
     }
   }
 
   const handleSeekSentence = async (sentenceIdx) => {
-    pollGenRef.current++
-    if (clientAudioRef.current) {
-      clientAudioRef.current.pause()
-      clientAudioRef.current = null
-    }
-    lastPlayedTargetRef.current = ''
-    fetchingTargetRef.current = ''
     try {
-      await ctx.rest('/playback/seek', {
-        method: 'POST',
-        body: { sentence_index: sentenceIdx }
-      })
+      await controller.seekSentence(sentenceIdx)
     } catch (err) {
       console.error(err)
     }
   }
 
   const handleSeekPage = async (page) => {
-    pollGenRef.current++
-    if (clientAudioRef.current) {
-      clientAudioRef.current.pause()
-      clientAudioRef.current = null
-    }
-    lastPlayedTargetRef.current = ''
-    fetchingTargetRef.current = ''
-    setViewPage(page)
     try {
-      await ctx.rest('/playback/seek', {
-        method: 'POST',
-        body: { page_number: page }
-      })
+      await controller.seekPage(page)
     } catch (err) {
       console.error(err)
     }
   }
 
   const handleSeekCitation = async (docId, page) => {
-    pollGenRef.current++
     try {
       const needsSwitch = Boolean(
         docId && (!docData || docData.doc_id !== docId || (status?.doc_id && status.doc_id !== docId))
       )
       if (needsSwitch) {
-        if (clientAudioRef.current) {
-          clientAudioRef.current.pause()
-          clientAudioRef.current = null
-        }
-        lastPlayedTargetRef.current = ''
-        fetchingTargetRef.current = ''
+        controller.invalidatePlayback()
         await ctx.rest('/select_document', {
           method: 'POST',
           body: { doc_id: docId },
@@ -754,9 +884,9 @@ function VoiceDocumentPage({ ctx }) {
         const switched = await ctx.rest(`/document/${docId}`, {
           timeoutMs: DOCUMENT_LOAD_TIMEOUT_MS
         })
-        setDocData(switched)
+        controller.setDocData(switched)
       }
-      handleSeekPage(page)
+      await handleSeekPage(page)
     } catch (err) {
       host.notifyError(err, 'Errore navigazione citazione')
     }
@@ -778,14 +908,8 @@ function VoiceDocumentPage({ ctx }) {
 
   const handleSpeedChange = async (e) => {
     const speed = parseFloat(e.target.value)
-    if (clientAudioRef.current && !isNaN(speed) && speed > 0) {
-      clientAudioRef.current.playbackRate = speed
-    }
     try {
-      await ctx.rest('/playback/config', {
-        method: 'POST',
-        body: { speed }
-      })
+      await controller.setSpeed(speed)
     } catch (err) {
       console.error(err)
     }
@@ -813,6 +937,7 @@ function VoiceDocumentPage({ ctx }) {
     const files = e.target.files
     if (!files || files.length === 0) return
     const file = files[0]
+    const scopeAtUpload = controller.currentScopeKey()
 
     const reader = new FileReader()
     reader.onload = async () => {
@@ -827,16 +952,11 @@ function VoiceDocumentPage({ ctx }) {
           },
           timeoutMs: DOCUMENT_LOAD_TIMEOUT_MS
         })
+        if (controller.currentScopeKey() !== scopeAtUpload) return
         if (res && res.document) {
-          pollGenRef.current++
-          if (clientAudioRef.current) {
-            clientAudioRef.current.pause()
-            clientAudioRef.current = null
-          }
-          lastPlayedTargetRef.current = ''
-          fetchingTargetRef.current = ''
-          setDocData(res.document)
-          setViewPage(1)
+          controller.invalidatePlayback()
+          controller.setDocData(res.document)
+          controller.setViewPage(1)
           refreshLibrary()
           host.notify({ kind: 'info', message: `Documento caricato: ${res.document.title}` })
         }
@@ -850,22 +970,18 @@ function VoiceDocumentPage({ ctx }) {
   const handleSelectDoc = async (e) => {
     const docId = e.target.value
     if (!docId) return
-    pollGenRef.current++
-    if (clientAudioRef.current) {
-      clientAudioRef.current.pause()
-      clientAudioRef.current = null
-    }
-    lastPlayedTargetRef.current = ''
-    fetchingTargetRef.current = ''
+    const scopeAtSelect = controller.currentScopeKey()
+    controller.invalidatePlayback()
     try {
       const res = await ctx.rest('/select_document', {
         method: 'POST',
         body: { doc_id: docId },
         timeoutMs: DOCUMENT_LOAD_TIMEOUT_MS
       })
+      if (controller.currentScopeKey() !== scopeAtSelect) return
       if (res && res.document) {
-        setDocData(res.document)
-        setViewPage(1)
+        controller.setDocData(res.document)
+        controller.setViewPage(1)
         host.notify({ kind: 'info', message: `Documento attivato: ${res.document.title}` })
       }
     } catch (err) {
@@ -873,16 +989,17 @@ function VoiceDocumentPage({ ctx }) {
     }
   }
 
-  // Ask question
+  // Ask question bound to the displayed document ID
   const handleAsk = async () => {
     const q = questionInput.trim()
     const targetDocId = docData ? docData.doc_id : (status?.doc_id || null)
     if (!q || isAsking || !targetDocId) return
-    setIsAsking(true)
+    const scopeAtAsk = controller.currentScopeKey()
+    controller.setIsAsking(true)
     setQuestionInput('')
 
     const userMsg = { role: 'user', text: q, doc_id: targetDocId, time: new Date().toLocaleTimeString() }
-    setChatMessages(prev => [...prev, userMsg])
+    controller.setChatMessages(prev => [...prev, userMsg])
 
     try {
       const answer = await ctx.rest('/ask', {
@@ -890,19 +1007,22 @@ function VoiceDocumentPage({ ctx }) {
         body: { question: q, doc_id: targetDocId },
         timeoutMs: ASK_REQUEST_TIMEOUT_MS
       })
+      if (controller.currentScopeKey() !== scopeAtAsk) return
       const resolvedDocId = answer.doc_id || targetDocId
+      const latestDoc = controller.docData.get()
       const assistantMsg = {
         role: 'assistant',
         text: answer.answer,
         doc_id: resolvedDocId,
-        doc_title: answer.doc_title || (docData?.doc_id === resolvedDocId ? docData?.title : undefined),
+        doc_title: answer.doc_title || (latestDoc?.doc_id === resolvedDocId ? latestDoc?.title : undefined),
         citations: answer.citations || [],
         verification: answer.verification,
         model_used: answer.model_used,
         time: new Date().toLocaleTimeString()
       }
-      setChatMessages(prev => [...prev, assistantMsg])
+      controller.setChatMessages(prev => [...prev, assistantMsg])
     } catch (err) {
+      if (controller.currentScopeKey() !== scopeAtAsk) return
       const errorMsg = {
         role: 'assistant',
         text: `Errore durante l'interrogazione: ${err.message || err}`,
@@ -913,9 +1033,11 @@ function VoiceDocumentPage({ ctx }) {
         },
         time: new Date().toLocaleTimeString()
       }
-      setChatMessages(prev => [...prev, errorMsg])
+      controller.setChatMessages(prev => [...prev, errorMsg])
     } finally {
-      setIsAsking(false)
+      if (controller.currentScopeKey() === scopeAtAsk) {
+        controller.setIsAsking(false)
+      }
     }
   }
 
@@ -986,10 +1108,9 @@ function VoiceDocumentPage({ ctx }) {
                 children: [
                   jsx('option', { value: '', children: 'Seleziona documento...' }),
                   library.map(doc => jsx('option', {
-                    key: doc.doc_id,
                     value: doc.doc_id,
                     children: `${doc.title} (${doc.total_pages} pag.)`
-                  }))
+                  }, doc.doc_id))
                 ]
               }),
               // Upload button
@@ -1076,12 +1197,11 @@ function VoiceDocumentPage({ ctx }) {
                   ? currentPageObj.sentences.map(sent => {
                       const isCurrentSpeaking = (status?.current_sentence_index === sent.sentence_index) && isPlaying
                       return jsx('span', {
-                        key: sent.sentence_index,
                         className: `hv-sentence ${isCurrentSpeaking ? 'hv-sentence-active' : ''}`,
                         onClick: () => handleSeekSentence(sent.sentence_index),
                         title: `Frase #${sent.sentence_index + 1} (Clicca per leggere)`,
                         children: sent.text + ' '
-                      })
+                      }, sent.sentence_index)
                     })
                   : jsx('div', {
                       style: { color: 'var(--ui-text-tertiary)', textAlign: 'center', marginTop: '40px' },
@@ -1235,16 +1355,14 @@ function VoiceDocumentPage({ ctx }) {
                       : chatMessages.map((msg, i) => {
                           if (msg.role === 'user') {
                             return jsxs('div', {
-                              key: i,
                               className: 'hv-chat-msg',
                               children: [
                                 jsx('div', { className: 'hv-msg-user', children: msg.text })
                               ]
-                            })
+                            }, i)
                           } else {
                             const isValid = msg.verification?.is_valid
                             return jsxs('div', {
-                              key: i,
                               className: 'hv-chat-msg',
                               children: [
                                 jsxs('div', {
@@ -1260,12 +1378,11 @@ function VoiceDocumentPage({ ctx }) {
                                           children: 'Citazioni verificabili:'
                                         }),
                                         msg.citations.map((cit, cIdx) => jsx('button', {
-                                          key: cIdx,
                                           className: 'hv-citation-badge',
                                           onClick: () => handleSeekCitation(msg.doc_id, cit.page_number),
                                           title: `Clicca per aprire Pagina ${cit.page_number}\n"${cit.verbatim_quote}"`,
                                           children: `[Pagina ${cit.page_number}]`
-                                        }))
+                                        }, cIdx))
                                       ]
                                     }),
                                     // Verification Badge
@@ -1278,7 +1395,7 @@ function VoiceDocumentPage({ ctx }) {
                                   ]
                                 })
                               ]
-                            })
+                            }, i)
                           }
                         })
                   }),
@@ -1346,31 +1463,30 @@ function VoiceDocumentPage({ ctx }) {
   })
 }
 
-// Mini status-bar widget
-function VoiceStatusChip({ ctx }) {
-  const [status, setStatus] = useState(null)
-
-  useEffect(() => {
-    let timer = null
-    const check = async () => {
-      try {
-        const s = await ctx.rest('/status')
-        setStatus(s)
-      } catch (e) {}
-      timer = setTimeout(check, 1000)
-    }
-    check()
-    return () => clearTimeout(timer)
-  }, [ctx])
+// Mini status-bar widget sharing the plugin-scoped playback controller
+function VoiceStatusChip({ controller }) {
+  const status = useValue(controller.status)
 
   if (!status || status.state === 'idle') return null
 
   const isPlaying = status.state === 'playing'
+  const isPaused = status.state === 'paused'
 
   return jsxs('div', {
     style: { display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '0 6px', fontSize: '11px' },
     children: [
-      jsx(Codicon, { name: isPlaying ? 'unmute' : 'mute', size: '0.8rem' }),
+      (isPlaying || isPaused)
+        ? jsx('button', {
+            type: 'button',
+            title: isPlaying ? 'Pausa lettura vocale' : 'Riprendi lettura vocale',
+            'aria-label': isPlaying ? 'Pausa lettura vocale' : 'Riprendi lettura vocale',
+            style: { background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', padding: 0, display: 'inline-flex', alignItems: 'center' },
+            onClick: () => {
+              void (isPlaying ? controller.pause() : controller.resume()).catch(() => {})
+            },
+            children: jsx(Codicon, { name: isPlaying ? 'debug-pause' : 'play', size: '0.8rem' })
+          })
+        : jsx(Codicon, { name: 'mute', size: '0.8rem' }),
       jsx('button', {
         type: 'button',
         style: { background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', padding: 0 },
@@ -1381,18 +1497,23 @@ function VoiceStatusChip({ ctx }) {
   })
 }
 
+export { createVoicePlaybackController }
+
 export default {
   id: PLUGIN_ID,
   name: 'NOEMETRA Voice',
   description: 'Assistente vocale documentale multi-agente deterministico con Pocket TTS e verifica citazioni.',
   defaultEnabled: true,
   register(ctx) {
+    const controller = createVoicePlaybackController(ctx)
+    ctx.onDispose(() => controller.dispose())
+
     // Register full route in Hermes Desktop
     ctx.register({
       id: 'page',
       area: ROUTES_AREA,
       data: { path: '/voice-document' },
-      render: () => jsx(VoiceDocumentPage, { ctx })
+      render: () => jsx(VoiceDocumentPage, { ctx, controller })
     })
 
     // Register sidebar nav icon
@@ -1412,7 +1533,7 @@ export default {
       id: 'status-chip',
       area: STATUSBAR_AREAS.right,
       order: 95,
-      render: () => jsx(VoiceStatusChip, { ctx })
+      render: () => jsx(VoiceStatusChip, { controller })
     })
 
     // Register palette command

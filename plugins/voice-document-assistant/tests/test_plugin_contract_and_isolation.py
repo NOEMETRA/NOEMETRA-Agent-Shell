@@ -394,6 +394,9 @@ def test_desktop_plugin_configures_extended_timeouts_for_slow_endpoints():
     assert re.search(r"body:\s*\{\s*question:\s*q,\s*doc_id:\s*targetDocId\s*\}", mirror_src)
     assert re.search(rf"ctx\.rest\(`/audio/sentence/\$\{{currentSentIdx\}}\?format=json`,\s*\{{{opts_body}timeoutMs:\s*AUDIO_SYNTH_TIMEOUT_MS", mirror_src, re.DOTALL)
     assert re.search(rf"ctx\.rest\('/upload',\s*\{{{opts_body}timeoutMs:\s*DOCUMENT_LOAD_TIMEOUT_MS", mirror_src, re.DOTALL)
+    # Playback controller must live at plugin registration scope and synchronize backend pause on disposal
+    assert "const controller = createVoicePlaybackController(ctx)" in mirror_src
+    assert "ctx.onDispose(() => controller.dispose())" in mirror_src
 
 
 
