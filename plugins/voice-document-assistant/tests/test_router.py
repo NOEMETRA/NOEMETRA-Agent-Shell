@@ -338,6 +338,37 @@ def test_anthropic_blocks_cross_origin_redirect_even_when_remote_allowed(monkeyp
     assert "attacker-origin.net" in str(exc_info.value)
 
 
+def test_model_router_resolves_credentials_from_secret_scope_not_os_environ(monkeypatch):
+    """Verify ModelRouter uses profile-aware secret API and does not read raw os.environ (AGENTS.md:104-110)."""
+    # Simulate an ambient process env with another profile's key
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-secret-from-other-profile")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-ant-secret")
+
+    # Mock get_secret to simulate an active profile that does NOT have the key set
+    monkeypatch.setattr("agent.secret_scope.get_secret", lambda name, default=None: None)
+
+    fake_config = {
+        "model": {
+            "provider": "openai",
+            "name": "gpt-4o",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    router = ModelRouter(allow_remote=True)
+    # The router must NOT pick up the ambient environment variable
+    assert router.remote_api_key == ""
+
+    # Now simulate get_secret returning the served profile's key
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret",
+        lambda name, default=None: "scoped-profile-key" if name == "OPENAI_API_KEY" else None,
+    )
+    router2 = ModelRouter(allow_remote=True)
+    assert router2.remote_api_key == "scoped-profile-key"
+
+
+
 
 
 

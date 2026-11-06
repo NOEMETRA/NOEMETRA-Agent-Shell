@@ -96,11 +96,18 @@
               }
             });
             audio.addEventListener("ended", () => {
-              fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ sentence_index: currentSentIdx, event: "ended" })
-              }).catch(() => {});
+              const sendEndedAck = (retryCount = 0) => {
+                fetchJSON("/api/plugins/voice-document-assistant/playback/ack", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ sentence_index: currentSentIdx, event: "ended" })
+                }).catch(() => {
+                  if (retryCount < 2) {
+                    setTimeout(() => sendEndedAck(retryCount + 1), 1000);
+                  }
+                });
+              };
+              sendEndedAck();
             }, { once: true });
             if (currentGen !== pollGenRef.current) {
               fetchingTargetRef.current = "";
@@ -114,7 +121,7 @@
             if (data.speed && clientAudioRef.current.playbackRate !== data.speed) {
               clientAudioRef.current.playbackRate = data.speed;
             }
-            if (clientAudioRef.current.paused) {
+            if (clientAudioRef.current.paused && !clientAudioRef.current.ended) {
               if (data.audio_seconds_offset !== undefined && Math.abs(clientAudioRef.current.currentTime - data.audio_seconds_offset) > 0.3) {
                 try {
                   clientAudioRef.current.currentTime = data.audio_seconds_offset;

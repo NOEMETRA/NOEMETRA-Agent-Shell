@@ -506,10 +506,17 @@ function VoiceDocumentPage({ ctx }) {
                     }
                   })
                   audio.addEventListener('ended', () => {
-                    ctx.rest('/playback/ack', {
-                      method: 'POST',
-                      body: { sentence_index: currentSentIdx, event: 'ended' }
-                    }).catch(() => {})
+                    const sendEndedAck = (retryCount = 0) => {
+                      ctx.rest('/playback/ack', {
+                        method: 'POST',
+                        body: { sentence_index: currentSentIdx, event: 'ended' }
+                      }).catch(() => {
+                        if (retryCount < 2 && !disposed) {
+                          setTimeout(() => sendEndedAck(retryCount + 1), 1000)
+                        }
+                      })
+                    }
+                    sendEndedAck()
                   }, { once: true })
 
                   // Re-verify freshness before initiating audio playback
@@ -536,8 +543,8 @@ function VoiceDocumentPage({ ctx }) {
               if (s.speed && clientAudioRef.current.playbackRate !== s.speed) {
                 clientAudioRef.current.playbackRate = s.speed
               }
-              if (clientAudioRef.current.paused) {
-                // Resume playback of existing audio within the same sentence at current bookmark offset
+              if (clientAudioRef.current.paused && !clientAudioRef.current.ended) {
+                // Resume playback of existing audio within the same sentence at current bookmark offset (excluding ended)
                 if (s.audio_seconds_offset !== undefined && Math.abs(clientAudioRef.current.currentTime - s.audio_seconds_offset) > 0.3) {
                   try {
                     clientAudioRef.current.currentTime = s.audio_seconds_offset

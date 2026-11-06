@@ -28,6 +28,23 @@ def is_local_endpoint(url: str) -> bool:
         return False
 
 
+def _get_profile_scoped_secret(name: str) -> Optional[str]:
+    """Resolve a credential within the active profile's secret scope (AGENTS.md:104-110).
+
+    Strictly avoids reading ambient os.environ directly when multiplexing profiles,
+    preventing cross-profile credential leaks in multi-tenant gateways.
+    """
+    try:
+        from agent.secret_scope import get_secret
+        val = get_secret(name)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    except Exception:
+        pass
+    return None
+
+
+
 class ModelRouter:
     """Routes LLM generation requests with local-first privacy enforcement."""
 
@@ -107,11 +124,11 @@ class ModelRouter:
         elif cfg_base_url and self.default_provider in ("remote", "api", "openai", "anthropic", "openrouter"):
             self.remote_base_url = cfg_base_url
         elif self.default_provider == "openrouter":
-            self.remote_base_url = os.environ.get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
+            self.remote_base_url = _get_profile_scoped_secret("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
         elif self.default_provider == "anthropic":
-            self.remote_base_url = os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1"
+            self.remote_base_url = _get_profile_scoped_secret("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1"
         elif self.default_provider in ("openai", "remote", "api"):
-            self.remote_base_url = os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+            self.remote_base_url = _get_profile_scoped_secret("OPENAI_BASE_URL") or "https://api.openai.com/v1"
         else:
             self.remote_base_url = None
 
@@ -120,11 +137,12 @@ class ModelRouter:
         elif cfg_api_key:
             self.remote_api_key = cfg_api_key
         else:
+            prov_key = f"{self.default_provider.upper()}_API_KEY" if self.default_provider else None
             self.remote_api_key = (
-                os.environ.get(f"{self.default_provider.upper()}_API_KEY")
-                or os.environ.get("OPENROUTER_API_KEY")
-                or os.environ.get("OPENAI_API_KEY")
-                or os.environ.get("ANTHROPIC_API_KEY")
+                (prov_key and _get_profile_scoped_secret(prov_key))
+                or _get_profile_scoped_secret("OPENROUTER_API_KEY")
+                or _get_profile_scoped_secret("OPENAI_API_KEY")
+                or _get_profile_scoped_secret("ANTHROPIC_API_KEY")
                 or ""
             )
 
@@ -274,11 +292,12 @@ class ModelRouter:
 
             target_key = self.remote_api_key
             if not target_key:
+                prov_key = f"{selected_provider.upper()}_API_KEY" if selected_provider else None
                 target_key = (
-                    os.environ.get(f"{selected_provider.upper()}_API_KEY")
-                    or os.environ.get("OPENROUTER_API_KEY")
-                    or os.environ.get("OPENAI_API_KEY")
-                    or os.environ.get("ANTHROPIC_API_KEY")
+                    (prov_key and _get_profile_scoped_secret(prov_key))
+                    or _get_profile_scoped_secret("OPENROUTER_API_KEY")
+                    or _get_profile_scoped_secret("OPENAI_API_KEY")
+                    or _get_profile_scoped_secret("ANTHROPIC_API_KEY")
                     or ""
                 )
 
