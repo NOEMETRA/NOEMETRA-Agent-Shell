@@ -267,7 +267,14 @@ def test_missing_dependencies_status_endpoint_returns_json():
     async def _missing_deps():
         return {
             "error": "missing_dependencies",
-            "detail": f"Dipendenze Python mancanti ({_import_err_msg}). Eseguire: hermes plugins install voice-document-assistant",
+            "state": "error",
+            "detail": (
+                f"Dipendenze Python del plugin vocale non trovate ({_import_err_msg}). "
+                "Per completare l'installazione, eseguire: 'hermes pm install --extra voice-document-assistant' "
+                "(oppure 'hermes pm repair'), quindi riavviare l'applicazione desktop o il gateway Hermes."
+            ),
+            "repair_command": "hermes pm install --extra voice-document-assistant",
+            "restart_required": True,
         }
 
     from fastapi import FastAPI
@@ -280,6 +287,8 @@ def test_missing_dependencies_status_endpoint_returns_json():
     assert res.status_code == 200
     assert res.json()["error"] == "missing_dependencies"
     assert "pymupdf" in res.json()["detail"]
+    assert res.json()["repair_command"] == "hermes pm install --extra voice-document-assistant"
+    assert res.json()["restart_required"] is True
 
 
 def test_state_keys_assistants_consistently_across_name_and_home_dir(tmp_path, monkeypatch):

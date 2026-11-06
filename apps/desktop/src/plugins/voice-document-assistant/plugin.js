@@ -1156,6 +1156,44 @@ function VoiceDocumentPage({ ctx, controller }) {
         ]
       }),
 
+      // Missing dependencies recovery banner
+      status?.error === 'missing_dependencies' && jsxs('div', {
+        className: 'hv-missing-deps-banner',
+        style: {
+          background: 'rgba(234, 88, 12, 0.12)',
+          border: '1px solid #ea580c',
+          borderRadius: '8px',
+          padding: '12px 16px',
+          margin: '12px 20px 0 20px',
+          color: '#f97316',
+          fontSize: '0.88rem',
+          lineHeight: '1.4'
+        },
+        children: [
+          jsx('strong', { children: 'Dipendenze Python mancanti per il Voice Assistant: ' }),
+          jsx('div', {
+            style: { margin: '6px 0', color: '#e2e8f0' },
+            children: status.detail || 'Le dipendenze del voice assistant (pocket-tts, pymupdf, sounddevice, soundfile) non sono presenti nel runtime Python.'
+          }),
+          jsx('div', {
+            style: {
+              background: '#0f172a',
+              padding: '6px 10px',
+              borderRadius: '4px',
+              fontFamily: 'monospace',
+              color: '#38bdf8',
+              margin: '6px 0',
+              userSelect: 'all'
+            },
+            children: status.repair_command || 'hermes pm install --extra voice-document-assistant'
+          }),
+          jsx('div', {
+            style: { fontSize: '0.8rem', color: '#94a3b8' },
+            children: 'Dopo l\'installazione tramite il gestore pacchetti, riavviare l\'applicazione Hermes o il gateway.'
+          })
+        ]
+      }),
+
       // Main Grid
       jsxs('div', {
         className: 'hv-main-grid',
