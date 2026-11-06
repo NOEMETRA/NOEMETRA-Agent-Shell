@@ -388,9 +388,10 @@ def test_desktop_plugin_configures_extended_timeouts_for_slow_endpoints():
     assert ask_const is not None
     assert int(ask_const.group(1)) >= 240000  # Must exceed backend 180s Ollama generation budget
 
-    # /ask, /audio/sentence, and /upload must pass explicit timeoutMs
+    # /ask, /audio/sentence, and /upload must pass explicit timeoutMs, and /ask must bind doc_id
     opts_body = r"(?:[^{}]|\{[^{}]*\})*"
     assert re.search(rf"ctx\.rest\('/ask',\s*\{{{opts_body}timeoutMs:\s*ASK_REQUEST_TIMEOUT_MS", mirror_src, re.DOTALL)
+    assert re.search(r"body:\s*\{\s*question:\s*q,\s*doc_id:\s*targetDocId\s*\}", mirror_src)
     assert re.search(rf"ctx\.rest\(`/audio/sentence/\$\{{currentSentIdx\}}\?format=json`,\s*\{{{opts_body}timeoutMs:\s*AUDIO_SYNTH_TIMEOUT_MS", mirror_src, re.DOTALL)
     assert re.search(rf"ctx\.rest\('/upload',\s*\{{{opts_body}timeoutMs:\s*DOCUMENT_LOAD_TIMEOUT_MS", mirror_src, re.DOTALL)
 

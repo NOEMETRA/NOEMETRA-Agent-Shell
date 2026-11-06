@@ -145,12 +145,19 @@ def voice_seek_document(args: Any = None, **kwargs) -> str:
 def voice_ask_document(args: Any = None, **kwargs) -> str:
     """Interroga il documento: il Bibliotecario estrae le evidenze, l'Analista risponde con numeri di pagina e il Verificatore convalida la citazione."""
     question = str(_extract_arg(args, kwargs, "question", "") or "")
+    doc_id_raw = _extract_arg(args, kwargs, "doc_id", None)
+    doc_id = str(doc_id_raw).strip() if doc_id_raw else None
     if not question:
         return json.dumps({"error": "Parametro 'question' mancante o non valido."})
 
     assistant = _get_assistant()
-    answer = assistant.ask(question)
+    try:
+        answer = assistant.ask(question, doc_id=doc_id)
+    except (FileNotFoundError, ValueError, PermissionError) as err:
+        return json.dumps({"error": str(err)})
     return json.dumps({
+        "doc_id": answer.doc_id,
+        "doc_title": answer.doc_title,
         "question": answer.question,
         "answer": answer.answer,
         "citations": [c.model_dump() for c in answer.citations],
@@ -251,7 +258,8 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "Domanda sul contenuto del documento"}
+                    "question": {"type": "string", "description": "Domanda sul contenuto del documento"},
+                    "doc_id": {"type": "string", "description": "ID opzionale del documento in biblioteca a cui vincolare la domanda"},
                 },
                 "required": ["question"],
             },

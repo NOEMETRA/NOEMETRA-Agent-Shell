@@ -631,14 +631,18 @@ function VoiceDocumentPage({ ctx }) {
 
   // When doc_id changes in status, load document text details
   useEffect(() => {
+    let cancelled = false
     if (status && status.doc_id) {
       if (!docData || docData.doc_id !== status.doc_id) {
-        ctx.rest(`/document/${status.doc_id}`).then(d => {
+        const expectedDocId = status.doc_id
+        ctx.rest(`/document/${expectedDocId}`).then(d => {
+          if (cancelled || !d || d.doc_id !== expectedDocId) return
           setDocData(d)
           if (status.current_page) setViewPage(status.current_page)
         }).catch(() => {})
       }
     }
+    return () => { cancelled = true }
   }, [status?.doc_id, ctx, docData])
 
   // Playback handlers
@@ -732,7 +736,10 @@ function VoiceDocumentPage({ ctx }) {
   const handleSeekCitation = async (docId, page) => {
     pollGenRef.current++
     try {
-      if (docId && docData && docData.doc_id !== docId) {
+      const needsSwitch = Boolean(
+        docId && (!docData || docData.doc_id !== docId || (status?.doc_id && status.doc_id !== docId))
+      )
+      if (needsSwitch) {
         if (clientAudioRef.current) {
           clientAudioRef.current.pause()
           clientAudioRef.current = null
@@ -869,24 +876,26 @@ function VoiceDocumentPage({ ctx }) {
   // Ask question
   const handleAsk = async () => {
     const q = questionInput.trim()
-    if (!q || isAsking) return
+    const targetDocId = docData ? docData.doc_id : (status?.doc_id || null)
+    if (!q || isAsking || !targetDocId) return
     setIsAsking(true)
     setQuestionInput('')
 
-    const userMsg = { role: 'user', text: q, time: new Date().toLocaleTimeString() }
+    const userMsg = { role: 'user', text: q, doc_id: targetDocId, time: new Date().toLocaleTimeString() }
     setChatMessages(prev => [...prev, userMsg])
 
-    const targetDocId = docData ? docData.doc_id : null
     try {
       const answer = await ctx.rest('/ask', {
         method: 'POST',
-        body: { question: q },
+        body: { question: q, doc_id: targetDocId },
         timeoutMs: ASK_REQUEST_TIMEOUT_MS
       })
+      const resolvedDocId = answer.doc_id || targetDocId
       const assistantMsg = {
         role: 'assistant',
         text: answer.answer,
-        doc_id: targetDocId,
+        doc_id: resolvedDocId,
+        doc_title: answer.doc_title || (docData?.doc_id === resolvedDocId ? docData?.title : undefined),
         citations: answer.citations || [],
         verification: answer.verification,
         model_used: answer.model_used,
