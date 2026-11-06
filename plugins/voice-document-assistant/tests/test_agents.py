@@ -239,8 +239,8 @@ def test_verifier_validates_multiple_claims_on_same_page():
         multi_answer = GroundedAnswer(
             question="Dettagli modello",
             answer=(
-                "Il modello è Pocket TTS [Pagina 1]. "
-                "Il runtime è locale e offline [Pagina 1]."
+                "La sintesi vocale è affidata a Pocket TTS [Pagina 1]. "
+                "L'assistente documentale opera su sistemi Windows 11 [Pagina 1]."
             ),
             citations=[
                 Citation(
@@ -249,7 +249,7 @@ def test_verifier_validates_multiple_claims_on_same_page():
                 ),
                 Citation(
                     page_number=1,
-                    verbatim_quote="architettura multi-agente",
+                    verbatim_quote="sistemi Windows 11",
                 ),
             ],
         )
@@ -258,4 +258,83 @@ def test_verifier_validates_multiple_claims_on_same_page():
         assert res.is_valid is True
         assert res.citation_match_score == 1.0
         assert len(res.unsupported_claims) == 0
+
+
+def test_analyst_and_verifier_reject_unsupported_claim_paired_with_real_quote():
+    """Verify that an unsupported assertion paired with a real verbatim quote in the same cited sentence is rejected (P1)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "test.pdf"
+        create_sample_italian_pdf(pdf_path)
+        doc = DocumentExtractor().extract(pdf_path)
+
+        analyst = AnalystAgent()
+        verifier = VerifierAgent(doc)
+
+        # 1. Fabricated Italian claim paired with a real quote from Page 2
+        poisoned_it = (
+            'L\'amministratore delegato ha sottratto fondi societari: '
+            '"raggiunge una velocità di generazione pari a 2.6 volte il tempo reale su CPU" [Pagina 2].'
+        )
+        cits_it = analyst._extract_citations(poisoned_it, excerpts=[])
+        # Both full claim and inner quote must be retained
+        assert len(cits_it) == 2
+        assert any("sottratto fondi" in c.verbatim_quote.lower() for c in cits_it)
+        assert any(
+            c.verbatim_quote == "raggiunge una velocità di generazione pari a 2.6 volte il tempo reale su CPU"
+            for c in cits_it
+        )
+
+        ans_it = GroundedAnswer(question="Cosa emerge?", answer=poisoned_it, citations=cits_it)
+        res_it = verifier.verify(ans_it)
+        assert res_it.is_valid is False
+        assert len(res_it.unsupported_claims) > 0
+
+        # 2. English / colon-prefixed fabricated assertion paired with a real quote
+        poisoned_en = (
+            'The CEO stole funds: "raggiunge una velocità di generazione pari a 2.6 volte il tempo reale su CPU" [Pagina 2].'
+        )
+        cits_en = analyst._extract_citations(poisoned_en, excerpts=[])
+        res_en = verifier.verify(GroundedAnswer(question="What?", answer=poisoned_en, citations=cits_en))
+        assert res_en.is_valid is False
+        assert len(res_en.unsupported_claims) > 0
+
+        # 3. Direct GroundedAnswer passing only the quote in citations still fails sentence-level verification
+        direct_bypass = GroundedAnswer(
+            question="What?",
+            answer=poisoned_en,
+            citations=[
+                Citation(
+                    page_number=2,
+                    verbatim_quote="raggiunge una velocità di generazione pari a 2.6 volte il tempo reale su CPU",
+                )
+            ],
+        )
+        res_direct = verifier.verify(direct_bypass)
+        assert res_direct.is_valid is False
+        assert len(res_direct.unsupported_claims) > 0
+
+
+def test_analyst_and_verifier_accept_grounded_claim_paired_with_real_quote():
+    """Verify that a grounded assertion accompanied by a genuine verbatim quote passes verification."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "test.pdf"
+        create_sample_italian_pdf(pdf_path)
+        doc = DocumentExtractor().extract(pdf_path)
+
+        analyst = AnalystAgent()
+        verifier = VerifierAgent(doc)
+
+        grounded_text = (
+            'In base al documento, la configurazione hardware di riferimento prevede un '
+            '"processore Intel Core Ultra 7 con 16 gigabyte di memoria RAM" [Pagina 1].'
+        )
+        cits = analyst._extract_citations(grounded_text, excerpts=[])
+        assert len(cits) == 2
+
+        ans = GroundedAnswer(question="Qual è la configurazione hardware?", answer=grounded_text, citations=cits)
+        res = verifier.verify(ans)
+        assert res.is_valid is True
+        assert res.citation_match_score == 1.0
+        assert len(res.unsupported_claims) == 0
+
 

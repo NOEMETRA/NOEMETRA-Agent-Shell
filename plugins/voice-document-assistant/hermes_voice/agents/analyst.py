@@ -14,6 +14,7 @@ import time
 from typing import List, Optional
 
 from hermes_voice.agents.librarian import RetrievedExcerpt
+from hermes_voice.agents.verifier import NEUTRAL_DISCOURSE_WORDS
 from hermes_voice.models import Citation, GroundedAnswer
 from hermes_voice.model_router import ModelRouter
 
@@ -121,31 +122,58 @@ class AnalystAgent:
             if not matches:
                 continue
 
-            # Check for explicit quotation marks inside this claim first (excluding apostrophes which occur in Italian words like dell'interazione)
-            quoted = re.findall(r'["“«]([^"”»\n]{8,})["”»]', s)
-            if quoted:
-                claim_text = quoted[0].strip()
-            else:
-                # Strip the citation marker from the claim sentence
-                claim_text = re.sub(r'\[Pagina\s*\d+\]', '', s, flags=re.IGNORECASE).strip()
-
-            if not claim_text:
+            # Strip citation markers and leading markdown bullet markers from the full sentence claim
+            full_claim = re.sub(r'\[Pagina\s*\d+\]', '', s, flags=re.IGNORECASE).strip()
+            full_claim = re.sub(r'^(?:\d+[\.\)]|[-•*]+)\s*', '', full_claim).strip()
+            if not full_claim:
                 continue
+
+            # Also extract any explicit verbatim quotations inside the sentence
+            quoted_spans = [
+                q.strip()
+                for q in re.findall(r'["“«]([^"”»\n]{4,})["”»]', full_claim)
+                if q.strip()
+            ]
+
+            candidate_claims: List[str] = []
+            norm_full = full_claim.lower().strip(' .,;:!?"“”«»\'')
+            if len(quoted_spans) == 1 and quoted_spans[0].lower().strip(' .,;:!?"“”«»\'') == norm_full:
+                # Entire sentence is solely the quotation itself
+                candidate_claims.append(quoted_spans[0])
+            else:
+                # Retain BOTH the full claim (so surrounding assertions are verified) AND each explicit quotation
+                candidate_claims.append(full_claim)
+                for q in quoted_spans:
+                    if q.lower().strip(' .,;:!?"“”«»\'') != norm_full:
+                        candidate_claims.append(q)
 
             for match in matches:
                 page_num = int(match.group(1))
-                claim_key = (page_num, claim_text.lower())
-                if claim_key in seen_claim_keys:
-                    continue
-                seen_claim_keys.add(claim_key)
+                for claim_text in candidate_claims:
+                    claim_key = (page_num, claim_text.lower())
+                    if claim_key in seen_claim_keys:
+                        continue
+                    seen_claim_keys.add(claim_key)
 
-                citations.append(
-                    Citation(
-                        page_number=page_num,
-                        verbatim_quote=claim_text,
-                        confidence=1.0,
+                    citations.append(
+                        Citation(
+                            page_number=page_num,
+                            verbatim_quote=claim_text,
+                            confidence=1.0,
+                        )
                     )
+
+        # If multiple citations exist, drop pure framing headers (e.g. "In base al documento:") that carry no factual words
+        if len(citations) > 1:
+            substantive = [
+                c for c in citations
+                if any(
+                    len(w) > 2 and w not in NEUTRAL_DISCOURSE_WORDS
+                    for w in re.sub(r'[\.,;:\'\"“”«»\!\?\(\)\[\]\{\}\-\—\–\*\_\#\`•]', ' ', c.verbatim_quote.lower()).split()
                 )
+            ]
+            if substantive:
+                citations = substantive
 
         # Fallback if citations matched in raw answer but were not captured by sentence splitting
         if not citations:
