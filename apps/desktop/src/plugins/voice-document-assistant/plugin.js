@@ -421,6 +421,7 @@ function createVoicePlaybackController(ctx) {
   const viewPage = atom(1)
   const chatMessages = atom([])
   const isAsking = atom(false)
+  const library = atom([])
 
   let disposed = false
   let cancelTimer = null
@@ -676,6 +677,7 @@ function createVoicePlaybackController(ctx) {
     loadingDocId = ''
     status.set(null)
     docData.set(null)
+    library.set([])
     viewPage.set(1)
     chatMessages.set([])
     isAsking.set(false)
@@ -695,6 +697,8 @@ function createVoicePlaybackController(ctx) {
     viewPage,
     chatMessages,
     isAsking,
+    library,
+    setLibrary: (docs) => library.set(docs),
     currentScopeKey,
     setDocData: (d) => docData.set(d),
     setViewPage: (p) => viewPage.set(p),
@@ -795,7 +799,7 @@ function VoiceDocumentPage({ ctx, controller }) {
   const viewPage = useValue(controller.viewPage)
   const chatMessages = useValue(controller.chatMessages)
   const isAsking = useValue(controller.isAsking)
-  const [library, setLibrary] = useState([])
+  const library = useValue(controller.library)
   const [questionInput, setQuestionInput] = useState('')
   const [isRecording, setIsRecording] = useState(false)
   const fileInputRef = useRef(null)
@@ -809,14 +813,20 @@ function VoiceDocumentPage({ ctx, controller }) {
       const res = await ctx.rest('/library')
       if (controller.currentScopeKey() !== scopeAtStart) return
       if (res && res.documents) {
-        setLibrary(res.documents)
+        controller.setLibrary(res.documents)
+      } else {
+        controller.setLibrary([])
       }
     } catch (err) {
+      if (controller.currentScopeKey() === scopeAtStart) {
+        controller.setLibrary([])
+      }
       console.error('Error fetching library:', err)
     }
   }
 
   useEffect(() => {
+    controller.setLibrary([])
     refreshLibrary()
   }, [activeScope])
 
