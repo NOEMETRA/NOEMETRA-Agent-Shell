@@ -371,5 +371,30 @@ def test_refuses_to_recreate_deleted_or_missing_named_profile_home(tmp_path, mon
         reset_assistants()
 
 
+def test_desktop_plugin_configures_extended_timeouts_for_slow_endpoints():
+    """Verify desktop plugin bundles stay in sync and grant sufficient timeoutMs for local LLM/TTS operations (P2)."""
+    import re
+
+    plugin_root = Path(__file__).resolve().parents[1]
+    repo_root = plugin_root.parents[1]
+    bundled_js = repo_root / "apps" / "desktop" / "src" / "plugins" / "voice-document-assistant" / "plugin.js"
+    mirror_js = plugin_root / "desktop" / "plugin.js"
+
+    mirror_src = mirror_js.read_text(encoding="utf-8")
+    if bundled_js.exists():
+        assert bundled_js.read_text(encoding="utf-8") == mirror_src
+
+    ask_const = re.search(r"const\s+ASK_REQUEST_TIMEOUT_MS\s*=\s*(\d+)", mirror_src)
+    assert ask_const is not None
+    assert int(ask_const.group(1)) >= 240000  # Must exceed backend 180s Ollama generation budget
+
+    # /ask, /audio/sentence, and /upload must pass explicit timeoutMs
+    opts_body = r"(?:[^{}]|\{[^{}]*\})*"
+    assert re.search(rf"ctx\.rest\('/ask',\s*\{{{opts_body}timeoutMs:\s*ASK_REQUEST_TIMEOUT_MS", mirror_src, re.DOTALL)
+    assert re.search(rf"ctx\.rest\(`/audio/sentence/\$\{{currentSentIdx\}}\?format=json`,\s*\{{{opts_body}timeoutMs:\s*AUDIO_SYNTH_TIMEOUT_MS", mirror_src, re.DOTALL)
+    assert re.search(rf"ctx\.rest\('/upload',\s*\{{{opts_body}timeoutMs:\s*DOCUMENT_LOAD_TIMEOUT_MS", mirror_src, re.DOTALL)
+
+
+
 
 
