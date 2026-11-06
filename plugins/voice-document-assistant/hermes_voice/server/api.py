@@ -11,11 +11,15 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from hermes_voice.pipeline import HermesVoiceAssistant
 
 from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusResponse, ReadingBookmark
 from hermes_voice.profile import (

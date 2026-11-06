@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 import numpy as np
 
 from hermes_voice.models import ExtractedDocument, PlayerState, ReadingBookmark, SentenceSpan

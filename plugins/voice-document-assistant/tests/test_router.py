@@ -475,6 +475,106 @@ def test_remote_consent_guard_blocks_remote_ollama_health_checks(monkeypatch):
     assert authorized_health["target_model_installed"] is True
 
 
+def test_authenticated_custom_and_lmstudio_endpoints_resolve_scoped_credentials(monkeypatch):
+    """Verify authenticated LM Studio, vLLM, and custom endpoints resolve profile-scoped secrets before falling back to 'local' (P2)."""
+    # 1. Custom / vLLM endpoint with credential stored in profile-scoped OPENAI_API_KEY
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-other-profile-secret")
+    scoped_secrets = {"OPENAI_API_KEY": "sk-custom-vllm-scoped-token"}
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret",
+        lambda name, default=None: scoped_secrets.get(name, default),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "vllm",
+                "base_url": "http://127.0.0.1:8000/v1",
+                "name": "Qwen/Qwen2.5-14B-Instruct",
+            }
+        },
+    )
+
+    router_vllm = ModelRouter()
+    assert router_vllm.default_provider == "openai_compatible"
+    assert router_vllm.codex_api_key == "sk-custom-vllm-scoped-token"
+
+    sent_headers = []
+
+    class MockChatResp:
+        is_redirect = False
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "Authenticated vLLM response"}}]}
+
+    def mock_post(url, headers=None, **kwargs):
+        sent_headers.append((url, dict(headers or {})))
+        return MockChatResp()
+
+    monkeypatch.setattr("requests.post", mock_post)
+    out = router_vllm.generate(prompt="Verifica autenticazione endpoint custom")
+    assert out == "Authenticated vLLM response"
+    assert sent_headers[-1][0] == "http://127.0.0.1:8000/v1/chat/completions"
+    assert sent_headers[-1][1]["Authorization"] == "Bearer sk-custom-vllm-scoped-token"
+
+    # 2. LM Studio endpoint prefers LM_API_KEY when present, else falls back to OPENAI_API_KEY
+    scoped_secrets["LM_API_KEY"] = "lmstudio-bearer-secret"
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "lmstudio",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "name": "gemma-4-12b-it",
+            }
+        },
+    )
+    router_lms = ModelRouter()
+    assert router_lms.codex_api_key == "lmstudio-bearer-secret"
+    router_lms.generate(prompt="Domanda LM Studio")
+    assert sent_headers[-1][1]["Authorization"] == "Bearer lmstudio-bearer-secret"
+
+    # 3. Named custom provider entry declaring key_env resolves that profile-scoped secret
+    scoped_secrets["HERMES_CUSTOM_CORP_VLLM_API_KEY"] = "corp-vllm-dedicated-key"
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "custom:corp-vllm",
+            },
+            "providers": {
+                "corp-vllm": {
+                    "base_url": "http://127.0.0.1:8081/v1",
+                    "default_model": "llama-3.3-70b",
+                    "key_env": "HERMES_CUSTOM_CORP_VLLM_API_KEY",
+                }
+            },
+        },
+    )
+    router_named = ModelRouter()
+    assert router_named.default_provider == "openai_compatible"
+    assert router_named.codex_base_url == "http://127.0.0.1:8081/v1"
+    assert router_named.ollama_model == "llama-3.3-70b"
+    assert router_named.codex_api_key == "corp-vllm-dedicated-key"
+
+    # 4. Keyless profile falls back cleanly to 'local' without reading ambient os.environ
+    scoped_secrets.clear()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:8000/v1",
+                "name": "local-open-model",
+            }
+        },
+    )
+    router_keyless = ModelRouter()
+    assert router_keyless.codex_api_key == "local"
+
+
+
 
 
 

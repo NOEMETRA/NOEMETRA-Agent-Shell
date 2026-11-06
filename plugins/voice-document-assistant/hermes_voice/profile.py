@@ -126,33 +126,36 @@ def bind_voice_profile_scope(
             has_secret_scope = False
 
         if has_secret_scope:
-            is_routed = not _is_process_home(target_home)
-            if is_routed:
-                mux_token = set_multiplex_context(True)
-
-            already_bound_home = current_secret_scope_home()
-            already_matches = False
-            if current_secret_scope() is not None and already_bound_home:
-                try:
-                    already_matches = Path(already_bound_home).resolve() == target_home
-                except OSError:
-                    already_matches = False
-
-            if not already_matches:
+            try:
+                is_routed = not _is_process_home(target_home)
                 if is_routed:
+                    mux_token = set_multiplex_context(True)
+
+                already_bound_home = current_secret_scope_home()
+                already_matches = False
+                if current_secret_scope() is not None and already_bound_home:
                     try:
-                        from hermes_cli.env_loader import hydrate_profile_secret_sources
-                        hydrate_profile_secret_sources(target_home)
-                    except Exception:
-                        pass
-                    secrets = build_profile_secret_scope(target_home)
-                else:
-                    try:
-                        from tui_gateway.launch_profile_policy import owner_secret_scope
-                        secrets = owner_secret_scope(target_home)
-                    except Exception:
+                        already_matches = Path(already_bound_home).resolve() == target_home
+                    except OSError:
+                        already_matches = False
+
+                if not already_matches:
+                    if is_routed:
+                        try:
+                            from hermes_cli.env_loader import hydrate_profile_secret_sources
+                            hydrate_profile_secret_sources(target_home)
+                        except Exception:
+                            pass
                         secrets = build_profile_secret_scope(target_home)
-                secret_token = set_secret_scope(secrets, profile_home=str(target_home))
+                    else:
+                        try:
+                            from tui_gateway.launch_profile_policy import owner_secret_scope
+                            secrets = owner_secret_scope(target_home)
+                        except Exception:
+                            secrets = build_profile_secret_scope(target_home)
+                    secret_token = set_secret_scope(secrets, profile_home=str(target_home))
+            except (ImportError, ModuleNotFoundError):
+                pass
 
         yield target_home
     finally:
