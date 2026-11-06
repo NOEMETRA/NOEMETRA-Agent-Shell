@@ -1156,6 +1156,25 @@ def test_ask_binds_question_to_requested_document_across_concurrent_switch(monke
         assert res_missing.status_code == 404
 
 
+def test_standalone_rejects_remote_clients_and_non_loopback_binding():
+    """Verify standalone server strictly restricts peer access and listener to loopback (P1)."""
+    from hermes_voice.server.standalone import run as standalone_run
+
+    # 1. Non-loopback client peer address must be rejected even with Host: localhost
+    remote_client = TestClient(app, client=("192.168.1.100", 54321))
+    resp = remote_client.get(
+        "/api/plugins/voice-document-assistant/status",
+        headers={"Host": "localhost"},
+    )
+    assert resp.status_code == 403
+    assert "Forbidden: remote client access not permitted" in resp.text
+
+    # 2. standalone run() must reject binding to non-loopback hosts
+    for bad_host in ["0.0.0.0", "192.168.1.50", "example.com"]:
+        with pytest.raises(ValueError, match="loopback addresses"):
+            standalone_run(host=bad_host)
+
+
 
 
 
