@@ -11,9 +11,13 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urljoin, urlparse
 import requests
+
+from hermes_voice.profile import bind_voice_profile_scope
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +62,35 @@ class ModelRouter:
         remote_base_url: Optional[str] = None,
         remote_api_key: Optional[str] = None,
         allow_remote: bool = False,
+        home_dir: Optional[Union[str, Path]] = None,
     ):
+        self.home_dir = Path(home_dir).resolve() if home_dir is not None else None
+        with (bind_voice_profile_scope(home_dir=self.home_dir) if self.home_dir is not None else nullcontext()):
+            self._init_from_profile_scope(
+                default_provider=default_provider,
+                ollama_base_url=ollama_base_url,
+                ollama_model=ollama_model,
+                codex_base_url=codex_base_url,
+                codex_api_key=codex_api_key,
+                remote_base_url=remote_base_url,
+                remote_api_key=remote_api_key,
+                allow_remote=allow_remote,
+            )
+
+    def _profile_scope(self):
+        return bind_voice_profile_scope(home_dir=self.home_dir) if self.home_dir is not None else nullcontext()
+
+    def _init_from_profile_scope(
+        self,
+        default_provider: Optional[str] = None,
+        ollama_base_url: Optional[str] = None,
+        ollama_model: Optional[str] = None,
+        codex_base_url: Optional[str] = None,
+        codex_api_key: Optional[str] = None,
+        remote_base_url: Optional[str] = None,
+        remote_api_key: Optional[str] = None,
+        allow_remote: bool = False,
+    ) -> None:
         # Resolve model, provider and endpoint from hermes config if not explicitly provided
         cfg_model = None
         cfg_provider = None
@@ -218,30 +250,40 @@ class ModelRouter:
 
     def get_providers_status(self) -> Dict[str, Any]:
         """Return status and privacy posture for all configured providers."""
-        ollama_health = self.check_ollama_health()
-        return {
-            "default_provider": self.default_provider,
-            "allow_remote": self.allow_remote,
-            "ollama": {
-                "url": self.ollama_base_url,
-                "model": self.ollama_model,
-                "status": ollama_health.get("status", "unknown"),
-                "models": ollama_health.get("available_models", []),
-                "is_local": is_local_endpoint(self.ollama_base_url),
-                "authorized": self.allow_remote or is_local_endpoint(self.ollama_base_url),
-            },
-            "codex": {
-                "configured": bool(self.codex_base_url),
-                "url": self.codex_base_url or "http://127.0.0.1:8000/v1",
-                "is_local": is_local_endpoint(self.codex_base_url or "http://127.0.0.1:8000/v1"),
-            },
-            "remote_api": {
-                "configured": bool(self.remote_base_url and self.remote_api_key),
-                "url": self.remote_base_url,
-                "is_local": False,
-                "authorized": self.allow_remote,
-            },
-        }
+        with self._profile_scope():
+            ollama_health = self.check_ollama_health()
+            has_remote_key = bool(self.remote_api_key)
+            if not has_remote_key and self.default_provider in ("openai", "anthropic", "openrouter", "remote", "api"):
+                if self.default_provider in ("remote", "api"):
+                    has_remote_key = bool(
+                        _get_profile_scoped_secret("REMOTE_API_KEY")
+                        or _get_profile_scoped_secret("OPENAI_API_KEY")
+                    )
+                else:
+                    has_remote_key = bool(_get_profile_scoped_secret(f"{self.default_provider.upper()}_API_KEY"))
+            return {
+                "default_provider": self.default_provider,
+                "allow_remote": self.allow_remote,
+                "ollama": {
+                    "url": self.ollama_base_url,
+                    "model": self.ollama_model,
+                    "status": ollama_health.get("status", "unknown"),
+                    "models": ollama_health.get("available_models", []),
+                    "is_local": is_local_endpoint(self.ollama_base_url),
+                    "authorized": self.allow_remote or is_local_endpoint(self.ollama_base_url),
+                },
+                "codex": {
+                    "configured": bool(self.codex_base_url),
+                    "url": self.codex_base_url or "http://127.0.0.1:8000/v1",
+                    "is_local": is_local_endpoint(self.codex_base_url or "http://127.0.0.1:8000/v1"),
+                },
+                "remote_api": {
+                    "configured": bool(self.remote_base_url and has_remote_key),
+                    "url": self.remote_base_url,
+                    "is_local": False,
+                    "authorized": self.allow_remote,
+                },
+            }
 
     def generate(
         self,
@@ -253,6 +295,25 @@ class ModelRouter:
         temperature: float = 0.2,
     ) -> str:
         """Generate response via selected provider while enforcing privacy controls."""
+        with self._profile_scope():
+            return self._generate_scoped(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                provider=provider,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+
+    def _generate_scoped(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        max_tokens: int = 512,
+        temperature: float = 0.2,
+    ) -> str:
         selected_provider = (provider or self.default_provider).lower()
 
         if selected_provider == "ollama":

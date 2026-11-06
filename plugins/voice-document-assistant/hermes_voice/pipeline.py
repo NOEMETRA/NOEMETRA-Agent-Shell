@@ -38,6 +38,7 @@ from hermes_voice.model_router import ModelRouter
 from hermes_voice.player import DocumentPlayer
 from hermes_voice.profile import (
     assert_voice_home_live,
+    bind_voice_profile_scope,
     ensure_voice_dir,
     resolve_voice_profile_dir,
     validate_path_profile_ownership,
@@ -64,7 +65,7 @@ class HermesVoiceAssistant:
     ):
         prof_dir = resolve_voice_profile_dir(profile=profile, home_dir=home_dir)
         self.profile = profile
-        self.home_dir = Path(home_dir).resolve() if home_dir else None
+        self.home_dir = prof_dir.parent.resolve()
 
         self.library_path = Path(library_path or prof_dir / "voice_library.json")
         ensure_voice_dir(self.library_path.parent)
@@ -74,8 +75,9 @@ class HermesVoiceAssistant:
 
         is_virtual = virtual_playback or os.environ.get("HERMES_VOICE_VIRTUAL", "").lower() in ("1", "true", "yes")
 
-        self.tts = tts_engine or PocketTTSEngine(cache_dir=c_dir, lazy_load=True)
-        self.router = model_router or ModelRouter()
+        with bind_voice_profile_scope(home_dir=self.home_dir, profile=self.profile):
+            self.tts = tts_engine or PocketTTSEngine(cache_dir=c_dir, lazy_load=True)
+            self.router = model_router or ModelRouter(home_dir=self.home_dir)
         self.extractor = DocumentExtractor()
 
         self.player = DocumentPlayer(
@@ -323,7 +325,8 @@ class HermesVoiceAssistant:
         # Step 2: Analista formulates answer with citations
         self._agents_status.analyst = "generating"
         self._agents_status.detail = "Analista: formulazione risposta grounded..."
-        grounded_answer = self.analyst.answer_question(question, excerpts)
+        with bind_voice_profile_scope(home_dir=self.home_dir, profile=self.profile):
+            grounded_answer = self.analyst.answer_question(question, excerpts)
         self._agents_status.analyst = "ready"
         logger.info(f"Analista ha generato la risposta con {len(grounded_answer.citations)} citazioni.")
 
