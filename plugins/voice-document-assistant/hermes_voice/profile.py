@@ -36,6 +36,33 @@ def clear_registered_served_profile_homes() -> None:
     _REGISTERED_SERVED_HOMES.clear()
 
 
+def get_gateway_served_profile_homes() -> dict[Path, str]:
+    """Discover all profile home directories currently served by the active gateway runner."""
+    homes: dict[Path, str] = {}
+    try:
+        from gateway.run_api import _ACTIVE_RUNNER
+        runner = _ACTIVE_RUNNER
+        if runner:
+            authorities_reg = getattr(runner, "session_authorities", None)
+            if authorities_reg:
+                serving_fn = getattr(authorities_reg, "serving", None)
+                if callable(serving_fn):
+                    for auth in serving_fn():
+                        pid = getattr(auth, "profile_id", None)
+                        if pid:
+                            p = Path(pid).resolve()
+                            homes[p] = p.name.lower() or "served_home"
+            cfg = getattr(runner, "config", None)
+            r_homes = getattr(cfg, "_runtime_profile_homes", None)
+            if r_homes:
+                for name, h in r_homes:
+                    p = Path(h).resolve()
+                    homes[p] = str(name).lower() or p.name.lower() or "served_home"
+    except Exception:
+        pass
+    return homes
+
+
 def assert_voice_home_live(path: Union[str, Path]) -> None:
     """Refuse missing or tombstoned named profile homes."""
     target = Path(path)
@@ -279,6 +306,15 @@ def validate_path_profile_ownership(
             sh_resolved = Path(sh).resolve()
             if sh_resolved not in all_homes_by_path:
                 all_homes_by_path[sh_resolved] = sname or sh_resolved.name.lower() or "served_home"
+        except Exception:
+            pass
+
+    # Automatically query and add all served profile homes from the active gateway runner
+    for gh, gname in get_gateway_served_profile_homes().items():
+        try:
+            gh_resolved = Path(gh).resolve()
+            if gh_resolved not in all_homes_by_path:
+                all_homes_by_path[gh_resolved] = gname or gh_resolved.name.lower() or "served_home"
         except Exception:
             pass
 

@@ -41,8 +41,13 @@ def voice_load_document(args: Any = None, **kwargs) -> str:
 
     assistant = _get_assistant()
     try:
-        from hermes_voice.profile import validate_path_profile_ownership
-        validate_path_profile_ownership(pdf_path, profile=assistant.profile, home_dir=assistant.home_dir)
+        from hermes_voice.profile import get_gateway_served_profile_homes, validate_path_profile_ownership
+        validate_path_profile_ownership(
+            pdf_path,
+            profile=assistant.profile,
+            home_dir=assistant.home_dir,
+            served_homes=get_gateway_served_profile_homes(),
+        )
     except PermissionError as err:
         return json.dumps({"error": f"Access denied: {err}"})
     except Exception as err:
