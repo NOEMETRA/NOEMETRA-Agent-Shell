@@ -36,6 +36,7 @@ class PocketTTSEngine:
         self.language = language
         self.voice = voice
         self.quantize = quantize
+        self._lazy_load = lazy_load
         self.cache_dir = Path(cache_dir or resolve_voice_profile_dir() / "audio_cache")
         ensure_voice_dir(self.cache_dir)
         self._lock = threading.Lock()
@@ -45,53 +46,69 @@ class PocketTTSEngine:
         self._sample_rate: int = 24000
 
         if not lazy_load:
-            self._ensure_loaded()
+            with self._lock:
+                self._ensure_loaded()
 
     def set_model(self, language: str) -> None:
         """Switch model between 'italian' and 'italian_24l' thread-safely."""
         with self._lock:
-            if language == self.language and self._model is not None:
+            was_loaded = self._model is not None and self._voice_state is not None
+            if language == self.language and was_loaded:
                 return
             logger.info(f"Cambiamento modello Pocket TTS: '{self.language}' -> '{language}'")
             self.language = language
             self._model = None
             self._voice_state = None
-            self._ensure_loaded()
+            if was_loaded or not self._lazy_load:
+                self._ensure_loaded()
 
     def set_voice(self, voice: str) -> None:
         """Switch voice (e.g. 'giovanni') thread-safely."""
         with self._lock:
             if voice == self.voice and self._voice_state is not None:
                 return
-            self.voice = voice
             if self._model is not None:
                 logger.info(f"Aggiornamento voce a '{voice}'...")
-                self._voice_state = self._model.get_state_for_audio_prompt(self.voice)
+                new_voice_state = self._model.get_state_for_audio_prompt(voice)
+                self.voice = voice
+                self._voice_state = new_voice_state
+            else:
+                self.voice = voice
 
     def _ensure_loaded(self) -> None:
-        """Load model and compute conditioning state for chosen voice."""
-        if self._model is not None:
+        """Load model and compute conditioning state for chosen voice atomically."""
+        if self._model is not None and self._voice_state is not None:
             return
 
         from pocket_tts import TTSModel
 
-        logger.info(f"Caricamento Pocket TTS: lingua='{self.language}', quantize={self.quantize}...")
-        t0 = time.perf_counter()
-        self._model = TTSModel.load_model(
-            language=self.language,
-            quantize=self.quantize,
-        )
-        self._model.to("cpu")
-        load_time = time.perf_counter() - t0
-        logger.info(f"Modello Pocket TTS caricato in {load_time:.2f}s")
+        try:
+            logger.info(f"Caricamento Pocket TTS: lingua='{self.language}', quantize={self.quantize}...")
+            t0 = time.perf_counter()
+            loaded_model = TTSModel.load_model(
+                language=self.language,
+                quantize=self.quantize,
+            )
+            loaded_model.to("cpu")
+            load_time = time.perf_counter() - t0
+            logger.info(f"Modello Pocket TTS caricato in {load_time:.2f}s")
 
-        # Extract sample rate from config
-        if hasattr(self._model, "config") and hasattr(self._model.config, "mimi"):
-            self._sample_rate = self._model.config.mimi.sample_rate
+            # Extract sample rate from config
+            sample_rate = self._sample_rate
+            if hasattr(loaded_model, "config") and hasattr(loaded_model.config, "mimi"):
+                sample_rate = loaded_model.config.mimi.sample_rate
 
-        # Cache voice conditioning state
-        logger.info(f"Preparazione condizionamento vocale per '{self.voice}'...")
-        self._voice_state = self._model.get_state_for_audio_prompt(self.voice)
+            # Cache voice conditioning state before publishing _model
+            logger.info(f"Preparazione condizionamento vocale per '{self.voice}'...")
+            loaded_voice_state = loaded_model.get_state_for_audio_prompt(self.voice)
+
+            self._model = loaded_model
+            self._voice_state = loaded_voice_state
+            self._sample_rate = sample_rate
+        except Exception:
+            self._model = None
+            self._voice_state = None
+            raise
 
     @property
     def sample_rate(self) -> int:
@@ -153,7 +170,8 @@ class PocketTTSEngine:
         runs: int = 1,
     ) -> Dict[str, Union[float, str, int]]:
         """Run reproducible benchmark measuring latency, RTF and memory."""
-        self._ensure_loaded()
+        with self._lock:
+            self._ensure_loaded()
         import psutil
 
         process = psutil.Process()

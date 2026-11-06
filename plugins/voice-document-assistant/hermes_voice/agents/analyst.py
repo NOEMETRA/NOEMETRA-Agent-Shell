@@ -95,7 +95,7 @@ class AnalystAgent:
             question=question,
             answer=raw_answer,
             citations=citations,
-            model_used=self.router.ollama_model,
+            model_used=getattr(self.router, "last_model_used", None) or self.router.ollama_model,
             latency_seconds=round(elapsed, 3),
         )
 
