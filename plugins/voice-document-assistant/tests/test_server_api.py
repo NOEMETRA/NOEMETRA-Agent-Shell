@@ -850,6 +850,52 @@ def test_playback_ack_ignores_stale_doc_id():
         assert assistant.player._client_ended_event.is_set()
 
 
+def test_api_headless_server_playback_requires_client_output(monkeypatch):
+    """Verify server-side /playback/play returns an error on headless hosts instead of simulating progress (P2)."""
+    import time
+
+    assistant = get_assistant()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "doc_headless_api.pdf"
+        create_sample_italian_pdf(pdf_path)
+        assistant.load_document(pdf_path)
+
+        prev_virtual = assistant.player.virtual_playback
+        prev_client = assistant.player.client_playback
+        assistant.player.virtual_playback = False
+        assistant.player.client_playback = False
+        monkeypatch.setattr(assistant.player, "_has_audio_output_device", lambda: False)
+        try:
+            # 1. Implicit server-side play fails with 400 and does not advance sentence 0
+            res_default = client.post("/api/plugins/voice-document-assistant/playback/play")
+            assert res_default.status_code == 400
+            assert "Nessun dispositivo hardware di output audio" in res_default.json()["detail"]
+            assert assistant.player.current_sentence_index == 0
+
+            # 2. Explicit output='server' also fails with 400 without advancing
+            res_server = client.post(
+                "/api/plugins/voice-document-assistant/playback/play",
+                json={"output": "server"},
+            )
+            assert res_server.status_code == 400
+            assert assistant.player.current_sentence_index == 0
+
+            # 3. Client-driven playback (output='client') succeeds and waits strictly for client acks
+            res_client = client.post(
+                "/api/plugins/voice-document-assistant/playback/play",
+                json={"output": "client"},
+            )
+            assert res_client.status_code == 200
+            assert assistant.player.client_playback is True
+            time.sleep(0.25)
+            assert assistant.player.current_sentence_index == 0
+        finally:
+            assistant.player.stop()
+            assistant.player.virtual_playback = prev_virtual
+            assistant.player.client_playback = prev_client
+
+
+
 
 
 

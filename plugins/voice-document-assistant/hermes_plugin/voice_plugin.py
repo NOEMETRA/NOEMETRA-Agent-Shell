@@ -69,7 +69,10 @@ def voice_load_document(args: Any = None, **kwargs) -> str:
 def voice_play_document(args: Any = None, **kwargs) -> str:
     """Avvia o riprende la riproduzione vocale deterministica del documento caricato con Pocket TTS."""
     assistant = _get_assistant()
-    bookmark = assistant.play()
+    try:
+        bookmark = assistant.play()
+    except Exception as err:
+        return json.dumps({"error": str(err)})
     return json.dumps({
         "status": bookmark.state.value,
         "current_page": bookmark.current_page,
@@ -94,7 +97,10 @@ def voice_pause_document(args: Any = None, **kwargs) -> str:
 def voice_resume_document(args: Any = None, **kwargs) -> str:
     """Riprende la lettura vocale esattamente dal punto in cui era stata sospesa."""
     assistant = _get_assistant()
-    bookmark = assistant.resume()
+    try:
+        bookmark = assistant.resume()
+    except Exception as err:
+        return json.dumps({"error": str(err)})
     return json.dumps({
         "status": bookmark.state.value,
         "current_page": bookmark.current_page,

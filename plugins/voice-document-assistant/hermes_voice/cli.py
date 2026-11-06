@@ -84,7 +84,11 @@ def main() -> None:
         print(f"Pagine: {assistant.current_document.total_pages}, Frasi: {bookmark.total_sentences}")
 
     elif args.command == "play":
-        bookmark = assistant.play()
+        try:
+            bookmark = assistant.play()
+        except Exception as err:
+            print(f"Errore avvio riproduzione: {err}", file=sys.stderr)
+            sys.exit(1)
         print(f"Riproduzione avviata: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
         ctrl_file = assistant.player.bookmark_path.parent / "player_control.json"
         _write_ctrl_file(ctrl_file, {"pid": os.getpid(), "command": "", "status": "playing"})
@@ -167,7 +171,11 @@ def main() -> None:
         print(f"Testo: '{bookmark.current_sentence_text}'")
 
     elif args.command == "resume":
-        bookmark = assistant.resume()
+        try:
+            bookmark = assistant.resume()
+        except Exception as err:
+            print(f"Errore ripresa riproduzione: {err}", file=sys.stderr)
+            sys.exit(1)
         print(f"Riproduzione ripresa: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
         ctrl_file = assistant.player.bookmark_path.parent / "player_control.json"
         _write_ctrl_file(ctrl_file, {"pid": os.getpid(), "command": "", "status": "playing"})

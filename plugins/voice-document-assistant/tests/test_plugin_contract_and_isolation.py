@@ -159,6 +159,7 @@ def test_player_tts_synthesis_error_sets_paused_state():
         doc = DocumentExtractor().extract(pdf_path)
 
         player = DocumentPlayer(bookmark_path=bm_path, virtual_playback=False)
+        player._has_audio_output_device = lambda: True
         player.load_document(doc)
 
         class BrokenTTS:
@@ -188,6 +189,7 @@ def test_player_audio_stream_failure_preserves_sentence_index():
         doc = DocumentExtractor().extract(pdf_path)
 
         player = DocumentPlayer(bookmark_path=bm_path, virtual_playback=False)
+        player._has_audio_output_device = lambda: True
         player.load_document(doc)
 
         class DummyTTS:
