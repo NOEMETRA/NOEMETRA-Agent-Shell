@@ -20,11 +20,94 @@ def is_pid_alive(pid: int) -> bool:
     except (OSError, SystemError, PermissionError):
         return False
 
+from typing import Optional
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
+
 from hermes_voice.extractor import create_sample_italian_pdf
-from hermes_voice.models import PlayerState
+from hermes_voice.models import PlayerState, ReadingBookmark
 from hermes_voice.pipeline import HermesVoiceAssistant
-from hermes_voice.profile import ensure_voice_dir
+from hermes_voice.profile import PROFILE_ID_RE, compute_home_fingerprint, ensure_voice_dir
 from hermes_voice.tts_engine import PocketTTSEngine
+
+_ALLOWED_CLI_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_cli_logger = __import__("logging").getLogger(__name__)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP redirects so local control probes never escape loopback."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "Redirects forbidden on local CLI control channel", headers, fp)
+
+
+def _candidate_local_server_urls() -> list[str]:
+    urls: list[str] = []
+    env_url = (os.environ.get("HERMES_VOICE_SERVER_URL") or "").strip().rstrip("/")
+    if env_url:
+        try:
+            parsed = urlparse(env_url)
+            if parsed.scheme == "http" and (parsed.hostname or "").lower() in _ALLOWED_CLI_LOOPBACK_HOSTS:
+                urls.append(env_url)
+        except Exception:
+            pass
+    for default_url in ("http://127.0.0.1:8000", "http://127.0.0.1:8080"):
+        if default_url not in urls:
+            urls.append(default_url)
+    return urls
+
+
+def _try_pause_matching_local_server(assistant: HermesVoiceAssistant) -> Optional[ReadingBookmark]:
+    """Pause a local Voice server ONLY if it provably serves the CLI's exact profile home (AGENTS.md:13)."""
+    expected_fp = compute_home_fingerprint(assistant.home_dir)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hermes-Voice-Home-Sha256": expected_fp,
+    }
+    if assistant.profile and PROFILE_ID_RE.match(assistant.profile.lower()):
+        headers["X-Hermes-Profile"] = assistant.profile.lower()
+
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    for base_url in _candidate_local_server_urls():
+        try:
+            status_req = urllib.request.Request(
+                f"{base_url}/api/plugins/voice-document-assistant/status",
+                headers=headers,
+                method="GET",
+            )
+            with opener.open(status_req, timeout=3.0) as status_resp:
+                if status_resp.status != 200:
+                    continue
+                status_body = json.loads(status_resp.read().decode("utf-8"))
+                resp_fp = (
+                    status_resp.headers.get("X-Hermes-Voice-Home-Sha256")
+                    or (status_body.get("home_fingerprint") if isinstance(status_body, dict) else "")
+                    or ""
+                ).strip().lower()
+                if resp_fp != expected_fp:
+                    continue
+                if not isinstance(status_body, dict) or status_body.get("state") != PlayerState.PLAYING.value:
+                    continue
+
+            pause_req = urllib.request.Request(
+                f"{base_url}/api/plugins/voice-document-assistant/playback/pause",
+                data=b"{}",
+                headers=headers,
+                method="POST",
+            )
+            with opener.open(pause_req, timeout=3.0) as pause_resp:
+                if pause_resp.status != 200:
+                    continue
+                pause_fp = (pause_resp.headers.get("X-Hermes-Voice-Home-Sha256") or "").strip().lower()
+                if pause_fp != expected_fp:
+                    continue
+                pause_body = json.loads(pause_resp.read().decode("utf-8"))
+                return ReadingBookmark.model_validate(pause_body)
+        except Exception as err:
+            _cli_logger.debug("Probe server voce locale %s scartato: %r", base_url, err)
+            continue
+    return None
 
 
 def _write_ctrl_file(ctrl_file: Path, payload: dict) -> None:
@@ -37,6 +120,7 @@ def main() -> None:
         prog="hermes-voice",
         description="Assistente vocale documentale multi-agente per Windows 11.",
     )
+    parser.add_argument("--profile", default=None, help="Profilo Hermes isolato da utilizzare")
     subparsers = parser.add_subparsers(dest="command", help="Comando da eseguire")
 
     # Command: load
@@ -64,7 +148,7 @@ def main() -> None:
     # Command: demo
     demo_parser = subparsers.add_parser("demo", help="Esegue la dimostrazione completa del criterio di successo")
     demo_parser.add_argument("--pdf", help="Percorso PDF personalizzato (opzionale)")
-    demo_parser.add_argument("--virtual", action="store_true", default=True, help="Modalità virtuale di riproduzione")
+    demo_parser.add_argument("--virtual", action="store_true", default=True, help="ModalitÃ  virtuale di riproduzione")
 
     # Command: benchmark
     bench_parser = subparsers.add_parser("benchmark", help="Esegue benchmark di Pocket TTS e Ollama")
@@ -76,7 +160,14 @@ def main() -> None:
         parser.print_help()
         sys.exit(0)
 
-    assistant = HermesVoiceAssistant(virtual_playback=getattr(args, "virtual", False))
+    if args.command == "demo":
+        run_full_demo(args.pdf, getattr(args, "virtual", True), profile=args.profile)
+        return
+
+    assistant = HermesVoiceAssistant(
+        virtual_playback=getattr(args, "virtual", False),
+        profile=args.profile,
+    )
 
     if args.command == "load":
         bookmark = assistant.load_document(args.pdf_path)
@@ -146,24 +237,23 @@ def main() -> None:
             except Exception:
                 pass
 
+        server_bookmark: Optional[ReadingBookmark] = None
         if not routed:
-            try:
-                import urllib.request
-                req = urllib.request.Request(
-                    "http://127.0.0.1:8000/api/plugins/voice-document-assistant/playback/pause",
-                    data=b"{}",
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=1.0) as resp:
-                    if resp.status == 200:
-                        routed = True
-            except Exception:
-                pass
+            server_bookmark = _try_pause_matching_local_server(assistant)
+            if server_bookmark is not None:
+                routed = True
 
-        if not routed:
+        if server_bookmark is not None:
+            bookmark = server_bookmark
+        elif not routed:
             bookmark = assistant.pause()
         else:
+            # Reload persisted bookmark updated by the external CLI player process
+            assistant.player = type(assistant.player)(
+                tts_engine=assistant.tts,
+                bookmark_path=assistant.player.bookmark_path,
+                virtual_playback=assistant.player.virtual_playback,
+            )
             bookmark = assistant.player.get_bookmark()
 
         print(f"Riproduzione in pausa: Frase {bookmark.current_sentence_index + 1} (Pagina {bookmark.current_page})")
@@ -256,27 +346,32 @@ def main() -> None:
 
     elif args.command == "benchmark":
         print(f"Avvio benchmark prestazionale Pocket TTS (modello='{args.language}', voce='giovanni')...")
-        engine = PocketTTSEngine(language=args.language, voice="giovanni", lazy_load=False)
+        engine = PocketTTSEngine(
+            cache_dir=assistant.player.bookmark_path.parent / "audio_cache",
+            language=args.language,
+            voice="giovanni",
+            lazy_load=False,
+        )
         res = engine.benchmark()
         print("\nRISULTATI BENCHMARK:")
         print(json.dumps(res, indent=2))
 
-    elif args.command == "demo":
-        run_full_demo(args.pdf, args.virtual)
 
-
-def run_full_demo(custom_pdf: str | None = None, virtual: bool = True) -> None:
+def run_full_demo(
+    custom_pdf: str | None = None,
+    virtual: bool = True,
+    profile: str | None = None,
+) -> None:
     """Execute end-to-end user scenario."""
     print("\n" + "#" * 65)
-    print("# DEMO END-TO-END — HERMES VOICE DOCUMENT ASSISTANT")
+    print("# DEMO END-TO-END â€” HERMES VOICE DOCUMENT ASSISTANT")
     print("#" * 65)
 
-    pdf_path = Path(custom_pdf) if custom_pdf else Path("test_document_it.pdf")
+    assistant = HermesVoiceAssistant(virtual_playback=virtual, profile=profile)
+    pdf_path = Path(custom_pdf) if custom_pdf else (assistant.player.bookmark_path.parent / "test_document_it.pdf")
     if not pdf_path.exists():
         print(f"\n[1/6] Generazione PDF di test italiano: {pdf_path}...")
         create_sample_italian_pdf(pdf_path)
-
-    assistant = HermesVoiceAssistant(virtual_playback=virtual)
 
     print(f"\n[2/6] Caricamento del documento: {pdf_path}...")
     bookmark = assistant.load_document(pdf_path)

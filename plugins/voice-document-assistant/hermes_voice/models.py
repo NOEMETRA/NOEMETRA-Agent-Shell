@@ -137,5 +137,6 @@ class PlayerStatusResponse(BaseModel):
     speed: float = 1.0
     client_playback: bool = False
     allow_remote: bool = False
+    home_fingerprint: str = ""
     agents: AgentStatusInfo = Field(default_factory=AgentStatusInfo)
     last_answer: Optional[GroundedAnswer] = None

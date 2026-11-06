@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from contextlib import contextmanager
@@ -11,6 +12,12 @@ from typing import Any, Iterable, Iterator, Optional, Union
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 _REGISTERED_SERVED_HOMES: dict[Path, str] = {}
+
+
+def compute_home_fingerprint(home_dir: Union[str, Path]) -> str:
+    """Compute an opaque SHA-256 fingerprint of a canonical Hermes home directory."""
+    canonical = os.path.normcase(str(Path(home_dir).resolve()))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def register_served_profile_home(home: Union[str, Path], name: Optional[str] = None) -> None:

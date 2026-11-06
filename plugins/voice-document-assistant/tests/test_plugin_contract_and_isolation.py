@@ -399,6 +399,132 @@ def test_desktop_plugin_configures_extended_timeouts_for_slow_endpoints():
     assert "ctx.onDispose(() => controller.dispose())" in mirror_src
 
 
+def test_cli_pause_scopes_local_server_to_active_profile_home(tmp_path, monkeypatch):
+    """Verify CLI pause never pauses a foreign profile/home server and only pauses verified same-home servers (P1)."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from fastapi.testclient import TestClient
+
+    from hermes_voice.cli import _try_pause_matching_local_server
+    from hermes_voice.models import PlayerState, ReadingBookmark
+    from hermes_voice.pipeline import HermesVoiceAssistant
+    from hermes_voice.profile import compute_home_fingerprint
+    from hermes_voice.server.standalone import app
+
+    home_alpha = tmp_path / "hermes_alpha"
+    home_beta = tmp_path / "hermes_beta"
+    home_alpha.mkdir(parents=True, exist_ok=True)
+    home_beta.mkdir(parents=True, exist_ok=True)
+
+    ast_alpha = HermesVoiceAssistant(home_dir=home_alpha, profile="alpha", virtual_playback=True)
+    alpha_fp = compute_home_fingerprint(ast_alpha.home_dir)
+    beta_fp = compute_home_fingerprint(home_beta)
+    assert alpha_fp != beta_fp
+
+    # 1. Server-side enforcement: mismatched X-Hermes-Voice-Home-Sha256 is rejected with 403 Forbidden
+    monkeypatch.setenv("HERMES_HOME", str(home_beta))
+    reset_assistants()
+    try:
+        api_client = TestClient(app)
+        forbidden = api_client.post(
+            "/api/plugins/voice-document-assistant/playback/pause",
+            json={},
+            headers={"X-Hermes-Voice-Home-Sha256": alpha_fp},
+        )
+        assert forbidden.status_code == 403
+    finally:
+        reset_assistants()
+
+    # 2. Client-side CLI verification against live loopback HTTP servers
+    server_mode = {"kind": "foreign_profile"}
+    recorded_posts: list[tuple[str, dict]] = []
+
+    class _MockVoiceHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+        def do_GET(self):
+            if self.path == "/api/plugins/voice-document-assistant/status":
+                mode = server_mode["kind"]
+                if mode == "foreign_profile":
+                    if self.headers.get("X-Hermes-Voice-Home-Sha256") != beta_fp:
+                        self.send_response(403)
+                        self.end_headers()
+                        return
+                elif mode == "unrelated_200":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"state": "playing"}')
+                    return
+                elif mode == "same_profile_playing":
+                    body = json.dumps({"state": "playing", "home_fingerprint": alpha_fp}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("X-Hermes-Voice-Home-Sha256", alpha_fp)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):
+            recorded_posts.append((self.path, dict(self.headers)))
+            bm = ReadingBookmark(
+                doc_id="doc-alpha",
+                file_path=str(home_alpha / "voice_assistant" / "alpha.pdf"),
+                current_page=2,
+                current_sentence_index=4,
+                current_sentence_text="Frase messa in pausa sul profilo corretto.",
+                audio_seconds_offset=1.25,
+                state=PlayerState.PAUSED,
+                total_sentences=10,
+            )
+            body = bm.model_dump_json().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("X-Hermes-Voice-Home-Sha256", alpha_fp)
+            self.end_headers()
+            self.wfile.write(body)
+
+    httpd = HTTPServer(("127.0.0.1", 0), _MockVoiceHandler)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("HERMES_VOICE_SERVER_URL", f"http://127.0.0.1:{port}")
+        # Patch candidate URLs so only our isolated ephemeral port is probed
+        monkeypatch.setattr(
+            "hermes_voice.cli._candidate_local_server_urls",
+            lambda: [f"http://127.0.0.1:{port}"],
+        )
+
+        # 2a. Foreign profile server -> never receives POST /playback/pause
+        server_mode["kind"] = "foreign_profile"
+        assert _try_pause_matching_local_server(ast_alpha) is None
+        assert recorded_posts == []
+
+        # 2b. Unrelated service returning 200 OK without matching home fingerprint -> never receives POST /playback/pause
+        server_mode["kind"] = "unrelated_200"
+        assert _try_pause_matching_local_server(ast_alpha) is None
+        assert recorded_posts == []
+
+        # 2c. Verified same-home server in playing state -> receives scoped POST and returns updated bookmark
+        server_mode["kind"] = "same_profile_playing"
+        paused_bm = _try_pause_matching_local_server(ast_alpha)
+        assert paused_bm is not None
+        assert paused_bm.state == PlayerState.PAUSED
+        assert paused_bm.current_sentence_index == 4
+        assert len(recorded_posts) == 1
+        post_path, post_headers = recorded_posts[0]
+        assert post_path == "/api/plugins/voice-document-assistant/playback/pause"
+        assert post_headers.get("X-Hermes-Voice-Home-Sha256") == alpha_fp
+        assert post_headers.get("X-Hermes-Profile") == "alpha"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 
 
 

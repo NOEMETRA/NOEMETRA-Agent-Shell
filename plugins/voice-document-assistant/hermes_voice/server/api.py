@@ -25,6 +25,7 @@ from hermes_voice.models import GroundedAnswer, LibraryEntry, PlayerStatusRespon
 from hermes_voice.profile import (
     PROFILE_ID_RE,
     bind_voice_profile_scope,
+    compute_home_fingerprint,
     ensure_voice_dir,
     register_served_profile_home,
     resolve_voice_profile_dir,
@@ -35,10 +36,12 @@ from hermes_voice.server.state import _evict_dead_assistants, get_assistant
 logger = logging.getLogger(__name__)
 
 
-async def _bind_authorized_request_scope(request: Request):
+async def _bind_authorized_request_scope(request: Request, response: Response):
     """Bind the authorized profile home and secret scope across assistant construction and route execution."""
     profile_name, authorized_home = _resolve_authorized_context(request)
     request.state._voice_resolved_context = (profile_name, authorized_home)
+    if authorized_home:
+        response.headers["X-Hermes-Voice-Home-Sha256"] = compute_home_fingerprint(authorized_home)
     try:
         with bind_voice_profile_scope(home_dir=authorized_home, profile=profile_name):
             yield
@@ -212,6 +215,19 @@ def _resolve_authorized_context(request: Request) -> Tuple[str, Optional[Path]]:
             )
 
     resolved_profile = bound_profile or (authorized_home.name if authorized_home else "default")
+    expected_home_fp = (request.headers.get("X-Hermes-Voice-Home-Sha256") or "").strip().lower()
+    if expected_home_fp:
+        actual_home_fp = compute_home_fingerprint(authorized_home) if authorized_home else ""
+        if not actual_home_fp or expected_home_fp != actual_home_fp:
+            logger.warning(
+                "Cross-home request blocked: caller home fingerprint %s does not match server home fingerprint %s",
+                expected_home_fp[:12],
+                actual_home_fp[:12] if actual_home_fp else "none",
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: request home fingerprint does not match server profile home",
+            )
     if authorized_home:
         register_served_profile_home(authorized_home, resolved_profile)
     return resolved_profile, authorized_home
