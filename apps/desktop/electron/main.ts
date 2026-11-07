@@ -11,13 +11,13 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
-import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import tls from 'node:tls'
 import { pathToFileURL } from 'node:url'
 
-const nodeRequire = typeof require === 'function' ? require : createRequire(import.meta.url)
+declare const require: NodeJS.Require
+const nodeRequire = require
 
 import {
   app,
