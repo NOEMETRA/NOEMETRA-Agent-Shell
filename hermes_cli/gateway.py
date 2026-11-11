@@ -2930,6 +2930,11 @@ def legacy_launchd_labels_for_install(exclude=()) -> list[str]:
 
 
 def get_python_path() -> str:
+    venv_exe = PROJECT_ROOT / ".venv" / ("Scripts" if sys.platform == "win32" else "bin") / ("python.exe" if sys.platform == "win32" else "python")
+    if venv_exe.is_file():
+        return str(venv_exe)
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        return sys.executable
     from hermes_cli._launchers import resolve_store_python
 
     return str(resolve_store_python(PROJECT_ROOT) or sys.executable)
