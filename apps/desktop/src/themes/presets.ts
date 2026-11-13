@@ -441,7 +441,75 @@ export const slateTheme: DesktopTheme = {
   }
 }
 
+export const noemetraTheme: DesktopTheme = {
+  name: 'noemetra',
+  label: 'NOEMETRA',
+  description: 'Deep obsidian, electric cyan and cobalt glass',
+  colors: {
+    background: '#f8fafc',
+    foreground: '#0f172a',
+    card: '#ffffff',
+    cardForeground: '#0f172a',
+    muted: '#eef2f6',
+    mutedForeground: '#475569',
+    popover: '#ffffff',
+    popoverForeground: '#0f172a',
+    primary: '#0284c7',
+    primaryForeground: '#ffffff',
+    secondary: '#e0f2fe',
+    secondaryForeground: '#0f172a',
+    accent: '#e0e7ff',
+    accentForeground: '#0f172a',
+    border: '#cbd5e1',
+    input: '#ffffff',
+    ring: '#0284c7',
+    midground: '#0284c7',
+    midgroundForeground: '#ffffff',
+    composerRing: '#0284c7',
+    destructive: '#dc2626',
+    destructiveForeground: '#ffffff',
+    sidebarBackground: '#f1f5f9',
+    sidebarBorder: '#e2e8f0',
+    userBubble: '#e0f2fe',
+    userBubbleBorder: '#bae6fd'
+  },
+  darkColors: {
+    background: '#080c14',
+    foreground: '#f1f5f9',
+    card: '#0d1320',
+    cardForeground: '#f1f5f9',
+    muted: '#131b2c',
+    mutedForeground: '#94a3b8',
+    popover: '#101829',
+    popoverForeground: '#f1f5f9',
+    primary: '#22d3ee',
+    primaryForeground: '#04121d',
+    secondary: '#17253d',
+    secondaryForeground: '#e2e8f0',
+    accent: '#1b2644',
+    accentForeground: '#f1f5f9',
+    border: '#1e293b',
+    input: '#0b101b',
+    ring: '#22d3ee',
+    midground: '#22d3ee',
+    midgroundForeground: '#04121d',
+    composerRing: '#38bdf8',
+    destructive: '#f87171',
+    destructiveForeground: '#0f172a',
+    sidebarBackground: '#05080f',
+    sidebarBorder: '#162032',
+    userBubble: '#111c33',
+    userBubbleBorder: '#1e3a5f'
+  },
+  typography: {
+    fontSans: `"Inter", ${SYSTEM_SANS}`,
+    fontMono: SYSTEM_MONO,
+    fontUrl: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap'
+  }
+}
+
 export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
+  noemetra: noemetraTheme,
   nous: nousTheme,
   github: githubTheme,
   catppuccin: catppuccinTheme,
