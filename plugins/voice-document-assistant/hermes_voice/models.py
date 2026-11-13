@@ -26,6 +26,10 @@ class SentenceSpan(BaseModel):
     char_start: int = Field(default=0, description="Start character offset in page text")
     char_end: int = Field(default=0, description="End character offset in page text")
     bbox: Optional[List[float]] = Field(default=None, description="Bounding box [x0, y0, x1, y1]")
+    is_header_footer: bool = Field(
+        default=False,
+        description="Whether this span looks like a repeated page header/footer or page marker",
+    )
 
 
 class DocumentPage(BaseModel):
@@ -135,6 +139,7 @@ class PlayerStatusResponse(BaseModel):
     audio_seconds_offset: float = 0.0
     tts_model: str = "italian"  # "italian" | "italian_24l"
     speed: float = 1.0
+    skip_headers_footers: bool = True
     client_playback: bool = False
     allow_remote: bool = False
     home_fingerprint: str = ""

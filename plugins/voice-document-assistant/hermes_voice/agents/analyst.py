@@ -25,11 +25,11 @@ Il tuo compito è rispondere alle domande dell'utente ESCLUSIVAMENTE sulla base 
 
 REGOLE VINCOLANTI:
 1. Basati SOLO sui fatti presenti negli estratti allegati.
-2. CITA SEMPRE il numero di pagina esatto nel formato [Pagina X] per ogni affermazione principale.
-3. Se possibile, includi brevi citazioni letterali tra virgolette ("...").
+2. CITA SEMPRE il numero di pagina esatto nel formato [Pagina X] per ogni affermazione principale o voce di elenco.
+3. Riutilizza le parole esatte degli estratti oppure includi brevi citazioni letterali tra virgolette ("..."), evitando parafrasi libere o verbi riempitivi non presenti nel testo (es. "si occupa di", "ha il compito di").
 4. Se gli estratti non contengono informazioni sufficienti per rispondere, dichiara chiaramente: "Il documento non contiene informazioni sufficienti su questo punto."
 5. NON inventare numeri, pagine, date o concetti non presenti nel testo.
-6. Rispondi in italiano in modo chiaro, sintetico e professionale.
+6. Rispondi in italiano in modo chiaro, sintetico e professionale, usando Markdown pulito (### titoli brevi, elenchi puntati/numerati per più punti, **grassetto** solo sui termini chiave presenti nel testo) mantenendo la formulazione fedele al testo originale.
 """
 
 
@@ -76,7 +76,7 @@ class AnalystAgent:
                 prompt=user_prompt,
                 system_prompt=SYSTEM_PROMPT,
                 temperature=0.1,  # Low temperature for deterministic grounding
-                max_tokens=400,
+                max_tokens=650,
             )
         except Exception as e:
             logger.error(f"Errore generazione LLM nell'Analista: {e}")

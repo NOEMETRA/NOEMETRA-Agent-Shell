@@ -420,6 +420,83 @@ def test_tts_engine_synthesizes_normalized_technical_text(monkeypatch):
         assert len(captured_prompts) == 1
 
 
+def test_clean_markdown_for_speech():
+    from hermes_voice.tts_engine import clean_markdown_for_speech
+
+    md = (
+        "### La Triade di Agenti\n\n"
+        "- **Il Bibliotecario**: indicizza i paragrafi [Pagina 3].\n"
+        "> \"Citazione letterale\" [Pagina 2]\n"
+        "Dettagli su [Portale](https://example.com) con `API REST`."
+    )
+    cleaned = clean_markdown_for_speech(md)
+    assert "[Pagina" not in cleaned
+    assert "###" not in cleaned
+    assert "**" not in cleaned
+    assert "https://example.com" not in cleaned
+    assert "Il Bibliotecario: indicizza i paragrafi" in cleaned
+    assert "Portale" in cleaned
+    assert "API REST" in cleaned
+
+
+def test_player_skips_headers_and_footers_when_enabled(tmp_path):
+    from hermes_voice.models import DocumentPage, ExtractedDocument, SentenceSpan
+    from hermes_voice.player import DocumentPlayer
+
+    doc = ExtractedDocument(
+        doc_id="skip-hdr-doc",
+        file_path=str(tmp_path / "dummy.pdf"),
+        title="Doc con Header",
+        total_pages=2,
+        pages=[
+            DocumentPage(
+                page_number=1,
+                text="HEADER\nCorpo uno.\nFooter | Pagina 1",
+                sentences=[
+                    SentenceSpan(sentence_index=0, page_number=1, text="HEADER", is_header_footer=True),
+                    SentenceSpan(sentence_index=1, page_number=1, text="Corpo uno.", is_header_footer=False),
+                    SentenceSpan(sentence_index=2, page_number=1, text="Footer | Pagina 1", is_header_footer=True),
+                ],
+            ),
+            DocumentPage(
+                page_number=2,
+                text="HEADER\nCorpo due.\nFooter | Pagina 2",
+                sentences=[
+                    SentenceSpan(sentence_index=3, page_number=2, text="HEADER", is_header_footer=True),
+                    SentenceSpan(sentence_index=4, page_number=2, text="Corpo due.", is_header_footer=False),
+                    SentenceSpan(sentence_index=5, page_number=2, text="Footer | Pagina 2", is_header_footer=True),
+                ],
+            ),
+        ],
+        all_sentences=[
+            SentenceSpan(sentence_index=0, page_number=1, text="HEADER", is_header_footer=True),
+            SentenceSpan(sentence_index=1, page_number=1, text="Corpo uno.", is_header_footer=False),
+            SentenceSpan(sentence_index=2, page_number=1, text="Footer | Pagina 1", is_header_footer=True),
+            SentenceSpan(sentence_index=3, page_number=2, text="HEADER", is_header_footer=True),
+            SentenceSpan(sentence_index=4, page_number=2, text="Corpo due.", is_header_footer=False),
+            SentenceSpan(sentence_index=5, page_number=2, text="Footer | Pagina 2", is_header_footer=True),
+        ],
+    )
+
+    player = DocumentPlayer(
+        bookmark_path=tmp_path / "bm.json",
+        virtual_playback=True,
+    )
+    bm = player.load_document(doc, resume_from_bookmark=False)
+    assert player.skip_headers_footers is True
+    # Initial index skips leading HEADER (0 -> 1)
+    assert bm.current_sentence_index == 1
+
+    # seek_to_page(2) jumps directly to first readable body sentence (4), skipping page 2 HEADER (3)
+    bm_p2 = player.seek_to_page(2)
+    assert bm_p2.current_sentence_index == 4
+
+    # Disabling header skip restores raw index 3 on page 2
+    player.set_skip_headers_footers(False)
+    bm_p2_raw = player.seek_to_page(2)
+    assert bm_p2_raw.current_sentence_index == 3
+
+
 
 
 

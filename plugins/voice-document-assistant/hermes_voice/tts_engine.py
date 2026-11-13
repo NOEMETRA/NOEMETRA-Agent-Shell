@@ -330,6 +330,42 @@ def _normalize_dates(text: str) -> str:
     return s
 
 
+def clean_markdown_for_speech(text: str) -> str:
+    """Strip Markdown formatting and inline citation tags so Analyst replies sound natural when spoken."""
+    if not text or not text.strip():
+        return ""
+    s = str(text)
+    # Remove inline page citation tags like [Pagina 3] or [Pag. 3]
+    s = re.sub(r"\[Pag(?:ina)?\.?\s*\d+\]", "", s, flags=re.IGNORECASE)
+    # Replace Markdown links [label](url) with label
+    s = re.sub(r"\[([^\]]+)\]\(https?://[^)\s]+\)", r"\1", s)
+    # Strip fenced code block markers
+    s = re.sub(r"```[a-zA-Z0-9_-]*", " ", s)
+    # Strip inline code backticks and emphasis markers
+    s = re.sub(r"[`*_~]+", "", s)
+    # Clean per-line headings, blockquotes, list bullets, and table pipes
+    cleaned_lines: list[str] = []
+    for raw_line in s.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$", line):
+            continue
+        if re.match(r"^[-=]{3,}$", line):
+            continue
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^>+\s*", "", line)
+        line = re.sub(r"^(?:[-*•▪◦‣])\s+", "", line)
+        if "|" in line:
+            line = ", ".join(c.strip() for c in line.strip("|").split("|") if c.strip())
+        if line:
+            line = re.sub(r"\s+([.,!?;:])", r"\1", line)
+            if line[-1] not in ".!?:,;":
+                line += "."
+            cleaned_lines.append(line)
+    return " ".join(cleaned_lines).strip()
+
+
 def normalize_text_for_tts(text: str) -> str:
     """Deterministically normalize technical Italian text for Pocket TTS pronunciation.
 

@@ -122,3 +122,33 @@ def test_extractor_splits_all_caps_heading_before_body_text():
             "Il sistema usa REST API dal 13/11/2026.",
         ]
 
+
+def test_extractor_tags_repeated_headers_and_footers_verbatim():
+    import pymupdf
+
+    extractor = DocumentExtractor()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "multipage_headers.pdf"
+        doc = pymupdf.open()
+        for page_num, body in [(1, "Contenuto prima pagina reale."), (2, "Contenuto seconda pagina reale.")]:
+            page = doc.new_page()
+            page.insert_text((50, 40), "HORIZON / TOPNETWORK - CONFRONTO TECNICO")
+            page.insert_text((50, 120), body)
+            page.insert_text((50, 800), f"9 novembre 2026 - Documento | Pagina {page_num}")
+        doc.save(str(pdf_path))
+        doc.close()
+
+        extracted = extractor.extract(pdf_path)
+        p1_flags = [(s.text, s.is_header_footer) for s in extracted.pages[0].sentences]
+        p2_flags = [(s.text, s.is_header_footer) for s in extracted.pages[1].sentences]
+        assert p1_flags == [
+            ("HORIZON / TOPNETWORK - CONFRONTO TECNICO", True),
+            ("Contenuto prima pagina reale.", False),
+            ("9 novembre 2026 - Documento | Pagina 1", True),
+        ]
+        assert p2_flags == [
+            ("HORIZON / TOPNETWORK - CONFRONTO TECNICO", True),
+            ("Contenuto seconda pagina reale.", False),
+            ("9 novembre 2026 - Documento | Pagina 2", True),
+        ]
+
