@@ -10,6 +10,19 @@
   font-size: var(--titlebar-icon-size);
 }
 
+svg.codicon {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  vertical-align: middle;
+  flex-shrink: 0;
+  font-family: inherit;
+}
+
+svg.codicon::before {
+  content: none !important;
+}
+
 /* v4 gates hover: on @media (hover: hover). Some Windows hosts with a
    digitizer answer false even with a mouse, so hover-reveal controls stay
    opacity-0 (clickable, invisible). Trust :hover itself. */

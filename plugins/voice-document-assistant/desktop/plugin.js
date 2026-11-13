@@ -29,16 +29,18 @@ const ASK_REQUEST_TIMEOUT_MS = 240000
 const AUDIO_SYNTH_TIMEOUT_MS = 120000
 const DOCUMENT_LOAD_TIMEOUT_MS = 120000
 
-// Custom styling adhering to Hermes theme CSS variables
+// Modern NOEMETRA Glass & Obsidian Styling synced with Hermes theme variables
 const CSS = `
 .hv-container {
   display: flex;
   flex-direction: column;
   height: 100%;
   width: 100%;
-  background: var(--ui-bg-app, #121316);
-  color: var(--ui-text-primary, #e4e4e7);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: radial-gradient(circle at 12% 0%, color-mix(in srgb, var(--primary, #22d3ee) 7%, transparent), transparent 42%),
+              radial-gradient(circle at 88% 15%, rgba(79, 70, 229, 0.08), transparent 45%),
+              var(--background, #080c14);
+  color: var(--foreground, #f1f5f9);
+  font-family: "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   overflow: hidden;
 }
 
@@ -46,9 +48,10 @@ const CSS = `
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 18px;
-  background: var(--ui-bg-surface, #18191d);
-  border-bottom: 1px solid var(--ui-stroke-secondary, #27272a);
+  padding: 12px 20px;
+  background: color-mix(in srgb, var(--card, #0d1320) 82%, transparent);
+  backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.16));
   gap: 12px;
   flex-wrap: wrap;
 }
@@ -59,78 +62,171 @@ const CSS = `
   gap: 10px;
 }
 
+.hv-logo-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(34, 211, 238, 0.18), rgba(79, 70, 229, 0.22));
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  color: var(--primary, #22d3ee);
+  box-shadow: 0 0 18px rgba(34, 211, 238, 0.14);
+}
+
 .hv-title {
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  color: var(--ui-text-primary, #ffffff);
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--foreground, #f8fafc);
 }
 
 .hv-badge {
-  font-size: 11px;
-  font-weight: 500;
-  padding: 2px 7px;
-  border-radius: 4px;
-  background: var(--ui-badge-bg, rgba(255,255,255,0.08));
-  color: var(--ui-text-secondary, #a1a1aa);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 3px 9px;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--muted, #131b2c) 85%, transparent);
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.18));
+  color: var(--muted-foreground, #94a3b8);
+}
+
+.hv-badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--muted-foreground, #64748b);
 }
 
 .hv-badge-active {
-  background: rgba(34, 197, 94, 0.15);
-  color: #22c55e;
-  border: 1px solid rgba(34, 197, 94, 0.3);
+  background: rgba(34, 211, 238, 0.12);
+  color: #22d3ee;
+  border-color: rgba(34, 211, 238, 0.35);
+}
+
+.hv-badge-active .hv-badge-dot {
+  background: #22d3ee;
+  box-shadow: 0 0 8px #22d3ee;
+  animation: hv-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes hv-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.85); }
 }
 
 .hv-header-actions {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .hv-btn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
-  padding: 5px 12px;
-  border-radius: 6px;
+  padding: 6px 13px;
+  border-radius: 10px;
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
-  border: 1px solid var(--ui-stroke-secondary, #3f3f46);
-  background: var(--ui-btn-bg, #27272a);
-  color: var(--ui-text-primary, #ffffff);
-  transition: all 0.15s ease;
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.2));
+  background: color-mix(in srgb, var(--card, #0d1320) 90%, var(--foreground, #fff) 4%);
+  color: var(--foreground, #f1f5f9);
+  transition: all 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-.hv-btn:hover {
-  background: var(--ui-btn-hover, #3f3f46);
-  border-color: var(--ui-stroke-primary, #52525b);
+.hv-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--card, #0d1320) 80%, var(--primary, #22d3ee) 10%);
+  border-color: color-mix(in srgb, var(--primary, #22d3ee) 45%, transparent);
+  transform: translateY(-0.5px);
+}
+
+.hv-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.hv-btn-icon {
+  padding: 6px 8px;
+  border-radius: 9px;
 }
 
 .hv-btn-primary {
-  background: var(--ui-accent, #3b82f6);
-  border-color: var(--ui-accent, #3b82f6);
+  background: linear-gradient(135deg, #06b6d4, #4f46e5);
+  border-color: rgba(34, 211, 238, 0.4);
   color: #ffffff;
+  font-weight: 600;
+  box-shadow: 0 4px 14px rgba(6, 182, 212, 0.22);
 }
 
-.hv-btn-primary:hover {
-  background: var(--ui-accent-hover, #2563eb);
+.hv-btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, #22d3ee, #6366f1);
+  border-color: rgba(34, 211, 238, 0.7);
+  box-shadow: 0 6px 20px rgba(34, 211, 238, 0.3);
+}
+
+.hv-play-hero {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border: 1px solid rgba(34, 211, 238, 0.45);
+  background: linear-gradient(135deg, #06b6d4, #4f46e5);
+  color: #ffffff;
+  box-shadow: 0 4px 16px rgba(6, 182, 212, 0.28);
+  transition: all 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+  flex-shrink: 0;
+}
+
+.hv-play-hero:hover:not(:disabled) {
+  transform: scale(1.05);
+  box-shadow: 0 6px 22px rgba(34, 211, 238, 0.4);
+}
+
+.hv-play-hero:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .hv-btn-danger {
-  background: rgba(239, 68, 68, 0.15);
-  border-color: rgba(239, 68, 68, 0.4);
-  color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.28);
+  color: #f87171;
+}
+
+.hv-btn-danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.18);
+  border-color: rgba(239, 68, 68, 0.5);
 }
 
 .hv-select {
-  padding: 5px 8px;
-  border-radius: 6px;
-  background: var(--ui-btn-bg, #27272a);
-  border: 1px solid var(--ui-stroke-secondary, #3f3f46);
-  color: var(--ui-text-primary, #ffffff);
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--card, #0d1320) 92%, var(--foreground, #fff) 3%);
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.2));
+  color: var(--foreground, #f1f5f9);
   font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.hv-select:hover, .hv-select:focus {
+  border-color: color-mix(in srgb, var(--primary, #22d3ee) 55%, transparent);
 }
 
 .hv-main-grid {
@@ -150,8 +246,8 @@ const CSS = `
 .hv-doc-column {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--ui-stroke-secondary, #27272a);
-  background: var(--ui-bg-app, #121316);
+  border-right: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.16));
+  background: transparent;
   overflow: hidden;
 }
 
@@ -159,63 +255,132 @@ const CSS = `
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--ui-stroke-secondary, #27272a);
-  background: var(--ui-bg-surface, #18191d);
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.14));
+  background: color-mix(in srgb, var(--card, #0d1320) 60%, transparent);
+  gap: 10px;
+}
+
+.hv-doc-title-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--foreground, #f1f5f9);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .hv-page-controls {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground, #94a3b8);
+  flex-shrink: 0;
 }
 
 .hv-doc-content {
   flex: 1;
-  padding: 24px;
+  padding: 28px 32px;
   overflow-y: auto;
-  line-height: 1.7;
-  font-size: 14px;
+  line-height: 1.85;
+  font-size: 14.5px;
+  color: color-mix(in srgb, var(--foreground, #f1f5f9) 90%, transparent);
+}
+
+.hv-empty-doc {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  height: 100%;
+  min-height: 220px;
+  gap: 12px;
+  color: var(--muted-foreground, #94a3b8);
+}
+
+.hv-empty-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--primary, #22d3ee) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary, #22d3ee) 25%, transparent);
+  color: var(--primary, #22d3ee);
+  font-size: 20px;
 }
 
 .hv-sentence {
   display: inline;
-  padding: 2px 3px;
-  border-radius: 3px;
+  padding: 2px 4px;
+  border-radius: 5px;
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition: background 0.16s ease, color 0.16s ease;
 }
 
 .hv-sentence:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: color-mix(in srgb, var(--foreground, #fff) 7%, transparent);
 }
 
 .hv-sentence-active {
-  background: rgba(245, 158, 11, 0.25) !important;
-  color: #fbbf24 !important;
-  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.5);
+  background: linear-gradient(90deg, rgba(34, 211, 238, 0.18), rgba(79, 70, 229, 0.16)) !important;
+  color: var(--foreground, #ffffff) !important;
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.42);
   font-weight: 500;
 }
 
 .hv-panel-column {
   display: flex;
   flex-direction: column;
-  background: var(--ui-bg-surface, #18191d);
+  background: color-mix(in srgb, var(--card, #0d1320) 55%, transparent);
   overflow: hidden;
 }
 
 .hv-player-box {
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--ui-stroke-secondary, #27272a);
-  background: var(--ui-bg-card, #1c1d22);
+  margin: 14px 16px 0 16px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.18));
+  background: color-mix(in srgb, var(--card, #0d1320) 88%, var(--primary, #22d3ee) 3%);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
 }
 
 .hv-player-controls {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
+}
+
+.hv-eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2.5px;
+  height: 14px;
+  padding: 0 4px;
+}
+
+.hv-eq span {
+  width: 2.5px;
+  border-radius: 9999px;
+  background: #22d3ee;
+  animation: hv-eq-bar 0.9s ease-in-out infinite;
+}
+
+.hv-eq span:nth-child(2) { animation-delay: 0.2s; }
+.hv-eq span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes hv-eq-bar {
+  0%, 100% { height: 4px; opacity: 0.55; }
+  50% { height: 14px; opacity: 1; }
 }
 
 .hv-timeline {
@@ -223,35 +388,36 @@ const CSS = `
   align-items: center;
   gap: 10px;
   font-size: 11px;
-  color: var(--ui-text-tertiary, #71717a);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground, #94a3b8);
 }
 
 .hv-progress-bar {
   flex: 1;
-  height: 5px;
-  background: var(--ui-stroke-secondary, #3f3f46);
-  border-radius: 3px;
+  height: 6px;
+  background: color-mix(in srgb, var(--foreground, #fff) 10%, transparent);
+  border-radius: 9999px;
   overflow: hidden;
   position: relative;
 }
 
 .hv-progress-fill {
   height: 100%;
-  background: var(--ui-accent, #3b82f6);
-  transition: width 0.2s ease;
+  border-radius: 9999px;
+  background: linear-gradient(90deg, #06b6d4, #6366f1);
+  transition: width 0.25s ease;
 }
 
 .hv-agents-box {
-  padding: 12px 18px;
-  border-bottom: 1px solid var(--ui-stroke-secondary, #27272a);
-  background: var(--ui-bg-surface, #18191d);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.14));
 }
 
 .hv-agents-title {
-  font-size: 11px;
+  font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--ui-text-tertiary, #71717a);
+  letter-spacing: 0.08em;
+  color: var(--muted-foreground, #94a3b8);
   margin-bottom: 8px;
   font-weight: 600;
 }
@@ -263,25 +429,47 @@ const CSS = `
 }
 
 .hv-agent-card {
-  padding: 8px;
-  border-radius: 6px;
-  background: var(--ui-bg-app, #121316);
-  border: 1px solid var(--ui-stroke-secondary, #27272a);
+  padding: 9px 11px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--card, #0d1320) 90%, var(--foreground, #fff) 2%);
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.16));
   font-size: 11px;
+  transition: border-color 0.2s ease;
 }
 
 .hv-agent-name {
   font-weight: 600;
   display: flex;
   align-items: center;
-  gap: 5px;
-  margin-bottom: 3px;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: var(--foreground, #f1f5f9);
+}
+
+.hv-agent-icon {
+  color: var(--primary, #22d3ee);
+  display: inline-flex;
+  align-items: center;
 }
 
 .hv-agent-status {
-  font-size: 10px;
-  color: var(--ui-text-secondary, #a1a1aa);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  color: var(--muted-foreground, #94a3b8);
 }
+
+.hv-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+
+.hv-dot-ok { background: #10b981; }
+.hv-dot-busy { background: #22d3ee; box-shadow: 0 0 8px #22d3ee; animation: hv-pulse 1.2s infinite; }
+.hv-dot-warn { background: #f59e0b; }
 
 .hv-chat-section {
   display: flex;
@@ -307,41 +495,43 @@ const CSS = `
 
 .hv-msg-user {
   align-self: flex-end;
-  background: var(--ui-accent, #3b82f6);
+  background: linear-gradient(135deg, #0891b2, #4338ca);
   color: #ffffff;
-  padding: 8px 12px;
-  border-radius: 8px 8px 2px 8px;
+  padding: 9px 14px;
+  border-radius: 14px 14px 4px 14px;
   max-width: 85%;
   font-size: 13px;
+  line-height: 1.5;
+  box-shadow: 0 4px 14px rgba(8, 145, 178, 0.22);
 }
 
 .hv-msg-assistant {
   align-self: flex-start;
-  background: var(--ui-bg-card, #222329);
-  border: 1px solid var(--ui-stroke-secondary, #2f3037);
-  padding: 10px 14px;
-  border-radius: 8px 8px 8px 2px;
-  max-width: 90%;
+  background: color-mix(in srgb, var(--card, #0d1320) 92%, var(--foreground, #fff) 3%);
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.18));
+  padding: 12px 15px;
+  border-radius: 14px 14px 14px 4px;
+  max-width: 92%;
   font-size: 13px;
-  line-height: 1.5;
+  line-height: 1.58;
 }
 
 .hv-citations-row {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 
 .hv-citation-badge {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 7px;
-  border-radius: 4px;
-  background: rgba(59, 130, 246, 0.15);
-  border: 1px solid rgba(59, 130, 246, 0.35);
-  color: #60a5fa;
+  padding: 3px 9px;
+  border-radius: 9999px;
+  background: rgba(34, 211, 238, 0.1);
+  border: 1px solid rgba(34, 211, 238, 0.32);
+  color: #22d3ee;
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
@@ -349,33 +539,37 @@ const CSS = `
 }
 
 .hv-citation-badge:hover {
-  background: rgba(59, 130, 246, 0.3);
-  border-color: #60a5fa;
+  background: rgba(34, 211, 238, 0.22);
+  border-color: #22d3ee;
 }
 
 .hv-verification-box {
-  margin-top: 8px;
-  padding: 6px 10px;
-  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 7px 10px;
+  border-radius: 9px;
   font-size: 11px;
+  font-weight: 500;
 }
 
 .hv-verification-valid {
-  background: rgba(34, 197, 94, 0.1);
-  border: 1px solid rgba(34, 197, 94, 0.3);
-  color: #4ade80;
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.28);
+  color: #34d399;
 }
 
 .hv-verification-invalid {
-  background: rgba(239, 68, 68, 0.1);
-  border: 1px solid rgba(239, 68, 68, 0.3);
-  color: #f87171;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  color: #fbbf24;
 }
 
 .hv-chat-input-bar {
-  padding: 10px 18px;
-  border-top: 1px solid var(--ui-stroke-secondary, #27272a);
-  background: var(--ui-bg-surface, #18191d);
+  padding: 10px 16px;
+  border-top: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.14));
+  background: color-mix(in srgb, var(--card, #0d1320) 75%, transparent);
   display: flex;
   gap: 8px;
   align-items: center;
@@ -383,35 +577,44 @@ const CSS = `
 
 .hv-input {
   flex: 1;
-  padding: 8px 12px;
-  border-radius: 6px;
-  border: 1px solid var(--ui-stroke-secondary, #3f3f46);
-  background: var(--ui-bg-app, #121316);
-  color: var(--ui-text-primary, #ffffff);
+  padding: 9px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.22));
+  background: var(--background, #080c14);
+  color: var(--foreground, #f1f5f9);
   font-size: 13px;
   outline: none;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
 .hv-input:focus {
-  border-color: var(--ui-accent, #3b82f6);
+  border-color: var(--primary, #22d3ee);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary, #22d3ee) 20%, transparent);
 }
 
 .hv-privacy-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 18px;
-  background: var(--ui-bg-app, #121316);
-  border-top: 1px solid var(--ui-stroke-secondary, #27272a);
+  padding: 8px 18px;
+  background: color-mix(in srgb, var(--background, #080c14) 92%, transparent);
+  border-top: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.14));
   font-size: 11px;
-  color: var(--ui-text-tertiary, #71717a);
+  color: var(--muted-foreground, #94a3b8);
+}
+
+.hv-privacy-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .hv-toggle-label {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 6px;
   cursor: pointer;
+  user-select: none;
 }
 `
 
@@ -1099,11 +1302,17 @@ function VoiceDocumentPage({ ctx, controller }) {
           jsxs('div', {
             className: 'hv-title-group',
             children: [
-              jsx(Codicon, { name: 'book', size: '1.2rem' }),
-              jsx('span', { className: 'hv-title', children: 'NOEMETRA Voice Assistant' }),
               jsx('span', {
+                className: 'hv-logo-pill',
+                children: jsx(Codicon, { name: 'audio-lines', size: '1.1rem' })
+              }),
+              jsx('span', { className: 'hv-title', children: 'NOEMETRA Voice' }),
+              jsxs('span', {
                 className: `hv-badge ${isPlaying ? 'hv-badge-active' : ''}`,
-                children: status?.state ? status.state.toUpperCase() : 'DISCONNESSO'
+                children: [
+                  jsx('span', { className: 'hv-badge-dot' }),
+                  status?.state ? status.state.toUpperCase() : 'DISCONNESSO'
+                ]
               })
             ]
           }),
@@ -1135,7 +1344,7 @@ function VoiceDocumentPage({ ctx, controller }) {
                 className: 'hv-btn',
                 onClick: () => fileInputRef.current?.click(),
                 children: [
-                  jsx(Codicon, { name: 'cloud-upload' }),
+                  jsx(Codicon, { name: 'cloud-upload', size: '0.95rem' }),
                   'Carica PDF'
                 ]
               }),
@@ -1172,7 +1381,7 @@ function VoiceDocumentPage({ ctx, controller }) {
         style: {
           background: 'rgba(234, 88, 12, 0.12)',
           border: '1px solid #ea580c',
-          borderRadius: '8px',
+          borderRadius: '12px',
           padding: '12px 16px',
           margin: '12px 20px 0 20px',
           color: '#f97316',
@@ -1189,7 +1398,7 @@ function VoiceDocumentPage({ ctx, controller }) {
             style: {
               background: '#0f172a',
               padding: '6px 10px',
-              borderRadius: '4px',
+              borderRadius: '6px',
               fontFamily: 'monospace',
               color: '#38bdf8',
               margin: '6px 0',
@@ -1215,25 +1424,28 @@ function VoiceDocumentPage({ ctx, controller }) {
               jsxs('div', {
                 className: 'hv-doc-toolbar',
                 children: [
-                  jsx('span', {
-                    style: { fontWeight: 500, fontSize: '13px' },
-                    children: docData?.title || 'Nessun documento attivo'
+                  jsxs('span', {
+                    className: 'hv-doc-title-pill',
+                    children: [
+                      jsx(Codicon, { name: 'book', size: '0.95rem' }),
+                      docData?.title || 'Nessun documento attivo'
+                    ]
                   }),
                   jsxs('div', {
                     className: 'hv-page-controls',
                     children: [
                       jsx('button', {
-                        className: 'hv-btn',
+                        className: 'hv-btn hv-btn-icon',
                         disabled: viewPage <= 1,
                         onClick: () => handleSeekPage(viewPage - 1),
-                        children: jsx(Codicon, { name: 'chevron-left' })
+                        children: jsx(Codicon, { name: 'chevron-left', size: '0.9rem' })
                       }),
-                      jsx('span', { children: `Pagina ${viewPage} di ${totalPages}` }),
+                      jsx('span', { children: `Pagina ${viewPage} / ${totalPages}` }),
                       jsx('button', {
-                        className: 'hv-btn',
+                        className: 'hv-btn hv-btn-icon',
                         disabled: viewPage >= totalPages,
                         onClick: () => handleSeekPage(viewPage + 1),
-                        children: jsx(Codicon, { name: 'chevron-right' })
+                        children: jsx(Codicon, { name: 'chevron-right', size: '0.9rem' })
                       })
                     ]
                   })
@@ -1251,9 +1463,20 @@ function VoiceDocumentPage({ ctx, controller }) {
                         children: sent.text + ' '
                       }, sent.sentence_index)
                     })
-                  : jsx('div', {
-                      style: { color: 'var(--ui-text-tertiary)', textAlign: 'center', marginTop: '40px' },
-                      children: docData ? 'Questa pagina non contiene testo estratto.' : 'Carica un file PDF italiano o selezionalo dalla biblioteca per visualizzarlo.'
+                  : jsxs('div', {
+                      className: 'hv-empty-doc',
+                      children: [
+                        jsx('div', {
+                          className: 'hv-empty-icon',
+                          children: jsx(Codicon, { name: docData ? 'warning' : 'cloud-upload', size: '1.35rem' })
+                        }),
+                        jsx('div', {
+                          style: { maxWidth: '340px', fontSize: '13px', lineHeight: 1.55 },
+                          children: docData
+                            ? 'Questa pagina non contiene testo estratto.'
+                            : 'Carica un file PDF italiano o selezionalo dalla biblioteca per avviare la lettura neurale e la verifica documentale.'
+                        })
+                      ]
                     })
               })
             ]
@@ -1263,7 +1486,7 @@ function VoiceDocumentPage({ ctx, controller }) {
           jsxs('div', {
             className: 'hv-panel-column',
             children: [
-              // Playback Box
+              // Modern Player Card
               jsxs('div', {
                 className: 'hv-player-box',
                 children: [
@@ -1271,37 +1494,46 @@ function VoiceDocumentPage({ ctx, controller }) {
                     className: 'hv-player-controls',
                     children: [
                       !isPlaying
-                        ? jsxs('button', {
-                            className: 'hv-btn hv-btn-primary',
+                        ? jsx('button', {
+                            className: 'hv-play-hero',
                             onClick: isPaused ? handleResume : handlePlay,
                             disabled: !docData,
-                            children: [
-                              jsx(Codicon, { name: 'play' }),
-                              isPaused ? 'Riprendi' : 'Ascolta'
-                            ]
+                            title: isPaused ? 'Riprendi ascolto' : 'Ascolta documento',
+                            children: jsx(Codicon, { name: 'play', size: '1.05rem', style: { marginLeft: '2px' } })
                           })
-                        : jsxs('button', {
-                            className: 'hv-btn',
+                        : jsx('button', {
+                            className: 'hv-play-hero',
                             onClick: handlePause,
-                            children: [
-                              jsx(Codicon, { name: 'debug-pause' }),
-                              'Pausa'
-                            ]
+                            title: 'Metti in pausa',
+                            children: jsx(Codicon, { name: 'debug-pause', size: '1.05rem' })
                           }),
                       jsxs('button', {
                         className: 'hv-btn hv-btn-danger',
                         onClick: handleStop,
                         disabled: !status || status.state === 'stopped' || status.state === 'idle',
                         children: [
-                          jsx(Codicon, { name: 'debug-stop' }),
+                          jsx(Codicon, { name: 'debug-stop', size: '0.85rem' }),
                           'Stop'
                         ]
                       }),
+                      isPlaying && jsxs('div', {
+                        className: 'hv-eq',
+                        'aria-hidden': 'true',
+                        children: [jsx('span', {}), jsx('span', {}), jsx('span', {})]
+                      }),
                       jsx('span', {
-                        style: { marginLeft: 'auto', fontSize: '11px', color: 'var(--ui-text-secondary)' },
+                        style: {
+                          marginLeft: 'auto',
+                          fontSize: '11.5px',
+                          color: 'var(--muted-foreground, #94a3b8)',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          maxWidth: '220px'
+                        },
                         children: status?.current_sentence_text
-                          ? `In lettura: "${status.current_sentence_text.slice(0, 40)}..."`
-                          : ''
+                          ? `"${status.current_sentence_text.slice(0, 48)}..."`
+                          : (isPaused ? 'In pausa' : 'Pronto alla lettura')
                       })
                     ]
                   }),
@@ -1335,7 +1567,7 @@ function VoiceDocumentPage({ ctx, controller }) {
               jsxs('div', {
                 className: 'hv-agents-box',
                 children: [
-                  jsx('div', { className: 'hv-agents-title', children: 'Stato Reale Triade Multi-Agente' }),
+                  jsx('div', { className: 'hv-agents-title', children: 'Triade Multi-Agente' }),
                   jsxs('div', {
                     className: 'hv-agents-cards',
                     children: [
@@ -1344,11 +1576,17 @@ function VoiceDocumentPage({ ctx, controller }) {
                         children: [
                           jsxs('div', {
                             className: 'hv-agent-name',
-                            children: ['📚 Bibliotecario']
+                            children: [
+                              jsx('span', { className: 'hv-agent-icon', children: jsx(Codicon, { name: 'library', size: '0.9rem' }) }),
+                              'Bibliotecario'
+                            ]
                           }),
-                          jsx('div', {
+                          jsxs('div', {
                             className: 'hv-agent-status',
-                            children: status?.agents?.librarian === 'searching' ? '🔍 Ricerca...' : '✅ Indicizzato'
+                            children: [
+                              jsx('span', { className: `hv-status-dot ${status?.agents?.librarian === 'searching' ? 'hv-dot-busy' : 'hv-dot-ok'}` }),
+                              status?.agents?.librarian === 'searching' ? 'Ricerca...' : 'Indicizzato'
+                            ]
                           })
                         ]
                       }),
@@ -1357,13 +1595,17 @@ function VoiceDocumentPage({ ctx, controller }) {
                         children: [
                           jsxs('div', {
                             className: 'hv-agent-name',
-                            children: ['🧠 Analista']
+                            children: [
+                              jsx('span', { className: 'hv-agent-icon', children: jsx(Codicon, { name: 'chip', size: '0.9rem' }) }),
+                              'Analista'
+                            ]
                           }),
-                          jsx('div', {
+                          jsxs('div', {
                             className: 'hv-agent-status',
-                            children: isAsking || status?.agents?.analyst === 'generating'
-                              ? '⏳ Generazione LLM...'
-                              : '✅ Pronto (Ollama)'
+                            children: [
+                              jsx('span', { className: `hv-status-dot ${isAsking || status?.agents?.analyst === 'generating' ? 'hv-dot-busy' : 'hv-dot-ok'}` }),
+                              isAsking || status?.agents?.analyst === 'generating' ? 'Generazione...' : 'Ollama Pronto'
+                            ]
                           })
                         ]
                       }),
@@ -1372,15 +1614,25 @@ function VoiceDocumentPage({ ctx, controller }) {
                         children: [
                           jsxs('div', {
                             className: 'hv-agent-name',
-                            children: ['🔍 Verificatore']
+                            children: [
+                              jsx('span', { className: 'hv-agent-icon', children: jsx(Codicon, { name: 'shield-check', size: '0.9rem' }) }),
+                              'Verificatore'
+                            ]
                           }),
-                          jsx('div', {
+                          jsxs('div', {
                             className: 'hv-agent-status',
-                            children: status?.agents?.verifier === 'valid'
-                              ? '✅ Citazioni Convalidate'
-                              : status?.agents?.verifier === 'invalid'
-                              ? '⚠️ Rilevate Discrepanze'
-                              : '✅ Pronto'
+                            children: [
+                              jsx('span', {
+                                className: `hv-status-dot ${
+                                  status?.agents?.verifier === 'invalid' ? 'hv-dot-warn' : 'hv-dot-ok'
+                                }`
+                              }),
+                              status?.agents?.verifier === 'valid'
+                                ? 'Convalidato'
+                                : status?.agents?.verifier === 'invalid'
+                                ? 'Discrepanze'
+                                : 'Pronto'
+                            ]
                           })
                         ]
                       })
@@ -1396,9 +1648,20 @@ function VoiceDocumentPage({ ctx, controller }) {
                   jsx('div', {
                     className: 'hv-chat-history',
                     children: chatMessages.length === 0
-                      ? jsx('div', {
-                          style: { color: 'var(--ui-text-tertiary)', textAlign: 'center', marginTop: '40px', fontSize: '13px' },
-                          children: 'Poni una domanda sul documento. L\'Analista risponderà basandosi sulle evidenze estratte e il Verificatore convaliderà ogni numero di pagina.'
+                      ? jsxs('div', {
+                          className: 'hv-empty-doc',
+                          style: { minHeight: '140px' },
+                          children: [
+                            jsx('div', {
+                              className: 'hv-empty-icon',
+                              style: { width: '38px', height: '38px', borderRadius: '11px' },
+                              children: jsx(Codicon, { name: 'sparkle', size: '1.1rem' })
+                            }),
+                            jsx('div', {
+                              style: { maxWidth: '320px', fontSize: '12.5px', lineHeight: 1.55 },
+                              children: 'Poni una domanda sul documento. L\'Analista risponderà basandosi sulle evidenze estratte e il Verificatore convaliderà ogni numero di pagina.'
+                            })
+                          ]
                         })
                       : chatMessages.map((msg, i) => {
                           if (msg.role === 'user') {
@@ -1422,23 +1685,29 @@ function VoiceDocumentPage({ ctx, controller }) {
                                       className: 'hv-citations-row',
                                       children: [
                                         jsx('span', {
-                                          style: { fontSize: '11px', color: 'var(--ui-text-secondary)', alignSelf: 'center' },
-                                          children: 'Citazioni verificabili:'
+                                          style: { fontSize: '11px', color: 'var(--muted-foreground, #94a3b8)', alignSelf: 'center' },
+                                          children: 'Fonti:'
                                         }),
-                                        msg.citations.map((cit, cIdx) => jsx('button', {
+                                        msg.citations.map((cit, cIdx) => jsxs('button', {
                                           className: 'hv-citation-badge',
                                           onClick: () => handleSeekCitation(msg.doc_id, cit.page_number),
                                           title: `Clicca per aprire Pagina ${cit.page_number}\n"${cit.verbatim_quote}"`,
-                                          children: `[Pagina ${cit.page_number}]`
+                                          children: [
+                                            jsx(Codicon, { name: 'link-external', size: '0.7rem' }),
+                                            `Pag. ${cit.page_number}`
+                                          ]
                                         }, cIdx))
                                       ]
                                     }),
                                     // Verification Badge
-                                    msg.verification && jsx('div', {
+                                    msg.verification && jsxs('div', {
                                       className: `hv-verification-box ${isValid ? 'hv-verification-valid' : 'hv-verification-invalid'}`,
-                                      children: isValid
-                                        ? `✅ Verificatore: ${msg.verification.notes || 'Citazioni convalidate con precisione del 100%'}`
-                                        : `⚠️ Verificatore: ${msg.verification.notes || 'Citazioni non conformi al testo sorgente.'}`
+                                      children: [
+                                        jsx(Codicon, { name: isValid ? 'verified-filled' : 'warning', size: '0.9rem' }),
+                                        isValid
+                                          ? `Verificatore: ${msg.verification.notes || 'Citazioni convalidate con precisione del 100%'}`
+                                          : `Verificatore: ${msg.verification.notes || 'Citazioni non conformi al testo sorgente.'}`
+                                      ]
                                     })
                                   ]
                                 })
@@ -1460,17 +1729,17 @@ function VoiceDocumentPage({ ctx, controller }) {
                         onKeyDown: (e) => { if (e.key === 'Enter') handleAsk() }
                       }),
                       jsx('button', {
-                        className: `hv-btn ${isRecording ? 'hv-btn-danger' : ''}`,
+                        className: `hv-btn hv-btn-icon ${isRecording ? 'hv-btn-danger' : ''}`,
                         onClick: toggleRecording,
                         title: 'Input microfonico vocale',
-                        children: jsx(Codicon, { name: isRecording ? 'mic-filled' : 'mic' })
+                        children: jsx(Codicon, { name: isRecording ? 'mic-filled' : 'mic', size: '0.95rem' })
                       }),
                       jsxs('button', {
                         className: 'hv-btn hv-btn-primary',
                         onClick: handleAsk,
                         disabled: isAsking || !questionInput.trim() || !docData,
                         children: [
-                          jsx(Codicon, { name: isAsking ? 'loading' : 'send' }),
+                          jsx(Codicon, { name: isAsking ? 'loading' : 'send', size: '0.9rem' }),
                           isAsking ? 'Analisi...' : 'Chiedi'
                         ]
                       })
@@ -1484,10 +1753,12 @@ function VoiceDocumentPage({ ctx, controller }) {
                 className: 'hv-privacy-bar',
                 children: [
                   jsxs('span', {
+                    className: 'hv-privacy-status',
                     children: [
-                      '🔒 Routing: ',
-                      jsx('strong', { children: 'Ollama Locale (gemma4:12b)' }),
-                      ' · Nessun dato trasmesso a terzi'
+                      jsx(Codicon, { name: 'shield-check', size: '0.9rem', style: { color: '#10b981' } }),
+                      'Routing: ',
+                      jsx('strong', { style: { color: 'var(--foreground, #f1f5f9)' }, children: 'Ollama Locale (gemma4:12b)' }),
+                      ' · Privacy locale attiva'
                     ]
                   }),
                   jsxs('label', {
@@ -1572,7 +1843,7 @@ export default {
       data: {
         path: '/voice-document',
         label: 'NOEMETRA Voice',
-        codicon: 'book'
+        codicon: 'audio-lines'
       }
     })
 
