@@ -16,7 +16,7 @@ import numpy as np
 
 from hermes_voice.models import ExtractedDocument, PlayerState, ReadingBookmark, SentenceSpan
 from hermes_voice.profile import ensure_voice_dir, resolve_voice_profile_dir
-from hermes_voice.tts_engine import PocketTTSEngine
+from hermes_voice.tts_engine import PocketTTSEngine, clean_markdown_for_speech
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ class DocumentPlayer:
         self._current_sent_idx = 0
         self._sample_offset = 0
         self._speed: float = 1.0
+        self._skip_headers_footers: bool = True
 
         self._current_audio: Optional[np.ndarray] = None
         self._current_sr: int = 24000
@@ -87,6 +88,28 @@ class DocumentPlayer:
         """Set playback speed factor (e.g. 1.0, 1.25, 1.5)."""
         with self._lock:
             self._speed = max(0.5, min(2.5, float(speed)))
+
+    @property
+    def skip_headers_footers(self) -> bool:
+        with self._lock:
+            return self._skip_headers_footers
+
+    def set_skip_headers_footers(self, enabled: bool) -> None:
+        """Enable or disable skipping repeated page headers/footers during playback."""
+        with self._lock:
+            self._skip_headers_footers = bool(enabled)
+
+    def _should_skip_sentence(self, sentence: SentenceSpan) -> bool:
+        return bool(self._skip_headers_footers and getattr(sentence, "is_header_footer", False))
+
+    def _next_playable_index(self, start_idx: int) -> int:
+        if not self._document or not self._document.all_sentences:
+            return start_idx
+        idx = max(0, start_idx)
+        total = len(self._document.all_sentences)
+        while idx < total and self._should_skip_sentence(self._document.all_sentences[idx]):
+            idx += 1
+        return idx
 
     def load_document(self, document: ExtractedDocument, resume_from_bookmark: bool = True) -> ReadingBookmark:
         """Load an extracted document and optionally restore previous bookmark."""
@@ -130,6 +153,11 @@ class DocumentPlayer:
                         )
                 except Exception as e:
                     logger.warning(f"Errore lettura bookmark da {self.bookmark_path}: {e}")
+
+            if self._state == PlayerState.IDLE and document.all_sentences:
+                first_playable = self._next_playable_index(0)
+                if first_playable < len(document.all_sentences):
+                    self._current_sent_idx = first_playable
 
             return self.get_bookmark()
 
@@ -324,15 +352,20 @@ class DocumentPlayer:
         return self.get_bookmark()
 
     def seek_to_page(self, page_number: int) -> ReadingBookmark:
-        """Jump to the first sentence of the given page."""
+        """Jump to the first readable sentence of the given page."""
         with self._lock:
             if not self._document:
                 raise ValueError("Nessun documento caricato.")
+            page_sentences = [
+                sent for sent in self._document.all_sentences if sent.page_number == page_number
+            ]
             target_idx = 0
-            for sent in self._document.all_sentences:
-                if sent.page_number == page_number:
-                    target_idx = sent.sentence_index
-                    break
+            if page_sentences:
+                readable = next(
+                    (s for s in page_sentences if not self._should_skip_sentence(s)),
+                    page_sentences[0],
+                )
+                target_idx = readable.sentence_index
         return self.seek_to_sentence(target_idx)
 
     def get_bookmark(self) -> ReadingBookmark:
@@ -366,6 +399,14 @@ class DocumentPlayer:
                 total_sentences=total,
             )
 
+    @staticmethod
+    def _encode_wav_bytes(audio_data: np.ndarray, sr: int) -> bytes:
+        import io
+        import soundfile as sf
+        buffer = io.BytesIO()
+        sf.write(buffer, audio_data, sr, format="WAV")
+        return buffer.getvalue()
+
     def get_sentence_audio_wav(self, sentence_index: int) -> bytes:
         """Synthesize and return standard WAV audio bytes for client-side playback on desktop/web."""
         with self._lock:
@@ -375,11 +416,15 @@ class DocumentPlayer:
 
         # Synthesize audio using Pocket TTS
         audio_data, sr = self.tts.synthesize(sentence.text)
-        import io
-        import soundfile as sf
-        buffer = io.BytesIO()
-        sf.write(buffer, audio_data, sr, format="WAV")
-        return buffer.getvalue()
+        return self._encode_wav_bytes(audio_data, sr)
+
+    def synthesize_text_wav(self, text: str, strip_markdown: bool = True) -> bytes:
+        """Synthesize arbitrary text (e.g. an AI Analyst reply) to WAV bytes."""
+        prepared = clean_markdown_for_speech(text) if strip_markdown else (text or "").strip()
+        if not prepared:
+            return b""
+        audio_data, sr = self.tts.synthesize(prepared)
+        return self._encode_wav_bytes(audio_data, sr)
 
     def handle_client_ack(
         self,
@@ -525,7 +570,7 @@ class DocumentPlayer:
                 audio_to_play = self._current_audio[self._sample_offset:]
                 if len(audio_to_play) == 0:
                     with self._lock:
-                        self._current_sent_idx += 1
+                        self._current_sent_idx = self._next_playable_index(self._current_sent_idx + 1)
                         self._sample_offset = 0
                         self._current_audio = None
                     continue
@@ -567,7 +612,7 @@ class DocumentPlayer:
 
                 # Sentence finished naturally
                 with self._lock:
-                    self._current_sent_idx += 1
+                    self._current_sent_idx = self._next_playable_index(self._current_sent_idx + 1)
                     self._sample_offset = 0
                     self._current_audio = None
                     self._save_bookmark()
@@ -673,7 +718,7 @@ class DocumentPlayer:
 
                 # Sentence finished
                 with self._lock:
-                    self._current_sent_idx += 1
+                    self._current_sent_idx = self._next_playable_index(self._current_sent_idx + 1)
                     self._sample_offset = 0
                     self._current_audio = None
                     self._client_started_event.clear()

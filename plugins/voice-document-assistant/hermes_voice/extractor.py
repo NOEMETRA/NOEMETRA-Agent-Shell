@@ -180,6 +180,7 @@ class DocumentExtractor:
             pages.append(doc_page)
 
         doc.close()
+        self._tag_headers_and_footers(pages)
 
         return ExtractedDocument(
             doc_id=doc_id,
@@ -190,6 +191,51 @@ class DocumentExtractor:
             all_sentences=all_sentences,
             has_scanned_pages=has_scanned,
         )
+
+    def _tag_headers_and_footers(self, pages: List[DocumentPage]) -> None:
+        """Flag repeated running headers/footers and page-number footers without altering verbatim text."""
+        if not pages:
+            return
+
+        page_footer_re = re.compile(
+            r"(?:\|\s*(?:pag(?:ina)?\.?\s*\d+(?:\s*(?:/|di)\s*\d+)?)"
+            r"|^\s*(?:pag(?:ina)?\.?\s*\d+(?:\s*(?:/|di)\s*\d+)?)\s*$)",
+            re.IGNORECASE,
+        )
+
+        def _sig(text: str) -> str:
+            low = text.strip().lower()
+            low = re.sub(r"\bpag(?:ina)?\.?\s*\d+(?:\s*(?:/|di)\s*\d+)?\b", "pagina #", low)
+            low = re.sub(r"\s+", " ", low)
+            return low
+
+        # Collect top/bottom candidates per page
+        sig_pages: dict[str, set[int]] = {}
+        marginal_spans: List[Tuple[int, SentenceSpan, str]] = []
+
+        for page in pages:
+            sents = page.sentences
+            if not sents:
+                continue
+            marginal_indices = {0, 1, len(sents) - 1, len(sents) - 2}
+            for idx, span in enumerate(sents):
+                if idx not in marginal_indices:
+                    continue
+                txt = span.text.strip()
+                if not txt or len(txt) > 150:
+                    continue
+                if page_footer_re.search(txt):
+                    span.is_header_footer = True
+                sig = _sig(txt)
+                if len(sig) >= 4:
+                    sig_pages.setdefault(sig, set()).add(page.page_number)
+                    marginal_spans.append((page.page_number, span, sig))
+
+        # Flag spans whose normalized marginal signature repeats across >= 2 pages
+        if len(pages) >= 2:
+            for _, span, sig in marginal_spans:
+                if len(sig_pages.get(sig, set())) >= 2:
+                    span.is_header_footer = True
 
     def _try_ocr(self, page: pymupdf.Page) -> Optional[str]:
         """Attempt OCR on a page using PyMuPDF and Tesseract if installed."""

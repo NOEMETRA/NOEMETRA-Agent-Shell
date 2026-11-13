@@ -279,6 +279,10 @@ class HermesVoiceAssistant:
         """Set playback speed multiplier."""
         self.player.set_speed(speed)
 
+    def set_skip_headers_footers(self, enabled: bool) -> None:
+        """Enable or disable skipping repeated page headers/footers during playback."""
+        self.player.set_skip_headers_footers(enabled)
+
     def set_allow_remote(self, allowed: bool) -> None:
         """Update explicit user authorization for remote network transmission."""
         self.router.set_allow_remote(allowed)
@@ -306,6 +310,7 @@ class HermesVoiceAssistant:
             audio_seconds_offset=bm.audio_seconds_offset,
             tts_model=self.tts.language,
             speed=self.player.speed,
+            skip_headers_footers=self.player.skip_headers_footers,
             client_playback=self.player.client_playback,
             allow_remote=self.router.allow_remote,
             home_fingerprint=compute_home_fingerprint(self.home_dir),

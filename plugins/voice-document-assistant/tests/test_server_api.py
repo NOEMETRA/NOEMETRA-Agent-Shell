@@ -1175,6 +1175,48 @@ def test_standalone_rejects_remote_clients_and_non_loopback_binding():
             standalone_run(host=bad_host)
 
 
+def test_api_skip_headers_config_and_text_tts_endpoint(monkeypatch):
+    """Verify skip_headers_footers config persistence and POST /audio/text synthesis for Analyst replies."""
+    import numpy as np
+
+    assistant = get_assistant()
+    captured_tts_inputs = []
+
+    def fake_synthesize(text: str, use_cache: bool = True):
+        captured_tts_inputs.append(text)
+        return np.ones(1200, dtype=np.float32) * 0.1, 24000
+
+    monkeypatch.setattr(assistant.tts, "synthesize", fake_synthesize)
+
+    res_cfg = client.post(
+        "/api/plugins/voice-document-assistant/playback/config",
+        json={"skip_headers_footers": False},
+    )
+    assert res_cfg.status_code == 200
+    assert res_cfg.json()["skip_headers_footers"] is False
+
+    res_status = client.get("/api/plugins/voice-document-assistant/status")
+    assert res_status.status_code == 200
+    assert res_status.json()["skip_headers_footers"] is False
+
+    res_cfg_restore = client.post(
+        "/api/plugins/voice-document-assistant/playback/config",
+        json={"skip_headers_footers": True},
+    )
+    assert res_cfg_restore.status_code == 200
+    assert res_cfg_restore.json()["skip_headers_footers"] is True
+
+    res_tts = client.post(
+        "/api/plugins/voice-document-assistant/audio/text?format=json",
+        json={"text": "### Sintesi\n\n- **Sistema** pronto [Pagina 2].", "strip_markdown": True},
+    )
+    assert res_tts.status_code == 200
+    body = res_tts.json()
+    assert body["format"] == "wav"
+    assert len(body["audio_base64"]) > 20
+    assert captured_tts_inputs == ["Sintesi. Sistema pronto."]
+
+
 
 
 

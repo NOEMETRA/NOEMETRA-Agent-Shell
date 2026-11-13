@@ -276,8 +276,14 @@ class PlaybackAckRequest(BaseModel):
 class ConfigRequest(BaseModel):
     tts_model: Optional[str] = None
     speed: Optional[float] = None
+    skip_headers_footers: Optional[bool] = None
     allow_remote: Optional[bool] = None
     llm_model: Optional[str] = None
+
+
+class SpeakTextRequest(BaseModel):
+    text: str
+    strip_markdown: bool = True
 
 
 class AskRequest(BaseModel):
@@ -605,14 +611,41 @@ async def get_sentence_audio(sentence_idx: int, request: Request):
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
+@router.post("/audio/text")
+async def synthesize_text_audio(req: SpeakTextRequest, request: Request):
+    """Synthesize spoken WAV audio from arbitrary text (e.g. Analyst Markdown summary)."""
+    assistant = _req_assistant(request)
+    wav_bytes = await asyncio.to_thread(
+        assistant.player.synthesize_text_wav,
+        req.text,
+        req.strip_markdown,
+    )
+    if not wav_bytes:
+        raise HTTPException(status_code=400, detail="Nessun testo sintetizzabile fornito.")
+
+    fmt = request.query_params.get("format", "").lower()
+    accept = request.headers.get("accept", "").lower()
+    if fmt == "json" or ("application/json" in accept and "audio/wav" not in accept):
+        b64_audio = base64.b64encode(wav_bytes).decode("ascii")
+        return {
+            "status": "success",
+            "format": "wav",
+            "audio_base64": b64_audio,
+        }
+
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
 @router.post("/playback/config")
 async def configure_playback(req: ConfigRequest, request: Request):
-    """Update TTS model, playback speed, LLM model, or privacy settings."""
+    """Update TTS model, playback speed, header/footer skipping, LLM model, or privacy settings."""
     assistant = _req_assistant(request)
     if req.tts_model:
         await asyncio.to_thread(assistant.set_tts_model, req.tts_model)
     if req.speed is not None:
         assistant.set_speed(req.speed)
+    if req.skip_headers_footers is not None:
+        assistant.set_skip_headers_footers(req.skip_headers_footers)
     if req.allow_remote is not None:
         assistant.set_allow_remote(req.allow_remote)
     if req.llm_model:
@@ -622,6 +655,7 @@ async def configure_playback(req: ConfigRequest, request: Request):
         "status": "success",
         "tts_model": assistant.tts.language,
         "speed": assistant.player.speed,
+        "skip_headers_footers": assistant.player.skip_headers_footers,
         "allow_remote": assistant.router.allow_remote,
         "llm_model": assistant.router.ollama_model,
     }
