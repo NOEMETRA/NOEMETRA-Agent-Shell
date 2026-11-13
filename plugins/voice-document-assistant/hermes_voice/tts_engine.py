@@ -111,17 +111,19 @@ _ITALIAN_MONTHS: Dict[int, str] = {
 }
 
 _ACRONYM_WHITELIST = {
-    "AI", "API", "ASCII", "BIOS", "CAD", "CAP", "CF", "CPU", "CSV", "DAC", "DB",
-    "DC", "AC", "DHCP", "DIN", "DNS", "DOM", "DRAM", "DVD", "EEPROM", "EU", "FAQ",
-    "FTP", "GB", "GPIO", "GPS", "GPU", "GUI", "HD", "HDMI", "HMI", "HTML", "HTTP",
-    "HTTPS", "ID", "IDE", "IEC", "IMAP", "IP", "ISO", "IT", "IVA", "JSON", "KB",
-    "LAN", "LCD", "LED", "LLM", "MAC", "MB", "MIDI", "MIME", "MQTT", "NFC", "NTP",
-    "OCR", "OK", "ONLUS", "OS", "PC", "PCB", "PDF", "PEC", "PIN", "PLC", "PNG",
-    "POP", "PUK", "PWM", "QR", "RAM", "REST", "RF", "RFID", "RGB", "ROM", "RPC",
-    "RS", "RSS", "RTC", "SAS", "SDK", "SEO", "SFTP", "SIM", "SIP", "SMTP", "SNC",
-    "SNMP", "SPA", "SPID", "SQL", "SRAM", "SRL", "SSD", "SSH", "SSL", "TCP", "TLS",
-    "TTS", "UART", "UDP", "UI", "UML", "UPS", "URI", "URL", "USB", "UTF", "UUID",
-    "UX", "VAT", "VLAN", "VM", "VPN", "VR", "WAN", "WLAN", "XML", "YAML",
+    "AI", "AOI", "API", "ASCII", "BIOS", "CAD", "CAP", "CF", "CNR", "CPU", "CRS",
+    "CSV", "DAC", "DB", "DC", "AC", "DHCP", "DIN", "DNS", "DOM", "DRAM", "DVD",
+    "EEPROM", "EPSG", "EU", "FAQ", "FTP", "GB", "GEOJSON", "GEOTIFF", "GPIO",
+    "GPS", "GPU", "GUI", "HD", "HDMI", "HMI", "HTML", "HTTP", "HTTPS", "ID", "IDE",
+    "IEC", "IMAP", "IP", "ISO", "IT", "IVA", "JSON", "KB", "LAN", "LCD", "LED",
+    "LLM", "LUT", "MAC", "MB", "MIDI", "MIME", "MQTT", "NFC", "NODATA", "NTP",
+    "OCR", "OK", "ONLUS", "OPENAPI", "OS", "PC", "PCB", "PDF", "PEC", "PIN", "PLC",
+    "PNG", "POP", "PUK", "PWM", "QR", "RAM", "REST", "RF", "RFID", "RGB", "ROM",
+    "RPC", "RS", "RSS", "RTC", "SAS", "SDK", "SEO", "SFTP", "SIM", "SIP", "SMTP",
+    "SNC", "SNMP", "SPA", "SPID", "SQL", "SRAM", "SRL", "SSD", "SSH", "SSL", "TCP",
+    "TIFF", "TLS", "TTS", "UART", "UDP", "UI", "UML", "UPS", "URI", "URL", "USB",
+    "UTF", "UUID", "UX", "VAT", "VLAN", "VM", "VPN", "VR", "WAN", "WEBHOOK",
+    "WLAN", "WKT", "XML", "YAML",
 }
 
 _ITALIAN_SHORT_UPPER_WORDS = {
@@ -208,10 +210,80 @@ def _normalize_all_caps_titles(text: str) -> str:
     return "".join(out_mixed)
 
 
+_IT_UNITS = (
+    "zero", "uno", "due", "tre", "quattro", "cinque", "sei", "sette", "otto", "nove",
+    "dieci", "undici", "dodici", "tredici", "quattordici", "quindici", "sedici",
+    "diciassette", "diciotto", "diciannove",
+)
+
+_IT_TENS = (
+    "", "", "venti", "trenta", "quaranta", "cinquanta",
+    "sessanta", "settanta", "ottanta", "novanta",
+)
+
+
+def _int_to_italian(n: int) -> str:
+    """Convert non-negative integer (0..999_999_999) into natural Italian words."""
+    if n < 20:
+        return _IT_UNITS[n]
+    if n < 100:
+        tens, rem = divmod(n, 10)
+        base = _IT_TENS[tens]
+        if rem == 0:
+            return base
+        if rem in (1, 8):
+            base = base[:-1]
+        unit_word = "tré" if rem == 3 else _IT_UNITS[rem]
+        return base + unit_word
+    if n < 1000:
+        hundreds, rem = divmod(n, 100)
+        prefix = "cento" if hundreds == 1 else f"{_IT_UNITS[hundreds]}cento"
+        return prefix if rem == 0 else prefix + _int_to_italian(rem)
+    if n < 1_000_000:
+        thousands, rem = divmod(n, 1000)
+        prefix = "mille" if thousands == 1 else f"{_int_to_italian(thousands)}mila"
+        return prefix if rem == 0 else prefix + _int_to_italian(rem)
+    millions, rem = divmod(n, 1_000_000)
+    prefix = "un milione" if millions == 1 else f"{_int_to_italian(millions)} milioni"
+    return prefix if rem == 0 else f"{prefix} {_int_to_italian(rem)}"
+
+
+def _digits_token_to_italian(token: str) -> str:
+    """Convert an unsigned digit string into Italian words, keeping leading zeros explicit."""
+    if len(token) > 1 and token.startswith("0"):
+        leading_zeros = len(token) - len(token.lstrip("0"))
+        zero_words = ["zero"] * leading_zeros
+        rest = token.lstrip("0")
+        if not rest:
+            return " ".join(zero_words)
+        return " ".join(zero_words + [_digits_token_to_italian(rest)])
+    if len(token) >= 8 and not token.endswith("000000"):
+        return " ".join(_IT_UNITS[int(ch)] for ch in token)
+    value = int(token)
+    if value >= 1_000_000_000:
+        return " ".join(_IT_UNITS[int(ch)] for ch in token)
+    return _int_to_italian(value)
+
+
+def _normalize_numbers_for_tts(text: str) -> str:
+    """Verbalize Italian thousands and standalone numbers so Pocket TTS avoids digit byte tokens."""
+    # Collapse Italian thousands dots ("1.000.000" -> "1000000") before digit conversion
+    s = re.sub(
+        r"\b(\d{1,3}(?:\.\d{3})+)\b",
+        lambda m: m.group(1).replace(".", ""),
+        text,
+    )
+    # "1 gennaio" -> "primo gennaio" for prose dates already written with month names
+    month_names_re = "|".join(_ITALIAN_MONTHS.values())
+    s = re.sub(rf"\b1\s+({month_names_re})\b", r"primo \1", s, flags=re.IGNORECASE)
+    return re.sub(r"\b\d+\b", lambda m: _digits_token_to_italian(m.group(0)), s)
+
+
 def _format_italian_date(day: int, month: int, year_str: str) -> Optional[str]:
     if not (1 <= day <= 31 and 1 <= month <= 12):
         return None
-    return f"{day} {_ITALIAN_MONTHS[month]} {year_str}"
+    day_str = "primo" if day == 1 else str(day)
+    return f"{day_str} {_ITALIAN_MONTHS[month]} {year_str}"
 
 
 def _normalize_dates(text: str) -> str:
@@ -271,8 +343,9 @@ def normalize_text_for_tts(text: str) -> str:
 
     s = text.strip()
 
-    # Strip decorative bullets and long ASCII dividers
-    s = re.sub(r"[•▪◦‣∙●■□►▸✔✓➢➤]+", " ", s)
+    # Strip decorative bullets (comma pause when separating inline header items) and ASCII dividers
+    s = re.sub(r"(?<=\S)\s*[•▪◦‣∙●■□►▸✔✓➢➤|¦]+\s*(?=\S)", ", ", s)
+    s = re.sub(r"[•▪◦‣∙●■□►▸✔✓➢➤|¦]+", " ", s)
     s = re.sub(r"(?:---+|===+|___|~~~+|\*{2,})", ", ", s)
 
     # Leading parenthesized list markers like "(1) Voce" or "(a) Voce"
@@ -344,10 +417,8 @@ def normalize_text_for_tts(text: str) -> str:
     s = re.sub(r"://", " ", s)
     s = re.sub(r"/{1,2}", " barra ", s)
 
-    # Split technical alphanumeric identifiers so single letters and numbers read cleanly
-    s = re.sub(r"\b([A-Z]{1,2})(\d{1,3})\b", r"\1 \2", s)
-    s = re.sub(r"\b([a-z]{1,2})(\d{1,3})(?=\s*(?:[=<>!+\-*/]|:=))", r"\1 \2", s)
-    s = re.sub(r"\b(\d+)([A-Z]{1,3})\b", r"\1 \2", s)
+    # Split boundaries between letters and digits so identifiers ("Q03", "res60") read cleanly
+    s = re.sub(r"(?<=[A-Za-zÀ-Úà-ú])(?=\d)|(?<=\d)(?=[A-Za-zÀ-Úà-ú])", " ", s)
     s = re.sub(r"\b([A-Za-z]+)-(\d+)\b", r"\1 \2", s)
 
     # Degrees / temperatures
@@ -366,12 +437,16 @@ def normalize_text_for_tts(text: str) -> str:
     # Negative numbers preceded by whitespace, start, or delimiter (after operators are expanded)
     s = re.sub(r"(?:(?<=^)|(?<=[\s,:(]))-(\d+)", r" meno \1", s)
 
-    # Prose dash separators (" - ", " – ", " — ") and glued colons ("key:val", keeping "10:30")
-    s = re.sub(r"\s+[–—-]\s+", ", ", s)
+    # En-dash / em-dash (even unspaced like "JSON–TIFF"), spaced ASCII hyphens, and glued colons
+    s = re.sub(r"\s*[–—]+\s*", ", ", s)
+    s = re.sub(r"\s+-\s+", ", ", s)
     s = re.sub(r"(?<=[A-Za-z]):(?=[A-Za-z0-9])", ": ", s)
 
     # Replace underscores and brackets with spaces so adjacent words never glue together
     s = re.sub(r"[_()\[\]{}]", " ", s)
+
+    # Verbalize standalone digits into Italian words so Pocket TTS avoids byte-token spelling
+    s = _normalize_numbers_for_tts(s)
 
     # Collapse whitespace and tidy punctuation spacing
     s = re.sub(r"\s+", " ", s).strip()
@@ -489,7 +564,7 @@ class PocketTTSEngine:
 
         # Cache key incorporates normalized spoken form so old raw-symbol caches are bypassed
         cache_key = hashlib.sha256(
-            f"{self.language}_{self.voice}_{self.quantize}_tts_v3_{spoken_text}".encode("utf-8")
+            f"{self.language}_{self.voice}_{self.quantize}_tts_v4_{spoken_text}".encode("utf-8")
         ).hexdigest()
         cache_file = self.cache_dir / f"{cache_key}.wav"
 

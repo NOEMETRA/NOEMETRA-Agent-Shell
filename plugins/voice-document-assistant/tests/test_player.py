@@ -306,15 +306,15 @@ def test_normalize_text_for_tts_technical_schemas():
     from hermes_voice.tts_engine import normalize_text_for_tts
 
     # Numbered paragraphs & sections
-    assert normalize_text_for_tts("1. Configurazione di sistema.") == "1, Configurazione di sistema."
-    assert normalize_text_for_tts("1.2.3 Titolo tecnico") == "1 punto 2 punto 3, Titolo tecnico"
-    assert normalize_text_for_tts("Art. 1. Oggetto") == "Articolo 1, Oggetto"
+    assert normalize_text_for_tts("1. Configurazione di sistema.") == "uno, Configurazione di sistema."
+    assert normalize_text_for_tts("1.2.3 Titolo tecnico") == "uno punto due punto tre, Titolo tecnico"
+    assert normalize_text_for_tts("Art. 1. Oggetto") == "Articolo uno, Oggetto"
 
     # Alphanumeric assignments, operators, temperatures
-    assert normalize_text_for_tts("P1=10") == "P 1 uguale a 10"
-    assert normalize_text_for_tts("p1<=5") == "p 1 minore o uguale a 5"
-    assert normalize_text_for_tts("T2>=25°C") == "T 2 maggiore o uguale a 25 gradi Celsius"
-    assert normalize_text_for_tts("P1!=0 -> attivo") == "P 1 diverso da 0 verso attivo"
+    assert normalize_text_for_tts("P1=10") == "P uno uguale a dieci"
+    assert normalize_text_for_tts("p1<=5") == "p uno minore o uguale a cinque"
+    assert normalize_text_for_tts("T2>=25°C") == "T due maggiore o uguale a venticinque gradi Celsius"
+    assert normalize_text_for_tts("P1!=0 -> attivo") == "P uno diverso da zero verso attivo"
 
     # Slashes read as "barra"
     assert normalize_text_for_tts("Modello client/server") == "Modello client barra server"
@@ -322,45 +322,51 @@ def test_normalize_text_for_tts_technical_schemas():
         "Modalità lettura barra scrittura on barra off"
     )
 
-    # Versions, decimals, thousands, decorative dividers, and prose preservation
+    # Versions, decimals (including leading-zero decimals), thousands, pipes, bullets, decorative dividers
     assert normalize_text_for_tts("Versione v2.6 con fattore 0.75") == (
-        "Versione v 2 punto 6 con fattore 0 virgola 75"
+        "Versione v due punto sei con fattore zero virgola settantacinque"
     )
-    assert normalize_text_for_tts("Valore pari a 1.000.000 euro.") == "Valore pari a 1.000.000 euro."
+    assert normalize_text_for_tts("Tolleranza 0.05") == "Tolleranza zero virgola zero cinque"
+    assert normalize_text_for_tts("Valore pari a 1.000.000 euro.") == "Valore pari a un milione euro."
+    assert normalize_text_for_tts("9 novembre 2026   •   Documento di confronto   |   Pagina 1") == (
+        "nove novembre duemilaventisei, Documento di confronto, Pagina uno"
+    )
     assert normalize_text_for_tts("---") == ""
     assert normalize_text_for_tts("•••") == ""
-    prose = "La presente relazione illustra i risultati dell'analisi nel 2025."
-    assert normalize_text_for_tts(prose) == prose
+    assert normalize_text_for_tts("Solo testo normale senza simboli.") == "Solo testo normale senza simboli."
 
 
 def test_normalize_text_for_tts_dates_and_uppercase_titles():
     from hermes_voice.tts_engine import normalize_text_for_tts
 
     # Dates in European, dot, hyphen, ISO, 2-digit year, and MM/YYYY formats (with trailing period)
-    assert normalize_text_for_tts("13/11/2026") == "13 novembre 2026"
-    assert normalize_text_for_tts("Valido dal 13/11/2026.") == "Valido dal 13 novembre 2026."
-    assert normalize_text_for_tts("Data: 13.11.2026") == "Data: 13 novembre 2026"
-    assert normalize_text_for_tts("Aggiornato il 2026-11-13.") == "Aggiornato il 13 novembre 2026."
-    assert normalize_text_for_tts("13-11-2026") == "13 novembre 2026"
-    assert normalize_text_for_tts("01/02/25") == "1 febbraio 25"
-    assert normalize_text_for_tts("Rev. 11/2026") == "Revisione novembre 2026"
+    assert normalize_text_for_tts("13/11/2026") == "tredici novembre duemilaventisei"
+    assert normalize_text_for_tts("Valido dal 13/11/2026.") == "Valido dal tredici novembre duemilaventisei."
+    assert normalize_text_for_tts("Data: 13.11.2026") == "Data: tredici novembre duemilaventisei"
+    assert normalize_text_for_tts("Aggiornato il 2026-11-13.") == "Aggiornato il tredici novembre duemilaventisei."
+    assert normalize_text_for_tts("13-11-2026") == "tredici novembre duemilaventisei"
+    assert normalize_text_for_tts("01/02/25") == "primo febbraio venticinque"
+    assert normalize_text_for_tts("Rev. 11/2026") == "Revisione novembre duemilaventisei"
 
-    # ALL-CAPS titles and embedded uppercase blocks converted cleanly while preserving technical acronyms
+    # ALL-CAPS titles, inline headings, en-dash without spaces, and domain acronyms
     assert normalize_text_for_tts("MANUALE TECNICO DI INSTALLAZIONE") == (
         "Manuale tecnico di installazione"
     )
     assert normalize_text_for_tts("1. INTRODUZIONE AL SISTEMA TCP/IP") == (
-        "1, Introduzione al sistema TCP barra IP"
+        "uno, Introduzione al sistema TCP barra IP"
     )
     assert normalize_text_for_tts("ART. 1. OGGETTO DEL CONTRATTO") == (
-        "Articolo 1, oggetto del contratto"
+        "Articolo uno, oggetto del contratto"
     )
     assert normalize_text_for_tts("CAPITOLO 1 - ARCHITETTURA") == (
-        "Capitolo 1, architettura"
+        "Capitolo uno, architettura"
     )
-    assert normalize_text_for_tts("CAPITOLO IV - NORME") == "Capitolo 4, norme"
+    assert normalize_text_for_tts("CAPITOLO IV - NORME") == "Capitolo quattro, norme"
     assert normalize_text_for_tts("Rev. 1.2 del 13/11/2026") == (
-        "Revisione 1 punto 2 del 13 novembre 2026"
+        "Revisione uno punto due del tredici novembre duemilaventisei"
+    )
+    assert normalize_text_for_tts("Q04 [P0] Relazione JSON–TIFF con EPSG:4326") == (
+        "Q zero quattro P zero Relazione JSON, TIFF con EPSG: quattromilatrecentoventisei"
     )
     assert normalize_text_for_tts("Configurazione AI e REST API") == (
         "Configurazione AI e REST API"
@@ -406,7 +412,7 @@ def test_tts_engine_synthesizes_normalized_technical_text(monkeypatch):
         audio, sr = engine.synthesize("1. Modalità client/server con P1=10.", use_cache=True)
         assert sr == 24000
         assert len(audio) == 1200
-        assert captured_prompts == ["1, Modalità client barra server con P 1 uguale a 10."]
+        assert captured_prompts == ["uno, Modalità client barra server con P uno uguale a dieci."]
 
         # Second call with same input hits audio cache without re-invoking generate_audio
         cached_audio, _ = engine.synthesize("1. Modalità client/server con P1=10.", use_cache=True)

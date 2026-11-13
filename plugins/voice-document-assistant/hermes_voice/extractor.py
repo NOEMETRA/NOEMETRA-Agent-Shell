@@ -67,20 +67,23 @@ class DocumentExtractor:
             page_num = page_idx + 1
             page = doc[page_idx]
 
-            # Extract structured blocks: (x0, y0, x1, y1, text, block_no, block_type)
-            # block_type 0 is text
-            blocks = page.get_text("blocks")
+            # Extract structured layout blocks via PyMuPDF "dict" to detect bold/sized headings cleanly
+            dict_blocks = page.get_text("dict").get("blocks", [])
             page_text_parts = []
             page_sentences: List[SentenceSpan] = []
 
             para_idx = 0
             char_cursor = 0
 
-            for block in blocks:
-                if len(block) < 5 or block[6] != 0:
+            for block in dict_blocks:
+                if block.get("type") != 0:
                     continue  # skip non-text blocks (images)
 
-                block_text = block[4].strip()
+                raw_lines = [
+                    "".join(sp.get("text", "") for sp in line.get("spans", []))
+                    for line in block.get("lines", [])
+                ]
+                block_text = "\n".join(raw_lines).strip()
                 if not block_text:
                     continue
 
@@ -89,11 +92,12 @@ class DocumentExtractor:
                 if not cleaned_block:
                     continue
 
-                bbox = [round(block[0], 2), round(block[1], 2), round(block[2], 2), round(block[3], 2)]
+                raw_bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
+                bbox = [round(raw_bbox[0], 2), round(raw_bbox[1], 2), round(raw_bbox[2], 2), round(raw_bbox[3], 2)]
 
-                # Segment block into sentences (preserving separate spans for inline all-caps headings)
+                # Segment block into sentences (preserving separate spans for layout headings)
                 sentences: List[str] = []
-                for segment in self._split_heading_segments(block_text):
+                for segment in self._split_dict_block_segments(block):
                     sentences.extend(self._split_into_sentences(segment))
                 for sent_text in sentences:
                     sent_text_clean = sent_text.strip()
@@ -231,6 +235,55 @@ class DocumentExtractor:
                 buffer.append(line)
         if buffer:
             segments.append(" ".join(buffer))
+        return [seg for seg in segments if seg.strip()]
+
+    def _split_dict_block_segments(self, dict_block: dict) -> List[str]:
+        """Split a PyMuPDF dict block into heading and body segments using bold/size transitions."""
+        line_meta: List[Tuple[str, bool, float]] = []
+        for line in dict_block.get("lines", []):
+            spans = line.get("spans", [])
+            text = "".join(sp.get("text", "") for sp in spans).strip()
+            if not text:
+                continue
+            non_ws = [sp for sp in spans if sp.get("text", "").strip()]
+            is_bold = bool(non_ws) and all((sp.get("flags", 0) & 16) != 0 for sp in non_ws)
+            max_size = max((float(sp.get("size", 0.0)) for sp in non_ws), default=0.0)
+            line_meta.append((text, is_bold, max_size))
+
+        if len(line_meta) <= 1:
+            if not line_meta:
+                return []
+            return [line_meta[0][0]]
+
+        def _is_all_caps(text: str) -> bool:
+            upper_count = sum(1 for ch in text if ch.isupper())
+            lower_count = sum(1 for ch in text if ch.islower())
+            return upper_count >= 3 and lower_count == 0 and len(text) <= 100
+
+        segments: List[str] = []
+        buffer: List[str] = []
+        for idx, (text, is_bold, size) in enumerate(line_meta):
+            if idx + 1 < len(line_meta):
+                next_text, next_bold, next_size = line_meta[idx + 1]
+                is_heading_break = (
+                    len(text) <= 120
+                    and (
+                        (is_bold and not next_bold)
+                        or (size - next_size >= 2.0)
+                        or (_is_all_caps(text) and any(ch.islower() for ch in next_text))
+                        or (not _is_all_caps(text) and _is_all_caps(next_text) and len(next_text) <= 80)
+                    )
+                )
+            else:
+                is_heading_break = False
+
+            buffer.append(text)
+            if is_heading_break:
+                segments.append(self._clean_paragraph_text("\n".join(buffer)))
+                buffer.clear()
+
+        if buffer:
+            segments.append(self._clean_paragraph_text("\n".join(buffer)))
         return [seg for seg in segments if seg.strip()]
 
     def _split_into_sentences(self, text: str) -> List[str]:
