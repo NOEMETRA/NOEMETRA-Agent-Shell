@@ -19,12 +19,19 @@ from hermes_voice.models import DocumentPage, ExtractedDocument, SentenceSpan
 
 logger = logging.getLogger(__name__)
 
-# Common Italian abbreviations that should not trigger sentence boundary splits
+# Common Italian and technical abbreviations that should not trigger sentence boundary splits
 ITALIAN_ABBREVIATIONS = {
     "dott", "dott.ssa", "prof", "prof.ssa", "avv", "ing", "sig", "sig.ra",
-    "art", "artt", "p", "pp", "pag", "pagg", "es", "ecc", "vol", "cap",
-    "n", "sez", "all", "rif", "lett", "comma", "c.d", "c.p", "c.c", "v"
+    "dr", "art", "artt", "p", "pp", "pag", "pagg", "es", "ecc", "vol", "cap",
+    "n", "sez", "all", "rif", "lett", "comma", "c.d", "c.p", "c.c", "v",
+    "par", "fig", "tab", "cod", "rev", "ver", "vs", "s.p.a", "s.r.l",
 }
+
+_LIST_OR_SECTION_PREFIX_RE = re.compile(
+    r"^(?:(?:art|artt|sez|cap|par|fig|tab|all|rif|pag|pagg|p|pp|n|comma)\.\s+)?"
+    r"(?:\d+(?:\.\d+)*|[IVXLC]+|[A-Za-z])\.$",
+    re.IGNORECASE,
+)
 
 
 class DocumentExtractor:
@@ -84,8 +91,10 @@ class DocumentExtractor:
 
                 bbox = [round(block[0], 2), round(block[1], 2), round(block[2], 2), round(block[3], 2)]
 
-                # Segment block into sentences
-                sentences = self._split_into_sentences(cleaned_block)
+                # Segment block into sentences (preserving separate spans for inline all-caps headings)
+                sentences: List[str] = []
+                for segment in self._split_heading_segments(block_text):
+                    sentences.extend(self._split_into_sentences(segment))
                 for sent_text in sentences:
                     sent_text_clean = sent_text.strip()
                     if not sent_text_clean:
@@ -196,6 +205,34 @@ class DocumentExtractor:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return " ".join(lines)
 
+    def _split_heading_segments(self, block_text: str) -> List[str]:
+        """Split a PDF block if an all-caps heading line precedes lowercase body lines."""
+        dehyphenated = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", block_text)
+        lines = [line.strip() for line in dehyphenated.splitlines() if line.strip()]
+        if len(lines) <= 1:
+            cleaned = self._clean_paragraph_text(block_text)
+            return [cleaned] if cleaned else []
+
+        def _is_all_caps_heading(line: str) -> bool:
+            upper_count = sum(1 for ch in line if ch.isupper())
+            lower_count = sum(1 for ch in line if ch.islower())
+            return upper_count >= 3 and lower_count == 0 and len(line) <= 100
+
+        segments: List[str] = []
+        buffer: List[str] = []
+        for idx, line in enumerate(lines):
+            has_next_body = idx + 1 < len(lines) and any(ch.islower() for ch in lines[idx + 1])
+            if _is_all_caps_heading(line) and has_next_body:
+                if buffer:
+                    segments.append(" ".join(buffer))
+                    buffer.clear()
+                segments.append(line)
+            else:
+                buffer.append(line)
+        if buffer:
+            segments.append(" ".join(buffer))
+        return [seg for seg in segments if seg.strip()]
+
     def _split_into_sentences(self, text: str) -> List[str]:
         """Split text into sentences while respecting Italian abbreviations and preserving trailing text."""
         raw_chunks: List[str] = []
@@ -230,16 +267,17 @@ class DocumentExtractor:
             if not current:
                 current = chunk
             else:
-                # Check if previous chunk ended on an abbreviation
-                words = current.strip().split()
+                stripped_current = current.strip()
+                # Check if previous chunk ended on an abbreviation or is a standalone list/section marker
+                words = stripped_current.split()
                 last_word = words[-1].lower().rstrip(".!?,;:") if words else ""
                 if "'" in last_word:
                     last_word = last_word.split("'")[-1]
 
-                if last_word in ITALIAN_ABBREVIATIONS:
+                if last_word in ITALIAN_ABBREVIATIONS or _LIST_OR_SECTION_PREFIX_RE.match(stripped_current):
                     current += chunk
                 else:
-                    merged_sentences.append(current.strip())
+                    merged_sentences.append(stripped_current)
                     current = chunk
 
         if current.strip():

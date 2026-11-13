@@ -302,6 +302,118 @@ def test_tts_engine_clears_model_on_voice_initialization_failure_and_recovers(mo
         assert attempts["voice_prompt"] == 2
 
 
+def test_normalize_text_for_tts_technical_schemas():
+    from hermes_voice.tts_engine import normalize_text_for_tts
+
+    # Numbered paragraphs & sections
+    assert normalize_text_for_tts("1. Configurazione di sistema.") == "1, Configurazione di sistema."
+    assert normalize_text_for_tts("1.2.3 Titolo tecnico") == "1 punto 2 punto 3, Titolo tecnico"
+    assert normalize_text_for_tts("Art. 1. Oggetto") == "Articolo 1, Oggetto"
+
+    # Alphanumeric assignments, operators, temperatures
+    assert normalize_text_for_tts("P1=10") == "P 1 uguale a 10"
+    assert normalize_text_for_tts("p1<=5") == "p 1 minore o uguale a 5"
+    assert normalize_text_for_tts("T2>=25°C") == "T 2 maggiore o uguale a 25 gradi Celsius"
+    assert normalize_text_for_tts("P1!=0 -> attivo") == "P 1 diverso da 0 verso attivo"
+
+    # Slashes read as "barra"
+    assert normalize_text_for_tts("Modello client/server") == "Modello client barra server"
+    assert normalize_text_for_tts("Modalità lettura/scrittura (on/off)") == (
+        "Modalità lettura barra scrittura on barra off"
+    )
+
+    # Versions, decimals, thousands, decorative dividers, and prose preservation
+    assert normalize_text_for_tts("Versione v2.6 con fattore 0.75") == (
+        "Versione v 2 punto 6 con fattore 0 virgola 75"
+    )
+    assert normalize_text_for_tts("Valore pari a 1.000.000 euro.") == "Valore pari a 1.000.000 euro."
+    assert normalize_text_for_tts("---") == ""
+    assert normalize_text_for_tts("•••") == ""
+    prose = "La presente relazione illustra i risultati dell'analisi nel 2025."
+    assert normalize_text_for_tts(prose) == prose
+
+
+def test_normalize_text_for_tts_dates_and_uppercase_titles():
+    from hermes_voice.tts_engine import normalize_text_for_tts
+
+    # Dates in European, dot, hyphen, ISO, 2-digit year, and MM/YYYY formats (with trailing period)
+    assert normalize_text_for_tts("13/11/2026") == "13 novembre 2026"
+    assert normalize_text_for_tts("Valido dal 13/11/2026.") == "Valido dal 13 novembre 2026."
+    assert normalize_text_for_tts("Data: 13.11.2026") == "Data: 13 novembre 2026"
+    assert normalize_text_for_tts("Aggiornato il 2026-11-13.") == "Aggiornato il 13 novembre 2026."
+    assert normalize_text_for_tts("13-11-2026") == "13 novembre 2026"
+    assert normalize_text_for_tts("01/02/25") == "1 febbraio 25"
+    assert normalize_text_for_tts("Rev. 11/2026") == "Revisione novembre 2026"
+
+    # ALL-CAPS titles and embedded uppercase blocks converted cleanly while preserving technical acronyms
+    assert normalize_text_for_tts("MANUALE TECNICO DI INSTALLAZIONE") == (
+        "Manuale tecnico di installazione"
+    )
+    assert normalize_text_for_tts("1. INTRODUZIONE AL SISTEMA TCP/IP") == (
+        "1, Introduzione al sistema TCP barra IP"
+    )
+    assert normalize_text_for_tts("ART. 1. OGGETTO DEL CONTRATTO") == (
+        "Articolo 1, oggetto del contratto"
+    )
+    assert normalize_text_for_tts("CAPITOLO 1 - ARCHITETTURA") == (
+        "Capitolo 1, architettura"
+    )
+    assert normalize_text_for_tts("CAPITOLO IV - NORME") == "Capitolo 4, norme"
+    assert normalize_text_for_tts("Rev. 1.2 del 13/11/2026") == (
+        "Revisione 1 punto 2 del 13 novembre 2026"
+    )
+    assert normalize_text_for_tts("Configurazione AI e REST API") == (
+        "Configurazione AI e REST API"
+    )
+
+
+def test_tts_engine_synthesizes_normalized_technical_text(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from hermes_voice.tts_engine import PocketTTSEngine
+
+    captured_prompts = []
+
+    class FakeTTSModel:
+        config = SimpleNamespace(mimi=SimpleNamespace(sample_rate=24000))
+
+        def to(self, device: str):
+            return self
+
+        def get_state_for_audio_prompt(self, voice: str):
+            return {"voice": voice, "ready": True}
+
+        def generate_audio(self, model_state, text_to_generate: str, copy_state: bool = True):
+            captured_prompts.append(text_to_generate)
+            return np.ones(1200, dtype=np.float32) * 0.1
+
+    class FakeTTSModelFactory:
+        @staticmethod
+        def load_model(language: str, quantize: bool = False):
+            return FakeTTSModel()
+
+    monkeypatch.setitem(sys.modules, "pocket_tts", SimpleNamespace(TTSModel=FakeTTSModelFactory))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        engine = PocketTTSEngine(cache_dir=Path(tmpdir) / "tts_cache", lazy_load=True)
+
+        # Non-speakable divider returns short silence without loading or calling the model
+        silent, sr = engine.synthesize("---", use_cache=True)
+        assert sr == 24000
+        assert len(silent) == 2400
+        assert captured_prompts == []
+
+        audio, sr = engine.synthesize("1. Modalità client/server con P1=10.", use_cache=True)
+        assert sr == 24000
+        assert len(audio) == 1200
+        assert captured_prompts == ["1, Modalità client barra server con P 1 uguale a 10."]
+
+        # Second call with same input hits audio cache without re-invoking generate_audio
+        cached_audio, _ = engine.synthesize("1. Modalità client/server con P1=10.", use_cache=True)
+        assert len(cached_audio) == 1200
+        assert len(captured_prompts) == 1
+
+
 
 
 

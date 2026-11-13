@@ -1,7 +1,8 @@
 """Deterministic Pocket TTS synthesis engine with Italian models and voice Giovanni.
 
-Strict constraint: Verbatim reading of extracted document sentences.
-No text transformation or LLM rewriting is applied.
+Strict constraint: Extracted document text remains 100% verbatim across storage and UI.
+Deterministic, zero-LLM Italian speech normalization is applied solely at synthesis time
+so technical schemas (numbering, symbols, operators, slashes) are spoken clearly.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -20,6 +22,365 @@ import soundfile as sf
 from hermes_voice.profile import ensure_voice_dir, resolve_voice_profile_dir
 
 logger = logging.getLogger(__name__)
+
+_ITALIAN_ABBREV_EXPANSIONS: Dict[str, str] = {
+    "art": "Articolo",
+    "artt": "Articoli",
+    "sez": "Sezione",
+    "cap": "Capitolo",
+    "par": "Paragrafo",
+    "fig": "Figura",
+    "tab": "Tabella",
+    "pag": "Pagina",
+    "pagg": "Pagine",
+    "cod": "Codice",
+    "rev": "Revisione",
+    "ver": "Versione",
+    "rif": "Riferimento",
+    "all": "Allegato",
+    "es": "Esempio",
+    "ecc": "Eccetera",
+    "n": "numero",
+}
+
+_ABBREV_RE = re.compile(
+    r"\b(" + "|".join(_ITALIAN_ABBREV_EXPANSIONS.keys()) + r")\.(?=\s|$|[0-9])",
+    re.IGNORECASE,
+)
+
+_OPERATOR_REPLACEMENTS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"<=>|<->"), " equivale a "),
+    (re.compile(r"->|→"), " verso "),
+    (re.compile(r"=>|⇒"), " implica "),
+    (re.compile(r"<=|≤"), " minore o uguale a "),
+    (re.compile(r">=|≥"), " maggiore o uguale a "),
+    (re.compile(r"!=|<>|≠"), " diverso da "),
+    (re.compile(r"=="), " uguale a "),
+    (re.compile(r":="), " assegnato a "),
+    (re.compile(r"="), " uguale a "),
+    (re.compile(r"<"), " minore di "),
+    (re.compile(r">"), " maggiore di "),
+    (re.compile(r"±"), " più o meno "),
+    (re.compile(r"×"), " per "),
+    (re.compile(r"÷"), " diviso "),
+    (re.compile(r"≈|~"), " circa "),
+    (re.compile(r"%"), " percento "),
+    (re.compile(r"&"), " e "),
+    (re.compile(r"@"), " chiocciola "),
+    (re.compile(r"\s*\+\s*"), " più "),
+)
+
+
+_ROMAN_SECTION_NUMERALS: Dict[str, str] = {
+    "ii": "2",
+    "iii": "3",
+    "iv": "4",
+    "v": "5",
+    "vi": "6",
+    "vii": "7",
+    "viii": "8",
+    "ix": "9",
+    "x": "10",
+    "xi": "11",
+    "xii": "12",
+}
+
+_SECTION_NOUNS_PATTERN = (
+    r"Articolo|Articoli|Sezione|Capitolo|Parte|Paragrafo|Figura|Tabella|Pagina|Pagine|"
+    r"Codice|Revisione|Versione|Riferimento|Allegato|Titolo|Comma|numero"
+)
+
+
+def _expand_dotted_sequence(dotted: str) -> str:
+    return " punto ".join(dotted.strip(".").split("."))
+
+
+_ITALIAN_MONTHS: Dict[int, str] = {
+    1: "gennaio",
+    2: "febbraio",
+    3: "marzo",
+    4: "aprile",
+    5: "maggio",
+    6: "giugno",
+    7: "luglio",
+    8: "agosto",
+    9: "settembre",
+    10: "ottobre",
+    11: "novembre",
+    12: "dicembre",
+}
+
+_ACRONYM_WHITELIST = {
+    "AI", "API", "ASCII", "BIOS", "CAD", "CAP", "CF", "CPU", "CSV", "DAC", "DB",
+    "DC", "AC", "DHCP", "DIN", "DNS", "DOM", "DRAM", "DVD", "EEPROM", "EU", "FAQ",
+    "FTP", "GB", "GPIO", "GPS", "GPU", "GUI", "HD", "HDMI", "HMI", "HTML", "HTTP",
+    "HTTPS", "ID", "IDE", "IEC", "IMAP", "IP", "ISO", "IT", "IVA", "JSON", "KB",
+    "LAN", "LCD", "LED", "LLM", "MAC", "MB", "MIDI", "MIME", "MQTT", "NFC", "NTP",
+    "OCR", "OK", "ONLUS", "OS", "PC", "PCB", "PDF", "PEC", "PIN", "PLC", "PNG",
+    "POP", "PUK", "PWM", "QR", "RAM", "REST", "RF", "RFID", "RGB", "ROM", "RPC",
+    "RS", "RSS", "RTC", "SAS", "SDK", "SEO", "SFTP", "SIM", "SIP", "SMTP", "SNC",
+    "SNMP", "SPA", "SPID", "SQL", "SRAM", "SRL", "SSD", "SSH", "SSL", "TCP", "TLS",
+    "TTS", "UART", "UDP", "UI", "UML", "UPS", "URI", "URL", "USB", "UTF", "UUID",
+    "UX", "VAT", "VLAN", "VM", "VPN", "VR", "WAN", "WLAN", "XML", "YAML",
+}
+
+_ITALIAN_SHORT_UPPER_WORDS = {
+    "A", "AD", "AGLI", "AI", "AL", "ALL", "ALLA", "ALLE", "ALLO", "CHE", "CHI",
+    "CI", "COI", "COL", "CON", "CUI", "DA", "DAI", "DAL", "DEI", "DEL", "DI",
+    "E", "ED", "FRA", "GLI", "HA", "HO", "I", "IL", "IN", "LA", "LE", "LI", "LO",
+    "MA", "MI", "NE", "NEI", "NEL", "NO", "NON", "O", "PER", "PIU", "PIÙ", "SE",
+    "SI", "SU", "SUI", "SUL", "TI", "TRA", "UN", "VI",
+}
+
+_VOWELS = frozenset("AEIOUÀÈÉÌÒÙ")
+
+
+def _is_preserved_acronym(word: str, *, all_caps_line: bool) -> bool:
+    if all_caps_line and word in _ITALIAN_SHORT_UPPER_WORDS:
+        return False
+    if word in _ACRONYM_WHITELIST:
+        return True
+    if 2 <= len(word) <= 4 and not any(ch in _VOWELS for ch in word):
+        return True
+    return False
+
+
+def _normalize_all_caps_titles(text: str) -> str:
+    """Convert ALL-CAPS titles/headings to natural Sentence Case so Pocket TTS avoids spelling."""
+    alpha_chars = [ch for ch in text if ch.isalpha()]
+    if len(alpha_chars) < 2:
+        return text
+
+    all_caps_line = not any(ch.islower() for ch in alpha_chars)
+    tokens = re.findall(r"[A-Za-zÀ-Úà-ú]+|[^A-Za-zÀ-Úà-ú]+", text)
+
+    if all_caps_line:
+        capitalized_first = False
+        out: list[str] = []
+        for tok in tokens:
+            if tok.isalpha() and tok.isupper():
+                if _is_preserved_acronym(tok, all_caps_line=True):
+                    out.append(tok)
+                    capitalized_first = True
+                elif not capitalized_first:
+                    out.append(tok.capitalize())
+                    capitalized_first = True
+                else:
+                    out.append(tok.lower())
+            else:
+                out.append(tok)
+        return "".join(out)
+
+    # Mixed-case text that embeds uppercase headings/blocks (e.g. "Art. 1. OGGETTO DEL CONTRATTO")
+    converted_flags = [False] * len(tokens)
+    for idx, tok in enumerate(tokens):
+        if (
+            tok.isalpha()
+            and tok.isupper()
+            and len(tok) >= 4
+            and any(ch in _VOWELS for ch in tok)
+            and tok not in _ACRONYM_WHITELIST
+        ):
+            converted_flags[idx] = True
+
+    if not any(converted_flags):
+        return text
+
+    # Also lowercase short uppercase Italian function words adjacent to converted uppercase words
+    for idx, tok in enumerate(tokens):
+        if tok.isalpha() and tok.isupper() and tok in _ITALIAN_SHORT_UPPER_WORDS:
+            left_conv = any(converted_flags[j] for j in range(max(0, idx - 2), idx))
+            right_conv = any(converted_flags[j] for j in range(idx + 1, min(len(tokens), idx + 3)))
+            if left_conv or right_conv:
+                converted_flags[idx] = True
+
+    out_mixed: list[str] = []
+    seen_converted = False
+    for idx, tok in enumerate(tokens):
+        if converted_flags[idx]:
+            if not seen_converted and (idx == 0 or not any(c.isalpha() for c in "".join(tokens[:idx]))):
+                out_mixed.append(tok.capitalize())
+            else:
+                out_mixed.append(tok.lower())
+            seen_converted = True
+        else:
+            out_mixed.append(tok)
+    return "".join(out_mixed)
+
+
+def _format_italian_date(day: int, month: int, year_str: str) -> Optional[str]:
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return None
+    return f"{day} {_ITALIAN_MONTHS[month]} {year_str}"
+
+
+def _normalize_dates(text: str) -> str:
+    """Convert numeric dates (DD/MM/YYYY, DD.MM.YYYY, DD-MM-YYYY, YYYY-MM-DD, MM/YYYY) to Italian."""
+    # ISO YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD (allowing trailing sentence punctuation like '.')
+    def _iso_repl(m: re.Match[str]) -> str:
+        formatted = _format_italian_date(int(m.group(4)), int(m.group(3)), m.group(1))
+        return formatted if formatted is not None else m.group(0)
+
+    s = re.sub(
+        r"(?<![\d/-])(?<!\d\.)((?:19|20)\d{2})([/.-])(0?[1-9]|1[0-2])\2(0?[1-9]|[12]\d|3[01])(?![\d])(?![./-]\w)",
+        _iso_repl,
+        text,
+    )
+
+    # European DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+    def _dmy4_repl(m: re.Match[str]) -> str:
+        formatted = _format_italian_date(int(m.group(1)), int(m.group(3)), m.group(4))
+        return formatted if formatted is not None else m.group(0)
+
+    s = re.sub(
+        r"(?<![\d/-])(?<!\d\.)(0?[1-9]|[12]\d|3[01])([/.-])(0?[1-9]|1[0-2])\2((?:19|20)\d{2})(?![\d])(?![./-]\w)",
+        _dmy4_repl,
+        s,
+    )
+
+    # Short European DD/MM/YY, DD-MM-YY, DD.MM.YY (2-digit year)
+    def _dmy2_repl(m: re.Match[str]) -> str:
+        formatted = _format_italian_date(int(m.group(1)), int(m.group(3)), m.group(4))
+        return formatted if formatted is not None else m.group(0)
+
+    s = re.sub(
+        r"(?<![\d/-])(?<!\d\.)(0?[1-9]|[12]\d|3[01])([/.-])(0?[1-9]|1[0-2])\2(\d{2})(?![\d])(?![./-]\w)",
+        _dmy2_repl,
+        s,
+    )
+
+    # Month/Year MM/YYYY (two-digit month to avoid ratios like 1/2000)
+    s = re.sub(
+        r"(?<![\d/-])(?<!\d\.)(0[1-9]|1[0-2])/((?:19[7-9]\d|20\d{2}))(?![\d])(?![./-]\w)",
+        lambda m: f"{_ITALIAN_MONTHS[int(m.group(1))]} {m.group(2)}",
+        s,
+    )
+    return s
+
+
+def normalize_text_for_tts(text: str) -> str:
+    """Deterministically normalize technical Italian text for Pocket TTS pronunciation.
+
+    Preserves standard prose unchanged while making list/section numbering,
+    ALL-CAPS titles, numeric dates, alphanumeric parameter codes (e.g. ``P1=10``),
+    operators, decimals, and slashes (``/`` -> ``barra``) pronounceable without LLM rewriting.
+    Returns ``""`` when no speakable alphanumeric characters remain.
+    """
+    if not text or not text.strip():
+        return ""
+
+    s = text.strip()
+
+    # Strip decorative bullets and long ASCII dividers
+    s = re.sub(r"[•▪◦‣∙●■□►▸✔✓➢➤]+", " ", s)
+    s = re.sub(r"(?:---+|===+|___|~~~+|\*{2,})", ", ", s)
+
+    # Leading parenthesized list markers like "(1) Voce" or "(a) Voce"
+    s = re.sub(r"^\s*\((\d{1,3}|[A-Za-z])\)\s+", r"\1, ", s)
+
+    # Leading multi-level section numbers: "1.2.3 Titolo" or "1.2. Titolo"
+    s = re.sub(
+        r"^\s*(\d+(?:\.\d+)+)\.?\s+",
+        lambda m: f"{_expand_dotted_sequence(m.group(1))}, ",
+        s,
+    )
+
+    # Leading single-level paragraph/list markers: "1. Configurazione" or "a. Voce"
+    s = re.sub(r"^\s*(\d{1,3}|[A-Za-z])\.\s+", r"\1, ", s)
+
+    # Normalize ALL-CAPS titles/headings before inserting lowercase words or expanding dates
+    s = _normalize_all_caps_titles(s)
+
+    # Convert numeric dates into spoken Italian before dot/slash/dash expansions
+    s = _normalize_dates(s)
+
+    # Expand common Italian technical abbreviations ("Art.", "Fig.", "Par.", ...)
+    s = _ABBREV_RE.sub(lambda m: _ITALIAN_ABBREV_EXPANSIONS[m.group(1).lower()], s)
+
+    # Heading number right after expanded section nouns ("Articolo 1. Oggetto" -> "Articolo 1, Oggetto")
+    s = re.sub(
+        rf"\b({_SECTION_NOUNS_PATTERN})\s+(\d+(?:\.\d+)*)\.\s+",
+        lambda m: f"{m.group(1)} {_expand_dotted_sequence(m.group(2))}, ",
+        s,
+    )
+
+    # Roman numerals after section nouns ("Capitolo IV" -> "Capitolo 4")
+    s = re.sub(
+        rf"\b({_SECTION_NOUNS_PATTERN})\s+(XII|XI|IX|VIII|VII|VI|IV|III|II|X|V)\b",
+        lambda m: f"{m.group(1)} {_ROMAN_SECTION_NUMERALS[m.group(2).lower()]}",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # Dotted revision/section numbers after section nouns ("Revisione 1.2" -> "Revisione 1 punto 2")
+    s = re.sub(
+        rf"\b({_SECTION_NOUNS_PATTERN})\s+(\d+(?:\.\d+)+)\b",
+        lambda m: f"{m.group(1)} {_expand_dotted_sequence(m.group(2))}",
+        s,
+    )
+
+    # Version numbers like "v2.6" or "v1.2.3" -> "v 2 punto 6"
+    s = re.sub(
+        r"\b[vV](\d+(?:\.\d+)+)\b",
+        lambda m: f"v {_expand_dotted_sequence(m.group(1))}",
+        s,
+    )
+
+    # Multi-dot numeric identifiers (2+ dots, excluding Italian thousands like 1.000.000)
+    def _replace_multidot(match: re.Match[str]) -> str:
+        token = match.group(0)
+        parts = token.split(".")
+        if len(parts[0]) <= 3 and all(len(p) == 3 for p in parts[1:]):
+            return token
+        return _expand_dotted_sequence(token)
+
+    s = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){2,}\b", _replace_multidot, s)
+
+    # Decimals written with dot ("0.125" or "2.6") -> "virgola"
+    s = re.sub(r"\b0\.(\d+)\b", r"0 virgola \1", s)
+    s = re.sub(r"(?<!\.)\b(\d+)\.(\d{1,2})\b(?!\.)", r"\1 virgola \2", s)
+
+    # URLs and slashes ("client/server" -> "client barra server")
+    s = re.sub(r"://", " ", s)
+    s = re.sub(r"/{1,2}", " barra ", s)
+
+    # Split technical alphanumeric identifiers so single letters and numbers read cleanly
+    s = re.sub(r"\b([A-Z]{1,2})(\d{1,3})\b", r"\1 \2", s)
+    s = re.sub(r"\b([a-z]{1,2})(\d{1,3})(?=\s*(?:[=<>!+\-*/]|:=))", r"\1 \2", s)
+    s = re.sub(r"\b(\d+)([A-Z]{1,3})\b", r"\1 \2", s)
+    s = re.sub(r"\b([A-Za-z]+)-(\d+)\b", r"\1 \2", s)
+
+    # Degrees / temperatures
+    s = re.sub(r"(\d+)\s*°\s*[Cc]\b", r"\1 gradi Celsius", s)
+    s = re.sub(r"(\d+)\s*°\s*[Ff]\b", r"\1 gradi Fahrenheit", s)
+    s = re.sub(r"(\d+)\s*°", r"\1 gradi", s)
+
+    # Operators and symbolic comparisons
+    for pattern, replacement in _OPERATOR_REPLACEMENTS:
+        s = pattern.sub(replacement, s)
+
+    # Multiplication asterisk between operands vs stray asterisk
+    s = re.sub(r"(?<=\w|\))\s*\*\s*(?=\w|\()", " per ", s)
+    s = s.replace("*", " ")
+
+    # Negative numbers preceded by whitespace, start, or delimiter (after operators are expanded)
+    s = re.sub(r"(?:(?<=^)|(?<=[\s,:(]))-(\d+)", r" meno \1", s)
+
+    # Prose dash separators (" - ", " – ", " — ") and glued colons ("key:val", keeping "10:30")
+    s = re.sub(r"\s+[–—-]\s+", ", ", s)
+    s = re.sub(r"(?<=[A-Za-z]):(?=[A-Za-z0-9])", ": ", s)
+
+    # Replace underscores and brackets with spaces so adjacent words never glue together
+    s = re.sub(r"[_()\[\]{}]", " ", s)
+
+    # Collapse whitespace and tidy punctuation spacing
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+    s = re.sub(r"(?:,\s*){2,}", ", ", s)
+
+    if not any(ch.isalnum() for ch in s):
+        return ""
+    return s
 
 
 class PocketTTSEngine:
@@ -117,14 +478,18 @@ class PocketTTSEngine:
         return self._sample_rate
 
     def synthesize(self, text: str, use_cache: bool = True) -> Tuple[np.ndarray, int]:
-        """Synthesize verbatim Italian text to audio array (float32, 1D)."""
+        """Synthesize Italian text to audio array (float32, 1D), applying speech normalization."""
         clean_text = text.strip()
         if not clean_text:
             return np.zeros(int(self.sample_rate * 0.1), dtype=np.float32), self.sample_rate
 
-        # Cache key
+        spoken_text = normalize_text_for_tts(clean_text)
+        if not spoken_text:
+            return np.zeros(int(self.sample_rate * 0.1), dtype=np.float32), self.sample_rate
+
+        # Cache key incorporates normalized spoken form so old raw-symbol caches are bypassed
         cache_key = hashlib.sha256(
-            f"{self.language}_{self.voice}_{self.quantize}_{clean_text}".encode("utf-8")
+            f"{self.language}_{self.voice}_{self.quantize}_tts_v3_{spoken_text}".encode("utf-8")
         ).hexdigest()
         cache_file = self.cache_dir / f"{cache_key}.wav"
 
@@ -142,7 +507,7 @@ class PocketTTSEngine:
 
             audio_tensor = self._model.generate_audio(
                 model_state=self._voice_state,
-                text_to_generate=clean_text,
+                text_to_generate=spoken_text,
                 copy_state=True,
             )
 

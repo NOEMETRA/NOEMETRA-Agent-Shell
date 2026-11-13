@@ -82,3 +82,43 @@ def test_extractor_preserves_trailing_text_without_terminal_punctuation():
             "Clausola finale critica",
         ]
 
+
+def test_extractor_preserves_technical_numbering_and_abbreviations():
+    extractor = DocumentExtractor()
+
+    numbered = "1. Configurazione di rete. 2. Verifica finale."
+    assert extractor._split_into_sentences(numbered) == [
+        "1. Configurazione di rete.",
+        "2. Verifica finale.",
+    ]
+
+    nested = "1.2.3. Sottocapitolo tecnico con P1=10 e client/server."
+    assert extractor._split_into_sentences(nested) == [
+        "1.2.3. Sottocapitolo tecnico con P1=10 e client/server.",
+    ]
+
+    article = "Art. 1. Oggetto e Fig. 2 versione v2.6."
+    assert extractor._split_into_sentences(article) == [
+        "Art. 1. Oggetto e Fig. 2 versione v2.6.",
+    ]
+
+
+def test_extractor_splits_all_caps_heading_before_body_text():
+    import pymupdf
+
+    extractor = DocumentExtractor()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "headings.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "1. INTRODUZIONE\nIl sistema usa REST API dal 13/11/2026.")
+        doc.save(str(pdf_path))
+        doc.close()
+
+        extracted = extractor.extract(pdf_path)
+        texts = [s.text for s in extracted.all_sentences]
+        assert texts == [
+            "1. INTRODUZIONE",
+            "Il sistema usa REST API dal 13/11/2026.",
+        ]
+
