@@ -595,6 +595,16 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
       expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('ChatGPT Codex (Quote) (gpt-5.4-mini)')
     })
 
+    // Selecting a 0-model offline provider keeps selector synced to active backend provider & opens drawer pre-initialized
+    fireEvent.change(providerSelect, { target: { value: 'unsloth_studio' } })
+    await waitFor(() => {
+      expect(providerSelect.value).toBe('openai-codex')
+      const drawerRt = view.container.querySelector('.hv-custom-runtime-row select[aria-label="Runtime locale"]') as HTMLSelectElement
+      const drawerUrl = view.container.querySelector('.hv-custom-runtime-row input[aria-label="Endpoint runtime locale"]') as HTMLInputElement
+      expect(drawerRt?.value).toBe('unsloth_studio')
+      expect(drawerUrl?.value).toBe('http://127.0.0.1:8888/v1')
+    })
+
     view.unmount()
   })
 })

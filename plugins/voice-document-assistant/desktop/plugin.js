@@ -2855,9 +2855,13 @@ function VoiceDocumentPage({ ctx, controller }) {
       openLocalConfigDrawer()
       return
     }
-    setSelectedProvider(nextProv)
     const nextRealModels = getModelsForProvider(nextProv).filter((o) => !o.disabled && o.value !== '__configure_local__')
     if (nextRealModels.length === 0) {
+      openLocalConfigDrawer(nextProv)
+      host.notify({
+        kind: 'info',
+        message: `${PROVIDER_DISPLAY_NAMES[nextProv] || nextProv} non ha modelli disponibili: configura URL o cartella qui sotto (attivo: ${PROVIDER_DISPLAY_NAMES[activeLlmProvider] || activeLlmProvider}).`
+      })
       return
     }
     const targetModel = nextProv === activeLlmProvider && nextRealModels.some((o) => o.value === activeLlmModel)
@@ -2869,6 +2873,7 @@ function VoiceDocumentPage({ ctx, controller }) {
     try {
       await controller.setLlmModel(targetModel, nextProv, runtimeUrl)
       prevBackendProviderRef.current = nextProv
+      setSelectedProvider(nextProv)
       host.notify({ kind: 'info', message: `Modello Analista impostato su: ${targetModel} (${PROVIDER_DISPLAY_NAMES[nextProv] || nextProv})` })
     } catch (err) {
       host.notifyError(err, 'Errore cambio runtime Analista')

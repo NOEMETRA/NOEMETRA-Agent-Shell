@@ -1194,53 +1194,6 @@
       } catch (_) {}
     }
 
-    llmProviderSelect.onchange = async () => {
-      const nextProv = llmProviderSelect.value || 'ollama';
-      if (nextProv === '__configure_local__') {
-        document.getElementById('localDirsPanel').style.display = 'flex';
-        llmProviderSelect.value = selectedWebProvider || 'ollama';
-        return;
-      }
-      selectedWebProvider = nextProv;
-      if (lastModelsInfo) renderModelSelectors(lastModelsInfo);
-      const modelItems = lastModelsInfo ? getWebModelsForProvider(lastModelsInfo, nextProv).filter(i => !i.disabled && i.value !== '__configure_local__') : [];
-      if (!modelItems.length) return;
-      const llm_model = modelItems[0].value;
-      const runtimeUrl = nextProv === 'ollama'
-        ? (lastModelsInfo && lastModelsInfo.ollama && lastModelsInfo.ollama.url)
-        : (lastModelsInfo && lastModelsInfo.local_runtimes && lastModelsInfo.local_runtimes[nextProv] && lastModelsInfo.local_runtimes[nextProv].url);
-      await api('/playback/config', {
-        method: 'POST',
-        body: JSON.stringify({ llm_model, llm_provider: nextProv, ...(runtimeUrl ? { llm_base_url: runtimeUrl } : {}) })
-      });
-      prevBackendProv = nextProv;
-      fetchStatus();
-    };
-
-    llmModelSelect.onchange = async () => {
-      const llm_model = llmModelSelect.value || '';
-      if (!llm_model) return;
-      if (llm_model === '__configure_local__') {
-        document.getElementById('localDirsPanel').style.display = 'flex';
-        return;
-      }
-      const llm_provider = selectedWebProvider || 'ollama';
-      const runtimeUrl = llm_provider === 'ollama'
-        ? (lastModelsInfo && lastModelsInfo.ollama && lastModelsInfo.ollama.url)
-        : (lastModelsInfo && lastModelsInfo.local_runtimes && lastModelsInfo.local_runtimes[llm_provider] && lastModelsInfo.local_runtimes[llm_provider].url);
-      await api('/playback/config', {
-        method: 'POST',
-        body: JSON.stringify({ llm_model, llm_provider, ...(runtimeUrl ? { llm_base_url: runtimeUrl } : {}) })
-      });
-      prevBackendProv = llm_provider;
-      fetchStatus();
-    };
-
-    refreshModelsBtn.onclick = () => loadModels(true);
-    document.getElementById('localDirsBtn').onclick = () => {
-      const p = document.getElementById('localDirsPanel');
-      p.style.display = p.style.display === 'none' ? 'flex' : 'none';
-    };
     const customRuntimeDefaults = {
       ollama: 'http://127.0.0.1:11434',
       unsloth_studio: 'http://127.0.0.1:8888/v1',
@@ -1250,6 +1203,103 @@
       koboldcpp: 'http://127.0.0.1:5001/v1',
       vllm: 'http://127.0.0.1:8000/v1',
       custom: 'http://127.0.0.1:8000/v1'
+    };
+
+    const openLocalDirsPanel = (preferredProv = null) => {
+      const panel = document.getElementById('localDirsPanel');
+      const rtSel = document.getElementById('customRuntimeSelect');
+      const urlInp = document.getElementById('customRuntimeUrlInput');
+      const modInp = document.getElementById('customRuntimeModelInput');
+      const activeProv = (currentStatus && currentStatus.llm_provider) || 'ollama';
+      const activeMod = (currentStatus && currentStatus.llm_model) || '';
+      const candidate = (preferredProv && customRuntimeDefaults[preferredProv])
+        ? preferredProv
+        : (customRuntimeDefaults[selectedWebProvider]
+            ? selectedWebProvider
+            : (customRuntimeDefaults[activeProv] ? activeProv : 'ollama'));
+      if (rtSel) rtSel.value = candidate;
+      const rtUrl = candidate === 'ollama'
+        ? (lastModelsInfo && lastModelsInfo.ollama && lastModelsInfo.ollama.url)
+        : (lastModelsInfo && lastModelsInfo.local_runtimes && lastModelsInfo.local_runtimes[candidate] && lastModelsInfo.local_runtimes[candidate].url);
+      if (urlInp) urlInp.value = rtUrl || customRuntimeDefaults[candidate] || '';
+      if (modInp) {
+        if (candidate === activeProv && activeMod) {
+          modInp.value = activeMod;
+        } else {
+          const rtModels = candidate === 'ollama'
+            ? (lastModelsInfo && lastModelsInfo.ollama && lastModelsInfo.ollama.models)
+            : (lastModelsInfo && lastModelsInfo.local_runtimes && lastModelsInfo.local_runtimes[candidate] && lastModelsInfo.local_runtimes[candidate].models);
+          modInp.value = (Array.isArray(rtModels) && rtModels[0]) || '';
+        }
+      }
+      if (panel) panel.style.display = 'flex';
+    };
+
+    llmProviderSelect.onchange = async () => {
+      const nextProv = llmProviderSelect.value || 'ollama';
+      if (nextProv === '__configure_local__') {
+        openLocalDirsPanel(selectedWebProvider);
+        llmProviderSelect.value = selectedWebProvider || 'ollama';
+        return;
+      }
+      const modelItems = lastModelsInfo ? getWebModelsForProvider(lastModelsInfo, nextProv).filter(i => !i.disabled && i.value !== '__configure_local__') : [];
+      if (!modelItems.length) {
+        openLocalDirsPanel(nextProv);
+        llmProviderSelect.value = selectedWebProvider || 'ollama';
+        return;
+      }
+      const llm_model = modelItems[0].value;
+      const runtimeUrl = nextProv === 'ollama'
+        ? (lastModelsInfo && lastModelsInfo.ollama && lastModelsInfo.ollama.url)
+        : (lastModelsInfo && lastModelsInfo.local_runtimes && lastModelsInfo.local_runtimes[nextProv] && lastModelsInfo.local_runtimes[nextProv].url);
+      try {
+        await api('/playback/config', {
+          method: 'POST',
+          body: JSON.stringify({ llm_model, llm_provider: nextProv, ...(runtimeUrl ? { llm_base_url: runtimeUrl } : {}) })
+        });
+        selectedWebProvider = nextProv;
+        prevBackendProv = nextProv;
+        if (lastModelsInfo) renderModelSelectors(lastModelsInfo);
+        fetchStatus();
+      } catch (err) {
+        llmProviderSelect.value = selectedWebProvider || 'ollama';
+        alert(err.message);
+      }
+    };
+
+    llmModelSelect.onchange = async () => {
+      const llm_model = llmModelSelect.value || '';
+      if (!llm_model) return;
+      if (llm_model === '__configure_local__') {
+        openLocalDirsPanel(selectedWebProvider);
+        if (lastModelsInfo) renderModelSelectors(lastModelsInfo);
+        return;
+      }
+      const llm_provider = selectedWebProvider || 'ollama';
+      const runtimeUrl = llm_provider === 'ollama'
+        ? (lastModelsInfo && lastModelsInfo.ollama && lastModelsInfo.ollama.url)
+        : (lastModelsInfo && lastModelsInfo.local_runtimes && lastModelsInfo.local_runtimes[llm_provider] && lastModelsInfo.local_runtimes[llm_provider].url);
+      try {
+        await api('/playback/config', {
+          method: 'POST',
+          body: JSON.stringify({ llm_model, llm_provider, ...(runtimeUrl ? { llm_base_url: runtimeUrl } : {}) })
+        });
+        prevBackendProv = llm_provider;
+        fetchStatus();
+      } catch (err) {
+        if (lastModelsInfo) renderModelSelectors(lastModelsInfo);
+        alert(err.message);
+      }
+    };
+
+    refreshModelsBtn.onclick = () => loadModels(true);
+    document.getElementById('localDirsBtn').onclick = () => {
+      const p = document.getElementById('localDirsPanel');
+      if (p.style.display === 'none') {
+        openLocalDirsPanel(selectedWebProvider);
+      } else {
+        p.style.display = 'none';
+      }
     };
     document.getElementById('customRuntimeSelect').onchange = (e) => {
       const rid = e.target.value;
@@ -1269,7 +1319,10 @@
           method: 'POST',
           body: JSON.stringify({ llm_model, llm_provider, ...(llm_base_url ? { llm_base_url } : {}) })
         });
+        selectedWebProvider = llm_provider;
+        prevBackendProv = llm_provider;
         loadModels(false);
+        fetchStatus();
       } catch (err) { alert(err.message); }
     };
     document.getElementById('addLocalDirBtn').onclick = async () => {
