@@ -279,6 +279,14 @@ class ConfigRequest(BaseModel):
     skip_headers_footers: Optional[bool] = None
     allow_remote: Optional[bool] = None
     llm_model: Optional[str] = None
+    llm_provider: Optional[str] = None
+    llm_base_url: Optional[str] = None
+
+
+class LocalModelDirsRequest(BaseModel):
+    path: Optional[str] = None
+    action: str = "add"  # "add" | "remove" | "set"
+    dirs: Optional[List[str]] = None
 
 
 class SpeakTextRequest(BaseModel):
@@ -648,8 +656,17 @@ async def configure_playback(req: ConfigRequest, request: Request):
         assistant.set_skip_headers_footers(req.skip_headers_footers)
     if req.allow_remote is not None:
         assistant.set_allow_remote(req.allow_remote)
+    if req.llm_provider:
+        assistant.router.set_provider(req.llm_provider, base_url=req.llm_base_url)
     if req.llm_model:
         assistant.router.set_model(req.llm_model)
+
+    raw_prov = str(getattr(assistant.router, "_raw_provider", "") or "")
+    exposed_provider = (
+        raw_prov
+        if (assistant.router.default_provider == "openai_compatible" and raw_prov in ("lmstudio", "llamacpp", "unsloth_studio", "jan", "koboldcpp", "vllm", "custom"))
+        else assistant.router.default_provider
+    )
 
     return {
         "status": "success",
@@ -658,6 +675,7 @@ async def configure_playback(req: ConfigRequest, request: Request):
         "skip_headers_footers": assistant.player.skip_headers_footers,
         "allow_remote": assistant.router.allow_remote,
         "llm_model": assistant.router.ollama_model,
+        "llm_provider": exposed_provider,
     }
 
 
@@ -688,10 +706,31 @@ async def ask_question(req: AskRequest, request: Request):
 
 
 @router.get("/models")
-async def get_models(request: Request):
-    """Return local and remote model provider statuses dispatched to a worker thread."""
+async def get_models(request: Request, refresh: bool = False):
+    """Return local runtimes, disk GGUF/Unsloth models, Codex OAuth, cloud free catalogs, and privacy posture."""
     assistant = _req_assistant(request)
-    return await asyncio.to_thread(assistant.router.get_providers_status)
+    return await asyncio.to_thread(assistant.router.get_providers_status, refresh)
+
+
+@router.post("/models/local-dirs")
+async def update_local_model_dirs(req: LocalModelDirsRequest, request: Request):
+    """Add, remove, or replace user-configured local GGUF/Unsloth scan directories for the active profile."""
+    assistant = _req_assistant(request)
+    action = (req.action or "add").strip().lower()
+    try:
+        if action == "remove":
+            if not req.path:
+                raise ValueError("Specificare 'path' da rimuovere.")
+            assistant.remove_local_model_dir(req.path)
+        elif action == "set":
+            assistant._save_model_dirs(req.dirs or [])
+        else:
+            if not req.path:
+                raise ValueError("Specificare 'path' della cartella modelli locale.")
+            assistant.add_local_model_dir(req.path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return await asyncio.to_thread(assistant.router.get_providers_status, False)
 
 
 @router.post("/config/privacy")

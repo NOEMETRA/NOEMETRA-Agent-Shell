@@ -646,6 +646,335 @@ def test_configured_hermes_providers_nous_and_gemini_preserved_and_routed_via_ru
         router_gemini.generate(prompt="Test", provider="invalid_nonexistent_xyz")
 
 
+def test_local_gguf_unsloth_discovery_and_runner(tmp_path, monkeypatch):
+    """Verify cross-PC GGUF/Unsloth scanning deduplicates splits, skips mmproj, and runs via llama-server."""
+    from hermes_voice.local_discovery import scan_local_gguf_models
+
+    unsloth_dir = tmp_path / "unsloth" / "Qwen3-14B-GGUF"
+    unsloth_dir.mkdir(parents=True)
+    gguf_file = unsloth_dir / "Qwen3-14B-UD-Q4_K_M.gguf"
+    gguf_file.write_bytes(b"GGUF" + b"\x00" * 64)
+    # Ignore projector files and merge multi-part splits into a single entry
+    (unsloth_dir / "mmproj-BF16.gguf").write_bytes(b"GGUF" + b"\x00" * 32)
+    (unsloth_dir / "Llama-3.3-70B-Q4_K_M-00001-of-00002.gguf").write_bytes(b"GGUF" + b"\x00" * 40)
+    (unsloth_dir / "Llama-3.3-70B-Q4_K_M-00002-of-00002.gguf").write_bytes(b"GGUF" + b"\x00" * 40)
+
+    discovered = scan_local_gguf_models(extra_dirs=[str(tmp_path)])
+    names = [m["file_name"] for m in discovered]
+    assert "Qwen3-14B-UD-Q4_K_M.gguf" in names
+    assert "Llama-3.3-70B-Q4_K_M-00001-of-00002.gguf" in names
+    assert "mmproj-BF16.gguf" not in names
+
+    unsloth_entry = next(m for m in discovered if m["file_name"] == "Qwen3-14B-UD-Q4_K_M.gguf")
+    assert unsloth_entry["source"] == "unsloth"
+    assert unsloth_entry["quant"] == "UD-Q4_K_M"
+
+    router = ModelRouter(allow_remote=False, local_model_dirs=[str(tmp_path)])
+    runner_calls = []
+    monkeypatch.setattr(
+        router._gguf_runner,
+        "ensure_running",
+        lambda path: (runner_calls.append(str(path)) or ("http://127.0.0.1:41234/v1", "Qwen3-14B")),
+    )
+    chat_calls = []
+    monkeypatch.setattr(
+        router,
+        "_call_openai_compatible",
+        lambda **kw: (chat_calls.append(kw) or "Risposta Unsloth GGUF locale"),
+    )
+
+    router.set_provider("gguf")
+    router.set_model(str(gguf_file))
+    out = router.generate(prompt="Riassumi sezione 1")
+    assert out == "Risposta Unsloth GGUF locale"
+    assert len(runner_calls) == 1
+    assert chat_calls[0]["base_url"] == "http://127.0.0.1:41234/v1"
+    assert chat_calls[0]["model"] == "Qwen3-14B"
+
+
+def test_codex_oauth_openrouter_free_and_ollama_cloud_routing(monkeypatch):
+    """Verify openai-codex (ChatGPT quotas), OpenRouter :free, and Ollama Cloud enforce privacy and route cleanly."""
+    import types
+
+    scoped_secrets = {
+        "OPENROUTER_API_KEY": "sk-or-test-key",
+        "OLLAMA_API_KEY": "ollama-cloud-test-key",
+    }
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret",
+        lambda name, default=None: scoped_secrets.get(name, default),
+    )
+
+    # Mock Hermes core Codex client resolution
+    codex_calls = []
+
+    class _FakeResp:
+        def __init__(self, text, model):
+            self.model = model
+            self.choices = [types.SimpleNamespace(message=types.SimpleNamespace(content=text))]
+
+    class _FakeClient:
+        base_url = "https://chatgpt.com/backend-api/codex"
+        chat = types.SimpleNamespace(
+            completions=types.SimpleNamespace(
+                create=lambda **kw: (codex_calls.append(kw) or _FakeResp("Risposta da ChatGPT Codex", kw.get("model")))
+            )
+        )
+
+    def _mock_resolve(provider, model=None, explicit_base_url=None, explicit_api_key=None, **kw):
+        if provider == "openai-codex":
+            return _FakeClient(), model or "gpt-5.4"
+        return None, None
+
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", _mock_resolve)
+    monkeypatch.setattr("hermes_cli.auth.get_auth_status", lambda prov: {"logged_in": prov == "openai-codex"})
+
+    router = ModelRouter(allow_remote=False)
+
+    # 1. Privacy gate blocks openai-codex, openrouter, and ollama-cloud while local-only
+    for remote_prov in ("openai-codex", "openrouter", "ollama-cloud"):
+        router.set_provider(remote_prov)
+        with pytest.raises(PermissionError, match="VIOLAZIONE VINCOLO PRIVACY"):
+            router.generate(prompt="Domanda protetta")
+
+    # 2. Enabling allow_remote permits openai-codex using ChatGPT OAuth session
+    router.set_allow_remote(True)
+    router.set_provider("openai-codex")
+    router.set_model("gpt-5.4")
+    assert router.generate(prompt="Domanda via quote ChatGPT") == "Risposta da ChatGPT Codex"
+    assert codex_calls[-1]["model"] == "gpt-5.4"
+
+    # 3. OpenRouter :free and Ollama Cloud route directly with profile-scoped keys
+    http_calls = []
+    monkeypatch.setattr(
+        router,
+        "_call_openai_compatible",
+        lambda **kw: (http_calls.append(kw) or f"Cloud OK ({kw['model']})"),
+    )
+
+    router.set_provider("openrouter")
+    router.set_model("meta-llama/llama-3.3-70b-instruct:free")
+    assert "meta-llama/llama-3.3-70b-instruct:free" in router.generate(prompt="Test OpenRouter Free")
+    assert http_calls[-1]["base_url"] == "https://openrouter.ai/api/v1"
+    assert http_calls[-1]["api_key"] == "sk-or-test-key"
+
+    router.set_provider("ollama-cloud")
+    router.set_model("gpt-oss:120b-cloud")
+    # Force fallback HTTP route when core auxiliary client raises for ollama-cloud
+    monkeypatch.setattr(
+        router,
+        "_call_hermes_runtime_provider",
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("fallback to HTTP")),
+    )
+    assert "gpt-oss:120b-cloud" in router.generate(prompt="Test Ollama Cloud")
+    assert http_calls[-1]["base_url"] == "https://ollama.com/v1"
+    assert http_calls[-1]["api_key"] == "ollama-cloud-test-key"
+
+    # 4. get_providers_status exposes codex_oauth, openrouter.free_models, ollama_cloud, local_runtimes, local_gguf
+    status = router.get_providers_status()
+    assert status["codex_oauth"]["configured"] is True
+    assert "gpt-5.4" in status["codex_oauth"]["models"]
+    assert status["cloud_providers"]["openrouter"]["configured"] is True
+    assert any(m.endswith(":free") for m in status["cloud_providers"]["openrouter"]["free_models"])
+    assert status["cloud_providers"]["ollama_cloud"]["configured"] is True
+    assert "local_runtimes" in status
+    assert "local_gguf" in status
+
+
+def test_local_discovery_unsloth_llama_and_non_chat_gguf_filter(tmp_path, monkeypatch):
+    """Unsloth llama-server path discovery and non-chat GGUF exclusion work cross-platform."""
+    import struct
+    import sys
+    from pathlib import Path
+    from hermes_voice.local_discovery import find_llama_server_binary, scan_local_gguf_models
+
+    fake_home = tmp_path / "home"
+    unsloth_dir = fake_home / ".unsloth" / "llama.cpp" / "build" / "bin" / "Release"
+    unsloth_dir.mkdir(parents=True)
+    exe_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+    fake_bin = unsloth_dir / exe_name
+    fake_bin.write_bytes(b"binary")
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.delenv("LLAMA_SERVER_PATH", raising=False)
+    monkeypatch.setattr("shutil.which", lambda _: None)
+
+    found = find_llama_server_binary()
+    assert found is not None
+    assert Path(found) == fake_bin
+
+    # Build minimal GGUF v3 files: one chat GGUF (llama) and non-chat image/MTP GGUFs
+    def _write_minimal_gguf(target: Path, arch: str):
+        # Magic GGUF + version 3 + tensor_count 0 + kv_count 1
+        key = b"general.architecture"
+        val = arch.encode("utf-8")
+        payload = bytearray()
+        payload += b"GGUF"
+        payload += struct.pack("<IQQ", 3, 0, 1)
+        payload += struct.pack("<Q", len(key)) + key
+        payload += struct.pack("<I", 8)  # GGUF_TYPE_STRING
+        payload += struct.pack("<Q", len(val)) + val
+        target.write_bytes(bytes(payload))
+
+    models_dir = tmp_path / "ggufs"
+    models_dir.mkdir()
+    chat_gguf = models_dir / "Qwen3-8B-Q4_K_M.gguf"
+    img_gguf = models_dir / "flux-2-klein-4b-Q4_K_M.gguf"
+    mtp_gguf = models_dir / "mtp-gemma-4-12b-it.gguf"
+    _write_minimal_gguf(chat_gguf, "llama")
+    _write_minimal_gguf(img_gguf, "flux")
+    _write_minimal_gguf(mtp_gguf, "gemma4-assistant")
+
+    discovered = scan_local_gguf_models(extra_dirs=[str(models_dir)])
+    paths = {Path(m["path"]) for m in discovered}
+    assert chat_gguf in paths
+    assert img_gguf not in paths
+    assert mtp_gguf not in paths
+
+
+def test_ollama_ignores_remote_slash_slug_and_codex_cli_fallback(tmp_path, monkeypatch):
+    """Remote slash slugs don't leak into Ollama, Codex CLI exec respects privacy, and refresh/llamacpp respect allow_remote."""
+    import json
+    import types
+    from pathlib import Path
+
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text(
+        json.dumps({"auth_mode": "chatgpt", "tokens": {"refresh_token": "cli-ref"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        "hermes_voice.model_router.shutil.which",
+        lambda name: "C:/codex.exe" if name == "codex" else None,
+    )
+    monkeypatch.setattr("hermes_voice.model_router.discover_local_servers", lambda **kw: {})
+    monkeypatch.setattr("hermes_voice.model_router.scan_local_gguf_models", lambda **kw: [])
+    monkeypatch.setattr("hermes_cli.auth.get_auth_status", lambda prov: {"logged_in": False})
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"provider": "ollama", "default": "anthropic/claude-opus-4.6"}},
+    )
+
+    router = ModelRouter(allow_remote=False)
+    assert router.default_provider == "ollama"
+    assert router.ollama_model == "gemma4:12b"
+
+    # Custom Ollama local endpoint updates ollama_base_url (stripping trailing /v1)
+    router.set_provider("ollama", base_url="http://127.0.0.1:11439/v1")
+    assert router.ollama_base_url == "http://127.0.0.1:11439"
+
+    # refresh=True while allow_remote=False must NEVER trigger remote catalog refreshes
+    refresh_flags = []
+    monkeypatch.setattr(
+        "hermes_voice.model_router._fetch_openrouter_catalog",
+        lambda *, refresh=False: (refresh_flags.append(("openrouter", refresh)) or {"free": [], "all": []}),
+    )
+    monkeypatch.setattr(
+        "hermes_voice.model_router._fetch_codex_oauth_catalog",
+        lambda *, refresh=False: (refresh_flags.append(("codex", refresh)) or ["gpt-5.4"]),
+    )
+    status = router.get_providers_status(refresh=True)
+    assert status["codex_oauth"]["configured"] is True
+    assert all(flag is False for _, flag in refresh_flags)
+
+    # llama.cpp configured with a remote custom URL must be blocked while allow_remote=False
+    router.set_provider("llamacpp", base_url="https://remote-llama.example.com/v1")
+    with pytest.raises(PermissionError, match="VIOLAZIONE VINCOLO PRIVACY"):
+        router.generate(prompt="Bloccato remoto llama.cpp")
+
+    # Execution routes through official `codex exec` when Hermes auth store is absent
+    subproc_calls = []
+
+    def _fake_subproc_run(cmd, **kw):
+        subproc_calls.append((cmd, kw))
+        out_idx = cmd.index("-o") + 1
+        Path(cmd[out_idx]).write_text("CodexExec:gpt-5.4", encoding="utf-8")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda *a, **kw: (None, None))
+    monkeypatch.setattr("hermes_voice.model_router.subprocess.run", _fake_subproc_run)
+
+    router.set_provider("openai-codex")
+    router.set_model("gpt-5.4")
+    with pytest.raises(PermissionError, match="VIOLAZIONE VINCOLO PRIVACY"):
+        router.generate(prompt="Privato")
+
+    router.set_allow_remote(True)
+    assert router.generate(prompt="Usa codex CLI") == "CodexExec:gpt-5.4"
+    assert subproc_calls
+    assert "-m" in subproc_calls[-1][0] and "gpt-5.4" in subproc_calls[-1][0]
+
+
+def test_explicit_api_key_not_reused_across_cloud_providers_and_object_models_probe(tmp_path, monkeypatch):
+    """Explicit API key bound to one provider never leaks to another, and dict entries in /models arrays are parsed."""
+    import types
+    from hermes_voice.local_discovery import _probe_openai_compat_models
+
+    # 1. Object entries in fallback `models` array are extracted cleanly
+    monkeypatch.setattr("hermes_voice.local_discovery._is_loopback_port_open", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        "hermes_voice.local_discovery.requests.get",
+        lambda *a, **kw: types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {"models": [{"name": "llama-obj-1"}, {"model": "llama-obj-2"}, "raw-str"]},
+        ),
+    )
+    probed = _probe_openai_compat_models("custom", "Custom", "http://127.0.0.1:8080/v1")
+    assert probed["status"] == "online"
+    assert probed["models"] == ["llama-obj-1", "llama-obj-2", "raw-str"]
+
+    monkeypatch.setattr(
+        "hermes_voice.local_discovery.requests.get",
+        lambda *a, **kw: types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {"data": ["str-data-model", {"id": "dict-data-model"}]},
+        ),
+    )
+    probed_data = _probe_openai_compat_models("custom", "Custom", "http://127.0.0.1:8080/v1")
+    assert probed_data["models"] == ["str-data-model", "dict-data-model"]
+
+    # 2. Explicit remote_api_key for OpenAI / remote must NOT leak to OpenRouter or Anthropic
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr("hermes_voice.model_router._is_hermes_provider_configured_offline", lambda *_: False)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+
+    router = ModelRouter(
+        default_provider="openai",
+        remote_api_key="sk-openai-secret-only",
+        allow_remote=True,
+    )
+    router.set_provider("openrouter")
+    router.set_model("meta-llama/llama-3.3-70b-instruct:free")
+    with pytest.raises(ValueError, match="Nessuna credenziale"):
+        router.generate(prompt="No cross-provider leak")
+
+    router_generic = ModelRouter(
+        default_provider="remote",
+        remote_api_key="sk-generic-remote-only",
+        allow_remote=True,
+    )
+    router_generic.set_provider("anthropic")
+    with pytest.raises(ValueError, match="Nessuna credenziale"):
+        router_generic.generate(prompt="No remote->anthropic key leak")
+
+    router_llama_remote = ModelRouter(
+        default_provider="llamacpp",
+        remote_base_url="https://remote-llama.example.com/v1",
+        allow_remote=True,
+    )
+    assert router_llama_remote.is_active_endpoint_local() is False
+
+    router.set_provider("custom", base_url="https://remote-custom.example.com/v1")
+    assert router.is_active_endpoint_local() is False
+
+
 
 
 

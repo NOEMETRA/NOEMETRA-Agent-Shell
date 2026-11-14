@@ -1217,6 +1217,61 @@ def test_api_skip_headers_config_and_text_tts_endpoint(monkeypatch):
     assert captured_tts_inputs == ["Sintesi. Sistema pronto."]
 
 
+def test_api_playback_config_llm_provider_and_status_exposure():
+    """Verify /playback/config switches both llm_provider and llm_model and /status exposes them."""
+    assistant = get_assistant()
+    prev_model = assistant.router.ollama_model
+    prev_provider = assistant.router.default_provider
+    try:
+        res_cfg = client.post(
+            "/api/plugins/voice-document-assistant/playback/config",
+            json={"llm_model": "qwen2.5:14b", "llm_provider": "ollama"},
+        )
+        assert res_cfg.status_code == 200
+        cfg_data = res_cfg.json()
+        assert cfg_data["llm_model"] == "qwen2.5:14b"
+        assert cfg_data["llm_provider"] == "ollama"
+
+        res_status = client.get("/api/plugins/voice-document-assistant/status")
+        assert res_status.status_code == 200
+        status_data = res_status.json()
+        assert status_data["llm_model"] == "qwen2.5:14b"
+        assert status_data["llm_provider"] == "ollama"
+    finally:
+        assistant.router.set_model(prev_model)
+        assistant.router.set_provider(prev_provider)
+
+
+def test_api_local_model_dirs_persistence_and_gguf_discovery(tmp_path):
+    """Verify POST /models/local-dirs adds/removes custom GGUF/Unsloth folders and exposes models in GET /models."""
+    assistant = get_assistant()
+    prev_dirs = list(getattr(assistant.router, "local_model_dirs", []) or [])
+    unsloth_dir = tmp_path / "unsloth_models"
+    unsloth_dir.mkdir(parents=True)
+    (unsloth_dir / "Gemma-3-12B-UD-Q4_K_M.gguf").write_bytes(b"GGUF" + b"\x00" * 32)
+    try:
+        res_add = client.post(
+            "/api/plugins/voice-document-assistant/models/local-dirs",
+            json={"action": "add", "path": str(unsloth_dir)},
+        )
+        assert res_add.status_code == 200
+        data_add = res_add.json()
+        assert str(unsloth_dir.resolve()) in data_add["local_gguf"]["custom_dirs"]
+        assert any(
+            m["file_name"] == "Gemma-3-12B-UD-Q4_K_M.gguf"
+            for m in data_add["local_gguf"]["models"]
+        )
+
+        res_rm = client.post(
+            "/api/plugins/voice-document-assistant/models/local-dirs",
+            json={"action": "remove", "path": str(unsloth_dir.resolve())},
+        )
+        assert res_rm.status_code == 200
+        assert str(unsloth_dir.resolve()) not in res_rm.json()["local_gguf"]["custom_dirs"]
+    finally:
+        assistant._save_model_dirs(prev_dirs)
+
+
 
 
 

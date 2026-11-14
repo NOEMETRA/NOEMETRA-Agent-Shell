@@ -10,13 +10,24 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urljoin, urlparse
 import requests
 
+from hermes_voice.local_discovery import (
+    LOCAL_RUNTIME_DEFAULT_URLS,
+    LocalGGUFRunner,
+    discover_local_servers,
+    find_llama_server_binary,
+    get_model_scan_dirs,
+    scan_local_gguf_models,
+)
 from hermes_voice.profile import bind_voice_profile_scope
 
 logger = logging.getLogger(__name__)
@@ -180,7 +191,7 @@ def _match_custom_provider_entry(
 
 
 _OPENAI_COMPAT_LOCAL_ALIASES = frozenset({
-    "custom", "lmstudio", "vllm", "openai_compatible", "codex", "local",
+    "custom", "lmstudio", "vllm", "openai_compatible", "codex", "local", "jan", "koboldcpp", "unsloth_studio", "unsloth",
 })
 _DIRECT_REMOTE_ALIASES = frozenset({
     "remote", "api", "openai", "anthropic", "openrouter",
@@ -188,6 +199,183 @@ _DIRECT_REMOTE_ALIASES = frozenset({
 _LLAMACPP_LOCAL_ALIASES = frozenset({
     "llamacpp", "llama.cpp", "llama-cpp",
 })
+_CODEX_OAUTH_ALIASES = frozenset({
+    "openai-codex", "chatgpt", "chatgpt-codex",
+})
+_OLLAMA_CLOUD_ALIASES = frozenset({
+    "ollama-cloud", "ollama_cloud",
+})
+_GGUF_LOCAL_ALIASES = frozenset({
+    "gguf", "llamacpp-file",
+})
+
+_OPENROUTER_FREE_FALLBACK: List[str] = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "qwen/qwen3-coder:free",
+    "google/gemma-3-27b-it:free",
+    "deepseek/deepseek-r1-0528:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+]
+
+_OLLAMA_CLOUD_FALLBACK: List[str] = [
+    "gpt-oss:120b-cloud",
+    "qwen3-coder:480b-cloud",
+    "deepseek-v3.1:671b-cloud",
+    "glm-4.6:cloud",
+]
+
+_CODEX_MODELS_FALLBACK: List[str] = [
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+]
+
+_CLOUD_CATALOG_CACHE: Dict[str, tuple[float, Any]] = {}
+_CLOUD_CATALOG_TTL_SECONDS = 600.0
+
+
+def _fetch_openrouter_catalog(refresh: bool = False) -> Dict[str, List[str]]:
+    """Fetch OpenRouter free models (and top catalog entries) with TTL cache and offline fallback."""
+    cache_key = "openrouter"
+    now = time.monotonic()
+    cached = _CLOUD_CATALOG_CACHE.get(cache_key)
+    if not refresh and cached and (now - cached[0]) < _CLOUD_CATALOG_TTL_SECONDS:
+        return cached[1]
+
+    free_models: List[str] = []
+    all_models: List[str] = []
+
+    if refresh:
+        try:
+            resp = requests.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Accept": "application/json"},
+                timeout=3.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", [])
+                if isinstance(data, list):
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        mid = str(item.get("id") or "").strip()
+                        if not mid:
+                            continue
+                        pricing = item.get("pricing") if isinstance(item.get("pricing"), dict) else {}
+                        is_zero = (
+                            str(pricing.get("prompt", "")).strip() == "0"
+                            and str(pricing.get("completion", "")).strip() == "0"
+                        )
+                        if mid.endswith(":free") or is_zero:
+                            if mid not in free_models:
+                                free_models.append(mid)
+                        if len(all_models) < 120 and mid not in all_models:
+                            all_models.append(mid)
+        except Exception as exc:
+            logger.debug("Fetch catalogo OpenRouter fallito: %s", exc)
+
+    if not free_models:
+        # Read Hermes cached/curated OpenRouter list if present locally before static fallback
+        with suppress(Exception):
+            from hermes_cli.models import fetch_openrouter_models
+
+            curated = fetch_openrouter_models(cache_only=True)
+            for row in curated or []:
+                mid = str(row[0] if isinstance(row, (list, tuple)) else row).strip()
+                if mid and mid.endswith(":free") and mid not in free_models:
+                    free_models.append(mid)
+                if mid and len(all_models) < 60 and mid not in all_models:
+                    all_models.append(mid)
+
+    for fallback_id in _OPENROUTER_FREE_FALLBACK:
+        if fallback_id not in free_models:
+            free_models.append(fallback_id)
+        if fallback_id not in all_models:
+            all_models.append(fallback_id)
+
+    result = {"free_models": free_models[:60], "models": all_models[:120]}
+    _CLOUD_CATALOG_CACHE[cache_key] = (now, result)
+    return result
+
+
+def _fetch_ollama_cloud_catalog(api_key: str = "", refresh: bool = False) -> List[str]:
+    """Resolve Ollama Cloud models using Hermes cache/live API with safe fallback."""
+    cache_key = "ollama_cloud"
+    now = time.monotonic()
+    cached = _CLOUD_CATALOG_CACHE.get(cache_key)
+    if not refresh and cached and (now - cached[0]) < _CLOUD_CATALOG_TTL_SECONDS:
+        return list(cached[1])
+
+    models: List[str] = []
+    with suppress(Exception):
+        from hermes_cli.models_local import fetch_ollama_cloud_models
+
+        fetched = fetch_ollama_cloud_models(
+            api_key=api_key or None,
+            force_refresh=refresh,
+            cache_only=not refresh,
+        )
+        for m in fetched or []:
+            ms = str(m or "").strip()
+            if ms and ms not in models:
+                models.append(ms)
+
+    if refresh and api_key and not models:
+        try:
+            resp = requests.get(
+                "https://ollama.com/v1/models",
+                headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+                timeout=3.0,
+            )
+            if resp.status_code == 200:
+                for item in resp.json().get("data", []):
+                    mid = str((item or {}).get("id") or "").strip() if isinstance(item, dict) else ""
+                    if mid and mid not in models:
+                        models.append(mid)
+        except Exception as exc:
+            logger.debug("Fetch catalogo Ollama Cloud fallito: %s", exc)
+
+    if not models:
+        models = list(_OLLAMA_CLOUD_FALLBACK)
+
+    _CLOUD_CATALOG_CACHE[cache_key] = (now, models)
+    return list(models)
+
+
+def _fetch_codex_oauth_catalog(refresh: bool = False) -> List[str]:
+    """Resolve ChatGPT Codex models available for the signed-in OAuth account."""
+    cache_key = "openai_codex"
+    now = time.monotonic()
+    cached = _CLOUD_CATALOG_CACHE.get(cache_key)
+    if not refresh and cached and (now - cached[0]) < _CLOUD_CATALOG_TTL_SECONDS:
+        return list(cached[1])
+
+    models: List[str] = []
+    with suppress(Exception):
+        from hermes_cli.auth import _codex_access_token_is_expiring, resolve_codex_runtime_credentials
+        from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, get_codex_model_ids
+
+        access_token = None
+        base_url = None
+        if refresh:
+            creds = resolve_codex_runtime_credentials(read_only=True)
+            tok = creds.get("api_key")
+            base_url = creds.get("base_url")
+            if tok and not _codex_access_token_is_expiring(tok, 0):
+                access_token = tok
+        if access_token:
+            models = list(get_codex_model_ids(access_token=access_token, base_url=base_url) or [])
+        else:
+            models = list(DEFAULT_CODEX_MODELS)
+
+    if not models:
+        models = list(_CODEX_MODELS_FALLBACK)
+
+    _CLOUD_CATALOG_CACHE[cache_key] = (now, models)
+    return list(models)
 
 
 def _resolve_hermes_provider_id(provider_name: Optional[str]) -> Optional[str]:
@@ -197,10 +385,15 @@ def _resolve_hermes_provider_id(provider_name: Optional[str]) -> Optional[str]:
         not norm
         or norm in ("auto", "default", "ollama")
         or norm in _OPENAI_COMPAT_LOCAL_ALIASES
+        or norm in _GGUF_LOCAL_ALIASES
         or norm.startswith("custom:")
         or norm in ("remote", "api")
     ):
         return None
+    if norm in _CODEX_OAUTH_ALIASES:
+        return "openai-codex"
+    if norm in _OLLAMA_CLOUD_ALIASES:
+        return "ollama-cloud"
     if norm in _LLAMACPP_LOCAL_ALIASES or norm == "moa":
         return norm
     try:
@@ -228,6 +421,25 @@ def _is_foreign_builtin_endpoint(canonical_provider: str, url: Optional[str]) ->
         return False
 
 
+def _is_codex_cli_logged_in() -> bool:
+    """Check read-only whether the official `codex` CLI binary and auth session exist (never extracts tokens)."""
+    try:
+        if not shutil.which("codex"):
+            return False
+        codex_home = os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+        auth_path = Path(codex_home).expanduser() / "auth.json"
+        if not auth_path.is_file():
+            return False
+        data = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            return False
+        if isinstance(data.get("tokens"), dict) and bool(data["tokens"].get("refresh_token")):
+            return True
+        return bool(data.get("OPENAI_API_KEY"))
+    except Exception:
+        return False
+
+
 def _is_hermes_provider_configured_offline(canonical_provider: str) -> bool:
     """Check whether a Hermes provider has credentials configured without making network requests."""
     if not canonical_provider:
@@ -246,7 +458,11 @@ def _is_hermes_provider_configured_offline(canonical_provider: str) -> bool:
                 _get_profile_scoped_secret("GOOGLE_APPLICATION_CREDENTIALS")
                 or _get_profile_scoped_secret("VERTEX_CREDENTIALS_PATH")
             )
-        return bool(auth_mod.get_auth_status(canonical_provider).get("logged_in"))
+        if bool(auth_mod.get_auth_status(canonical_provider).get("logged_in")):
+            return True
+        if canonical_provider == "openai-codex":
+            return _is_codex_cli_logged_in()
+        return False
     except Exception:
         return False
 
@@ -265,6 +481,7 @@ class ModelRouter:
         remote_api_key: Optional[str] = None,
         allow_remote: bool = False,
         home_dir: Optional[Union[str, Path]] = None,
+        local_model_dirs: Optional[List[str]] = None,
     ):
         self.home_dir = Path(home_dir).resolve() if home_dir is not None else None
         with (bind_voice_profile_scope(home_dir=self.home_dir) if self.home_dir is not None else nullcontext()):
@@ -277,6 +494,7 @@ class ModelRouter:
                 remote_base_url=remote_base_url,
                 remote_api_key=remote_api_key,
                 allow_remote=allow_remote,
+                local_model_dirs=local_model_dirs,
             )
 
     def _profile_scope(self):
@@ -292,6 +510,7 @@ class ModelRouter:
         remote_base_url: Optional[str] = None,
         remote_api_key: Optional[str] = None,
         allow_remote: bool = False,
+        local_model_dirs: Optional[List[str]] = None,
     ) -> None:
         # Resolve model, provider and endpoint from hermes config if not explicitly provided
         cfg: Dict[str, Any] = {}
@@ -430,18 +649,28 @@ class ModelRouter:
             self.ollama_base_url = "http://127.0.0.1:11434"
 
         # Resolve model name
-        resolved_model = str(ollama_model or cfg_model or "").strip()
+        raw_ollama_model = str(ollama_model or "").strip()
+        raw_cfg_model = str(cfg_model or "").strip()
+        self._has_explicit_model: bool = bool(raw_ollama_model)
+        if resolved_provider == "ollama" and not raw_ollama_model and "/" in raw_cfg_model:
+            # Global/Hermes configs may hold a cloud slug (e.g. "anthropic/claude-opus-4.6");
+            # never adopt a remote provider/model slug as Ollama's active local tag.
+            raw_cfg_model = ""
+        resolved_model = str(raw_ollama_model or raw_cfg_model).strip()
         self._configured_model: Optional[str] = resolved_model or None
         self.ollama_model = resolved_model or "gemma4:12b"
         self.last_model_used: Optional[str] = None
 
         # Resolve OpenAI-compatible / local server endpoint (LM Studio, vLLM, Codex)
+        self._has_explicit_codex_base_url = codex_base_url is not None
         if codex_base_url is not None:
             self.codex_base_url = codex_base_url
         elif cfg_base_url and self.default_provider in ("openai_compatible", "codex"):
             self.codex_base_url = str(cfg_base_url)
         elif raw_provider == "lmstudio":
             self.codex_base_url = _get_profile_scoped_secret("LM_BASE_URL") or "http://127.0.0.1:1234/v1"
+        elif raw_provider in LOCAL_RUNTIME_DEFAULT_URLS:
+            self.codex_base_url = LOCAL_RUNTIME_DEFAULT_URLS[raw_provider]
         elif raw_provider == "custom":
             self.codex_base_url = _get_profile_scoped_secret("CUSTOM_BASE_URL") or "http://127.0.0.1:8000/v1"
         else:
@@ -518,6 +747,21 @@ class ModelRouter:
             self.remote_api_key = resolved_key
 
         self.allow_remote = allow_remote
+        self._initial_provider = resolved_provider
+        self._runtime_override_url: Optional[str] = None
+        self._discovered_local_urls: Dict[str, str] = {}
+        self._gguf_runner = LocalGGUFRunner()
+
+        cfg_voice = cfg.get("voice") if isinstance(cfg.get("voice"), dict) else {}
+        cfg_dirs = cfg_voice.get("local_model_dirs") if isinstance(cfg_voice.get("local_model_dirs"), list) else []
+        raw_dirs = local_model_dirs if local_model_dirs is not None else cfg_dirs
+        self.local_model_dirs: List[str] = [str(d).strip() for d in raw_dirs if str(d or "").strip()]
+
+    def close(self) -> None:
+        """Stop any owned on-demand local runtime processes."""
+        runner = getattr(self, "_gguf_runner", None)
+        if runner is not None:
+            runner.stop()
 
     def _resolve_openai_compatible_api_key(
         self,
@@ -599,7 +843,93 @@ class ModelRouter:
         if model_name and model_name.strip():
             self.ollama_model = model_name.strip()
             self._configured_model = self.ollama_model
+            self._has_explicit_model = True
             logger.info("Modello aggiornato a: %s", self.ollama_model)
+
+    def set_local_model_dirs(self, dirs: List[str]) -> List[str]:
+        """Replace the configured custom local GGUF/Unsloth directories."""
+        cleaned: List[str] = []
+        seen = set()
+        for d in dirs or []:
+            val = str(d or "").strip()
+            if val and val not in seen:
+                seen.add(val)
+                cleaned.append(val)
+        self.local_model_dirs = cleaned
+        return list(self.local_model_dirs)
+
+    def set_provider(self, provider_name: str, base_url: Optional[str] = None) -> None:
+        """Explicitly switch the LLM provider used for question answering."""
+        if not provider_name or not provider_name.strip():
+            return
+        raw = provider_name.strip().lower()
+        self._raw_provider = raw
+        if base_url and str(base_url).strip():
+            self._runtime_override_url = str(base_url).strip()
+        elif raw in self._discovered_local_urls:
+            self._runtime_override_url = self._discovered_local_urls[raw]
+        elif raw in LOCAL_RUNTIME_DEFAULT_URLS:
+            self._runtime_override_url = LOCAL_RUNTIME_DEFAULT_URLS[raw]
+        else:
+            self._runtime_override_url = None
+
+        if raw in _CODEX_OAUTH_ALIASES:
+            self.default_provider = "openai-codex"
+        elif raw in _OLLAMA_CLOUD_ALIASES:
+            self.default_provider = "ollama-cloud"
+        elif raw in _GGUF_LOCAL_ALIASES:
+            self.default_provider = "gguf"
+        elif raw in _OPENAI_COMPAT_LOCAL_ALIASES or raw.startswith("custom:"):
+            self.default_provider = "openai_compatible"
+        else:
+            self.default_provider = raw
+            if raw == "ollama" and base_url and str(base_url).strip():
+                clean_ollama_url = str(base_url).strip().rstrip("/")
+                if clean_ollama_url.endswith("/v1"):
+                    clean_ollama_url = clean_ollama_url[:-3].rstrip("/")
+                if is_local_endpoint(clean_ollama_url) or self.allow_remote:
+                    self.ollama_base_url = clean_ollama_url
+        if self.default_provider != "gguf" and getattr(self, "_gguf_runner", None) is not None:
+            self._gguf_runner.stop()
+        logger.info("Provider aggiornato a: %s (raw=%s)", self.default_provider, self._raw_provider)
+
+    def is_active_endpoint_local(self) -> bool:
+        """Return True if the currently selected provider + endpoint routes strictly to loopback/local disk."""
+        prov = self.default_provider
+        if prov == "gguf":
+            return True
+        if prov == "ollama":
+            return is_local_endpoint(self.ollama_base_url)
+        if prov == "openai_compatible":
+            candidate = (
+                self._runtime_override_url
+                or self.codex_base_url
+                or self._discovered_local_urls.get(self._raw_provider)
+                or LOCAL_RUNTIME_DEFAULT_URLS.get(self._raw_provider)
+                or "http://127.0.0.1:8000/v1"
+            )
+            return is_local_endpoint(str(candidate))
+        if prov in _CODEX_OAUTH_ALIASES or prov in _OLLAMA_CLOUD_ALIASES or prov in ("openrouter", "openai", "anthropic", "remote", "api"):
+            if prov in ("remote", "api") and self.remote_base_url:
+                return is_local_endpoint(self.remote_base_url)
+            if prov == self._initial_provider and self.remote_base_url:
+                return is_local_endpoint(self.remote_base_url)
+            return False
+        # Named Hermes runtime provider (e.g. llamacpp, vllm, etc.)
+        if self._runtime_override_url:
+            return is_local_endpoint(self._runtime_override_url)
+        if self._explicit_remote_base_url and (prov == self._initial_provider or self._raw_provider == self._initial_provider):
+            return is_local_endpoint(self._explicit_remote_base_url)
+        canonical = _resolve_hermes_provider_id(prov)
+        if canonical in _LLAMACPP_LOCAL_ALIASES:
+            cfg_local_url = (
+                self._cfg_base_url
+                if self._cfg_base_url and not _is_foreign_builtin_endpoint(canonical, self._cfg_base_url)
+                else None
+            )
+            url = cfg_local_url or self._discovered_local_urls.get("llamacpp") or LOCAL_RUNTIME_DEFAULT_URLS["llamacpp"]
+            return is_local_endpoint(url)
+        return bool(self._cfg_base_url and is_local_endpoint(self._cfg_base_url))
 
     def select_installed_model(self) -> str:
         """Autodetect and select an installed Ollama model if the configured target model is missing."""
@@ -650,10 +980,21 @@ class ModelRouter:
 
         return {"status": "offline", "error": last_err or "Unknown error", "available_models": []}
 
-    def get_providers_status(self) -> Dict[str, Any]:
-        """Return status and privacy posture for all configured providers."""
+    def get_providers_status(self, refresh: bool = False) -> Dict[str, Any]:
+        """Return status, discovered local runtimes/GGUFs, cloud free catalogs, and privacy posture."""
         with self._profile_scope():
             ollama_health = self.check_ollama_health()
+            avail_ollama = ollama_health.get("available_models") or []
+            if (
+                self.default_provider == "ollama"
+                and ollama_health.get("status") == "online"
+                and avail_ollama
+                and not getattr(self, "_has_explicit_model", True)
+                and self.ollama_model not in avail_ollama
+                and (self.ollama_model == "gemma4:12b" or "/" in str(self.ollama_model))
+            ):
+                self.ollama_model = str(avail_ollama[0])
+                self._configured_model = self.ollama_model
             has_remote_key = bool(self.remote_api_key)
             hermes_id = _resolve_hermes_provider_id(self.default_provider)
             if not has_remote_key and self.default_provider in _DIRECT_REMOTE_ALIASES:
@@ -670,12 +1011,77 @@ class ModelRouter:
             elif not has_remote_key and hermes_id and hermes_id not in _LLAMACPP_LOCAL_ALIASES:
                 has_remote_key = _is_hermes_provider_configured_offline(hermes_id)
 
+            custom_local_eps: List[Dict[str, str]] = []
+            if self.codex_base_url and is_local_endpoint(self.codex_base_url):
+                custom_id = self._raw_provider if self._raw_provider in ("lmstudio", "vllm", "jan", "koboldcpp", "unsloth_studio") else "custom"
+                custom_local_eps.append({"id": custom_id, "label": custom_id, "base_url": self.codex_base_url})
+            if (
+                getattr(self, "_runtime_override_url", None)
+                and is_local_endpoint(str(self._runtime_override_url))
+                and self.default_provider == "openai_compatible"
+            ):
+                override_id = self._raw_provider if self._raw_provider in ("lmstudio", "vllm", "jan", "koboldcpp", "unsloth_studio") else "custom"
+                custom_local_eps.append({"id": override_id, "label": override_id, "base_url": str(self._runtime_override_url)})
+
+            local_runtimes = discover_local_servers(custom_endpoints=custom_local_eps)
+            for rid, info in local_runtimes.items():
+                if info.get("status") == "online" and info.get("url"):
+                    self._discovered_local_urls[rid] = str(info["url"])
+
+            custom_dirs = list(getattr(self, "local_model_dirs", []) or [])
+            scan_dirs = [str(p) for p in get_model_scan_dirs(extra_dirs=custom_dirs, include_missing=False)]
+            gguf_models = scan_local_gguf_models(extra_dirs=custom_dirs)
+            llama_bin_ready = bool(find_llama_server_binary())
+
+            remote_refresh = bool(refresh and self.allow_remote)
+
+            codex_oauth_configured = _is_hermes_provider_configured_offline("openai-codex")
+            codex_oauth_models = _fetch_codex_oauth_catalog(
+                refresh=remote_refresh and codex_oauth_configured
+            )
+
+            openrouter_key = _get_profile_scoped_secret("OPENROUTER_API_KEY") or ""
+            openrouter_configured = bool(
+                openrouter_key
+                or _is_hermes_provider_configured_offline("openrouter")
+                or (self.default_provider == "openrouter" and self.remote_api_key)
+            )
+            openrouter_cat = _fetch_openrouter_catalog(refresh=remote_refresh)
+
+            ollama_cloud_key = _get_profile_scoped_secret("OLLAMA_API_KEY") or ""
+            ollama_cloud_configured = bool(
+                ollama_cloud_key
+                or _is_hermes_provider_configured_offline("ollama-cloud")
+                or (self.default_provider == "ollama-cloud" and self.remote_api_key)
+            )
+            ollama_cloud_models = _fetch_ollama_cloud_catalog(
+                api_key=ollama_cloud_key,
+                refresh=remote_refresh and ollama_cloud_configured,
+            )
+
+            openai_configured = bool(
+                _get_profile_scoped_secret("OPENAI_API_KEY")
+                or _is_hermes_provider_configured_offline("openai-api")
+                or (self.default_provider in ("openai", "remote", "api") and self.remote_api_key)
+            )
+            anthropic_configured = bool(
+                _get_profile_scoped_secret("ANTHROPIC_API_KEY")
+                or _is_hermes_provider_configured_offline("anthropic")
+                or (self.default_provider == "anthropic" and self.remote_api_key)
+            )
+
             remote_configured = bool(
                 (self.remote_base_url and has_remote_key)
                 or (hermes_id and hermes_id not in _LLAMACPP_LOCAL_ALIASES and has_remote_key)
+                or codex_oauth_configured
+                or openrouter_configured
+                or ollama_cloud_configured
+                or openai_configured
+                or anthropic_configured
             )
             return {
                 "default_provider": self.default_provider,
+                "raw_provider": getattr(self, "_raw_provider", self.default_provider),
                 "allow_remote": self.allow_remote,
                 "ollama": {
                     "url": self.ollama_base_url,
@@ -695,6 +1101,51 @@ class ModelRouter:
                     "url": self.remote_base_url,
                     "is_local": False,
                     "authorized": self.allow_remote,
+                },
+                "local_runtimes": local_runtimes,
+                "local_gguf": {
+                    "scan_dirs": scan_dirs,
+                    "custom_dirs": custom_dirs,
+                    "llama_server_available": llama_bin_ready,
+                    "models": gguf_models,
+                },
+                "codex_oauth": {
+                    "configured": codex_oauth_configured,
+                    "auth_mode": "chatgpt",
+                    "models": codex_oauth_models,
+                    "is_local": False,
+                    "authorized": self.allow_remote,
+                },
+                "cloud_providers": {
+                    "openrouter": {
+                        "configured": openrouter_configured,
+                        "free_models": openrouter_cat.get("free_models", []),
+                        "models": openrouter_cat.get("models", []),
+                        "is_local": False,
+                        "authorized": self.allow_remote,
+                    },
+                    "ollama_cloud": {
+                        "configured": ollama_cloud_configured,
+                        "models": ollama_cloud_models,
+                        "is_local": False,
+                        "authorized": self.allow_remote,
+                    },
+                    "openai": {
+                        "configured": openai_configured,
+                        "models": ["gpt-4o-mini", "gpt-4.1", "gpt-5.4-mini", "gpt-5.4"],
+                        "is_local": False,
+                        "authorized": self.allow_remote,
+                    },
+                    "anthropic": {
+                        "configured": anthropic_configured,
+                        "models": [
+                            "claude-3-5-sonnet-20241022",
+                            "claude-haiku-4-5-20251001",
+                            "claude-sonnet-4-6",
+                        ],
+                        "is_local": False,
+                        "authorized": self.allow_remote,
+                    },
                 },
             }
 
@@ -746,11 +1197,52 @@ class ModelRouter:
                 max_tokens=max_tokens,
             )
 
+        if selected_provider in _GGUF_LOCAL_ALIASES:
+            requested_ref = str(model or self.ollama_model or "").strip()
+            candidate_path = Path(requested_ref).expanduser() if requested_ref else None
+            if not candidate_path or not candidate_path.is_file():
+                # Look up by model_id or name in scanned GGUFs
+                matches = scan_local_gguf_models(extra_dirs=getattr(self, "local_model_dirs", []))
+                found = next(
+                    (
+                        m for m in matches
+                        if requested_ref in (m.get("id"), m.get("path"), m.get("model_id"), m.get("name"), m.get("file_name"))
+                    ),
+                    None,
+                )
+                if found:
+                    candidate_path = Path(found["path"])
+            if not candidate_path or not candidate_path.is_file():
+                raise FileNotFoundError(
+                    f"Modello GGUF '{requested_ref}' non trovato nelle cartelle locali configurate."
+                )
+            base_url, served_model = self._gguf_runner.ensure_running(candidate_path)
+            self.last_model_used = candidate_path.stem
+            return self._call_openai_compatible(
+                base_url=base_url,
+                api_key="local",
+                model=served_model,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+            )
+
         elif (
             selected_provider in _OPENAI_COMPAT_LOCAL_ALIASES
             or selected_provider.startswith("custom:")
         ):
-            target_url = self.codex_base_url or "http://127.0.0.1:8000/v1"
+            raw_hint = (provider or self._raw_provider or selected_provider).lower().strip()
+            if self._runtime_override_url and raw_hint == self._raw_provider:
+                target_url = self._runtime_override_url
+            elif self._has_explicit_codex_base_url or raw_hint == self._initial_provider or raw_hint in ("codex", "custom", "openai_compatible"):
+                target_url = self.codex_base_url or LOCAL_RUNTIME_DEFAULT_URLS.get(raw_hint, "http://127.0.0.1:8000/v1")
+            else:
+                target_url = (
+                    self._discovered_local_urls.get(raw_hint)
+                    or LOCAL_RUNTIME_DEFAULT_URLS.get(raw_hint)
+                    or self.codex_base_url
+                    or "http://127.0.0.1:8000/v1"
+                )
             if not is_local_endpoint(target_url) and not self.allow_remote:
                 raise PermissionError(
                     f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint '{target_url}' è remoto. "
@@ -785,19 +1277,45 @@ class ModelRouter:
                     "allow_remote=True con il consenso dell'utente."
                 )
 
-            target_url = self.remote_base_url
+            use_explicit_remote = (
+                self.remote_base_url
+                and (
+                    selected_provider in ("remote", "api")
+                    or selected_provider == self._initial_provider
+                    or (selected_provider == "openrouter" and _host_matches_domain(self.remote_base_url, "openrouter.ai"))
+                    or (selected_provider == "anthropic" and _host_matches_domain(self.remote_base_url, "anthropic.com"))
+                    or (selected_provider == "openai" and _host_matches_domain(self.remote_base_url, "openai.com"))
+                )
+            )
+            target_url = self.remote_base_url if use_explicit_remote else None
             if not target_url:
                 if selected_provider == "openrouter":
-                    target_url = "https://openrouter.ai/api/v1"
+                    target_url = _get_profile_scoped_secret("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
                 elif selected_provider == "anthropic":
-                    target_url = "https://api.anthropic.com/v1"
+                    target_url = _get_profile_scoped_secret("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1"
                 else:
-                    target_url = "https://api.openai.com/v1"
+                    target_url = _get_profile_scoped_secret("OPENAI_BASE_URL") or "https://api.openai.com/v1"
 
             target_key = ""
-            if self.remote_api_key and self.default_provider in (selected_provider, "remote", "api"):
-                target_key = self.remote_api_key
-            elif self.remote_api_key and self.default_provider == "ollama":
+            allow_explicit_key = bool(
+                use_explicit_remote
+                or (
+                    self._explicit_remote_api_key
+                    and (
+                        selected_provider == self._initial_provider
+                        or (
+                            selected_provider in ("remote", "api")
+                            and self._initial_provider in ("remote", "api", "ollama", "openai")
+                        )
+                    )
+                )
+                or (
+                    self._initial_provider == "ollama"
+                    and not self.remote_base_url
+                    and selected_provider in ("remote", "api", "openai")
+                )
+            )
+            if self.remote_api_key and allow_explicit_key:
                 target_key = self.remote_api_key
 
             if not target_key:
@@ -829,11 +1347,16 @@ class ModelRouter:
                 )
 
             target_model = model or self.ollama_model
-            if not target_model or target_model == "gemma4:12b":
+            is_local_placeholder = (
+                not target_model
+                or target_model == "gemma4:12b"
+                or str(target_model).lower().endswith(".gguf")
+            )
+            if is_local_placeholder:
                 if selected_provider == "anthropic":
                     target_model = "claude-3-5-sonnet-20241022"
                 elif selected_provider == "openrouter":
-                    target_model = "anthropic/claude-3.5-sonnet"
+                    target_model = _OPENROUTER_FREE_FALLBACK[0]
                 else:
                     target_model = "gpt-4o-mini"
 
@@ -858,44 +1381,181 @@ class ModelRouter:
                 temperature=temperature,
             )
 
+        elif selected_provider in _OLLAMA_CLOUD_ALIASES:
+            if not self.allow_remote:
+                raise PermissionError(
+                    "VIOLAZIONE VINCOLO PRIVACY: Il provider 'ollama-cloud' è remoto. "
+                    "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita. "
+                    "Per abilitarlo, impostare esplicitamente allow_remote=True con il consenso dell'utente."
+                )
+            allow_ollama_cloud_explicit = bool(
+                self._explicit_remote_api_key
+                and (
+                    self._initial_provider in _OLLAMA_CLOUD_ALIASES
+                    or _host_matches_domain(self.remote_base_url or "", "ollama.com")
+                )
+            )
+            cloud_key = _get_profile_scoped_secret("OLLAMA_API_KEY") or (
+                self._explicit_remote_api_key if allow_ollama_cloud_explicit else ""
+            ) or ""
+            target_model = model or self.ollama_model
+            if not target_model or target_model == "gemma4:12b" or str(target_model).lower().endswith(".gguf"):
+                target_model = _OLLAMA_CLOUD_FALLBACK[0]
+            try:
+                return self._call_hermes_runtime_provider(
+                    provider_name="ollama-cloud",
+                    canonical_provider="ollama-cloud",
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model=target_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    explicit_base_url=_get_profile_scoped_secret("OLLAMA_BASE_URL") or "https://ollama.com/v1",
+                )
+            except Exception as exc:
+                if cloud_key:
+                    cloud_url = _get_profile_scoped_secret("OLLAMA_BASE_URL") or "https://ollama.com/v1"
+                    self.last_model_used = target_model
+                    return self._call_openai_compatible(
+                        base_url=cloud_url,
+                        api_key=cloud_key,
+                        model=target_model,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                    )
+                raise exc
+
         else:
             canonical_hermes = _resolve_hermes_provider_id(selected_provider)
             if canonical_hermes is not None:
+                is_active_selection = (
+                    selected_provider == self.default_provider
+                    or selected_provider == self._raw_provider
+                    or canonical_hermes == _resolve_hermes_provider_id(self.default_provider)
+                )
+                override_url = self._runtime_override_url if (is_active_selection and self._runtime_override_url) else None
                 candidate_url = (
-                    self._explicit_remote_base_url
-                    if self._explicit_remote_base_url and selected_provider == self.default_provider
-                    else (
-                        self._cfg_base_url
-                        if self._cfg_base_url
-                        and (
-                            selected_provider == self.default_provider
-                            or canonical_hermes == _resolve_hermes_provider_id(self.default_provider)
+                    override_url
+                    or (
+                        self._explicit_remote_base_url
+                        if self._explicit_remote_base_url and selected_provider == self.default_provider
+                        else (
+                            self._cfg_base_url
+                            if self._cfg_base_url
+                            and is_active_selection
+                            and not _is_foreign_builtin_endpoint(canonical_hermes, self._cfg_base_url)
+                            else None
                         )
-                        and not _is_foreign_builtin_endpoint(canonical_hermes, self._cfg_base_url)
-                        else None
                     )
                 )
-                is_local_runtime = canonical_hermes in _LLAMACPP_LOCAL_ALIASES or (
-                    bool(candidate_url) and is_local_endpoint(candidate_url)
+                default_local_check = (
+                    self._discovered_local_urls.get("llamacpp") or LOCAL_RUNTIME_DEFAULT_URLS["llamacpp"]
+                    if canonical_hermes in _LLAMACPP_LOCAL_ALIASES
+                    else None
                 )
+                effective_url = candidate_url or default_local_check
+                is_local_runtime = bool(effective_url and is_local_endpoint(effective_url))
                 if not is_local_runtime and not self.allow_remote:
                     raise PermissionError(
                         f"VIOLAZIONE VINCOLO PRIVACY: Il provider '{selected_provider}' è remoto. "
                         "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita. "
                         "Per abilitarlo, impostare esplicitamente allow_remote=True con il consenso dell'utente."
                     )
-                return self._call_hermes_runtime_provider(
-                    provider_name=selected_provider,
-                    canonical_provider=canonical_hermes,
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    explicit_base_url=candidate_url,
-                )
+                try:
+                    return self._call_hermes_runtime_provider(
+                        provider_name=selected_provider,
+                        canonical_provider=canonical_hermes,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        explicit_base_url=candidate_url,
+                    )
+                except RuntimeError as exc:
+                    # Standalone fallback for running local llama.cpp server when Hermes core is absent
+                    if canonical_hermes in _LLAMACPP_LOCAL_ALIASES:
+                        fallback_url = (
+                            candidate_url
+                            or self._discovered_local_urls.get("llamacpp")
+                            or LOCAL_RUNTIME_DEFAULT_URLS["llamacpp"]
+                        )
+                        if not is_local_endpoint(fallback_url) and not self.allow_remote:
+                            raise PermissionError(
+                                f"VIOLAZIONE VINCOLO PRIVACY: L'endpoint '{fallback_url}' per il provider '{selected_provider}' è remoto. "
+                                "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
+                            )
+                        target_model = model or self.ollama_model or "local-model"
+                        self.last_model_used = target_model
+                        return self._call_openai_compatible(
+                            base_url=fallback_url,
+                            api_key="local",
+                            model=target_model,
+                            prompt=prompt,
+                            system_prompt=system_prompt,
+                            temperature=temperature,
+                        )
+                    raise exc
 
             raise ValueError(f"Provider sconosciuto: {selected_provider}")
+
+    def _call_codex_cli_exec(
+        self,
+        *,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> str:
+        """Execute a one-shot query via the official `codex exec` CLI using Codex's own auth session."""
+        if not self.allow_remote:
+            raise PermissionError(
+                "VIOLAZIONE VINCOLO PRIVACY: ChatGPT Codex CLI usa endpoint remoti OpenAI/ChatGPT. "
+                "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
+            )
+        codex_bin = shutil.which("codex")
+        if not codex_bin:
+            raise RuntimeError("Binario `codex` CLI non trovato nel PATH.")
+
+        target_model = str(model or "gpt-5.4").strip()
+        if not target_model or target_model == "gemma4:12b" or target_model.lower().endswith(".gguf"):
+            target_model = "gpt-5.4"
+
+        combined_prompt = (
+            f"Istruzioni di sistema:\n{system_prompt.strip()}\n\nRichiesta:\n{prompt}"
+            if system_prompt and system_prompt.strip()
+            else prompt
+        )
+
+        with tempfile.TemporaryDirectory(prefix="hv_codex_") as tmpdir:
+            out_file = Path(tmpdir) / "last_message.txt"
+            cmd = [
+                codex_bin,
+                "exec",
+                "-s", "read-only",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "-C", tmpdir,
+                "-o", str(out_file),
+                "-m", target_model,
+                "-",
+            ]
+            proc = subprocess.run(
+                cmd,
+                input=combined_prompt,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=max(30, int(getattr(self, "timeout", 120) or 120)),
+            )
+            if proc.returncode != 0:
+                err_msg = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+                raise RuntimeError(f"Errore Codex CLI (`codex exec`): {err_msg[:300]}")
+            text = out_file.read_text(encoding="utf-8").strip() if out_file.is_file() else (proc.stdout or "").strip()
+            self.last_model_used = target_model
+            return text
 
     def _call_hermes_runtime_provider(
         self,
@@ -921,6 +1581,17 @@ class ModelRouter:
             or canonical_provider == _resolve_hermes_provider_id(self.default_provider)
         )
         requested_model = model or (self._configured_model if same_default else None)
+        if canonical_provider in ("openai-codex", "ollama-cloud", "openrouter") and (
+            not requested_model
+            or requested_model == "gemma4:12b"
+            or str(requested_model).lower().endswith(".gguf")
+        ):
+            if canonical_provider == "openai-codex":
+                requested_model = (_fetch_codex_oauth_catalog(refresh=False) or _CODEX_MODELS_FALLBACK)[0]
+            elif canonical_provider == "ollama-cloud":
+                requested_model = _OLLAMA_CLOUD_FALLBACK[0]
+            elif canonical_provider == "openrouter":
+                requested_model = _OPENROUTER_FREE_FALLBACK[0]
 
         explicit_key: Optional[str] = None
         if same_default:
@@ -932,15 +1603,21 @@ class ModelRouter:
                 explicit_key = _get_profile_scoped_secret(self._cfg_key_env)
 
         client, resolved_model = aux_mod.resolve_provider_client(
-            provider_name,
+            canonical_provider or provider_name,
             model=requested_model,
             explicit_base_url=explicit_base_url,
             explicit_api_key=explicit_key,
         )
+        if client is None and canonical_provider == "openai-codex" and _is_codex_cli_logged_in():
+            return self._call_codex_cli_exec(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=requested_model,
+            )
         if client is None:
             raise ValueError(
                 f"Nessuna credenziale valida trovata per il provider '{provider_name}'. "
-                "Configurare l'autenticazione ufficiale del provider in Hermes (`hermes auth` / `hermes model`) per procedere."
+                "Configurare l'autenticazione ufficiale del provider in Hermes (`hermes auth` / `hermes model`) o accedere con `codex login`."
             )
 
         client_base_url = str(getattr(client, "base_url", "") or explicit_base_url or "")

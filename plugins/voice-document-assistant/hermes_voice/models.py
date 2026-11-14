@@ -140,6 +140,9 @@ class PlayerStatusResponse(BaseModel):
     tts_model: str = "italian"  # "italian" | "italian_24l"
     speed: float = 1.0
     skip_headers_footers: bool = True
+    llm_model: str = "gemma4:12b"
+    llm_provider: str = "ollama"
+    llm_is_local: bool = True
     client_playback: bool = False
     allow_remote: bool = False
     home_fingerprint: str = ""
