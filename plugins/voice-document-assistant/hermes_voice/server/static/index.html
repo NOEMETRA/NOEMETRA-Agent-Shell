@@ -501,6 +501,36 @@
 
       <!-- Q&A Chat -->
       <div class="chat-section">
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid rgba(148,163,184,0.14);font-size:12px;">
+          <span style="color: var(--ui-text-secondary, #94a3b8); font-weight: 600;">Modello Analista:</span>
+          <select id="llmModelSelect" style="flex:1;padding:4px 8px;border-radius:6px;background:rgba(15,23,42,0.6);color:inherit;border:1px solid rgba(148,163,184,0.25);">
+            <option value="ollama::gemma4:12b">Ollama · gemma4:12b</option>
+          </select>
+          <button id="refreshModelsBtn" type="button" title="Aggiorna modelli locali e cloud" style="padding:4px 8px;">↻</button>
+          <button id="localDirsBtn" type="button" title="Cartelle modelli GGUF/Unsloth" style="padding:4px 8px;">📁</button>
+        </div>
+        <div id="localDirsPanel" style="display:none;padding:8px 14px;border-bottom:1px solid rgba(148,163,184,0.14);font-size:11px;gap:6px;flex-direction:column;">
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <select id="customRuntimeSelect" style="padding:4px 8px;border-radius:6px;background:rgba(15,23,42,0.6);color:inherit;border:1px solid rgba(148,163,184,0.25);">
+              <option value="ollama">Ollama</option>
+              <option value="unsloth_studio">Unsloth Studio</option>
+              <option value="lmstudio">LM Studio</option>
+              <option value="llamacpp">llama.cpp Server</option>
+              <option value="jan">Jan</option>
+              <option value="koboldcpp">KoboldCpp</option>
+              <option value="vllm">vLLM</option>
+              <option value="custom">Custom OpenAI-Compat</option>
+            </select>
+            <input id="customRuntimeUrlInput" type="text" placeholder="URL locale (es. http://127.0.0.1:8888/v1)" value="http://127.0.0.1:11434" style="flex:1;min-width:160px;padding:4px 8px;border-radius:6px;background:rgba(15,23,42,0.6);color:inherit;border:1px solid rgba(148,163,184,0.25);">
+            <input id="customRuntimeModelInput" type="text" placeholder="ID/Tag modello locale..." style="flex:1;min-width:150px;padding:4px 8px;border-radius:6px;background:rgba(15,23,42,0.6);color:inherit;border:1px solid rgba(148,163,184,0.25);">
+            <button id="applyCustomRuntimeBtn" type="button" class="btn-primary" style="padding:4px 10px;">Applica</button>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <input id="localDirInput" type="text" placeholder="Cartella modelli locali (es. D:\\AI\\Unsloth o ~/models)..." style="flex:1;padding:4px 8px;border-radius:6px;background:rgba(15,23,42,0.6);color:inherit;border:1px solid rgba(148,163,184,0.25);">
+            <button id="addLocalDirBtn" type="button" class="btn-primary" style="padding:4px 10px;">Aggiungi</button>
+          </div>
+          <div id="localDirsList" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+        </div>
         <div id="chatHistory" class="chat-history">
           <div style="color: var(--ui-text-tertiary); text-align: center; margin-top: 40px; font-size: 13px;">
             Poni una domanda sul documento. L'Analista estrarrà la risposta dal testo originale e il Verificatore convaliderà ogni numero di pagina con citazioni verificabili.
@@ -516,8 +546,8 @@
 
       <!-- Privacy Consent Footer -->
       <footer>
-        <div>
-          🔒 Routing: <strong>Ollama Locale (gemma4:12b)</strong> · Nessun dato inviato a server terzi
+        <div id="routingSummary">
+          🔒 Routing: <strong id="routingSummaryModel">Ollama Locale (gemma4:12b)</strong> · Nessun dato inviato a server terzi
         </div>
         <label class="toggle-label">
           <input type="checkbox" id="privacyConsentToggle">
@@ -542,6 +572,9 @@
     const pdfFileInput = document.getElementById('pdfFileInput');
     const ttsModelSelect = document.getElementById('ttsModelSelect');
     const speedSelect = document.getElementById('speedSelect');
+    const llmModelSelect = document.getElementById('llmModelSelect');
+    const refreshModelsBtn = document.getElementById('refreshModelsBtn');
+    const routingSummaryModel = document.getElementById('routingSummaryModel');
     const docTitleLabel = document.getElementById('docTitleLabel');
     const prevPageBtn = document.getElementById('prevPageBtn');
     const nextPageBtn = document.getElementById('nextPageBtn');
@@ -718,14 +751,55 @@
       }
 
       // Agents status
+      const activeProv = s.llm_provider || 'ollama';
+      const activeMod = s.llm_model || 'gemma4:12b';
       if (s.agents) {
         librarianStatus.textContent = s.agents.librarian === 'searching' ? '🔍 Ricerca...' : '✅ Indicizzato';
-        analystStatus.textContent = isAsking || s.agents.analyst === 'generating' ? '⏳ Generazione LLM...' : '✅ Pronto (Ollama)';
+        analystStatus.textContent = isAsking || s.agents.analyst === 'generating' ? '⏳ Generazione LLM...' : `✅ ${activeMod}`;
         verifierStatus.textContent = s.agents.verifier === 'valid'
           ? '✅ Convalidato 100%'
           : s.agents.verifier === 'invalid'
           ? '⚠️ Rilevate Discrepanze'
           : '✅ Pronto';
+      }
+
+      const REMOTE_PROVIDERS = new Set(['openai-codex', 'openrouter', 'ollama-cloud', 'openai', 'anthropic', 'remote', 'api']);
+      const updateRoutingSummary = (prov, mod, allowRem, isLocalFlag) => {
+        const rsEl = document.getElementById('routingSummary');
+        if (!rsEl) return;
+        const label = prov === 'ollama' ? 'Ollama Locale' : prov;
+        const isRemoteProv = (typeof isLocalFlag === 'boolean') ? !isLocalFlag : REMOTE_PROVIDERS.has(prov);
+        if (isRemoteProv) {
+          rsEl.innerHTML = '';
+          rsEl.append(allowRem ? '🌐 Routing Remoto: ' : '🔒 Bloccato (Remoto): ');
+          const strong = document.createElement('strong');
+          strong.id = 'routingSummaryModel';
+          strong.textContent = `${label} (${mod})`;
+          rsEl.append(
+            strong,
+            allowRem
+              ? ' · Consenso remoto attivo (dati inviati all\'endpoint selezionato)'
+              : ' · Consenso remoto disattivato (attiva il toggle per inviare richieste)'
+          );
+        } else {
+          rsEl.innerHTML = '';
+          rsEl.append('🔒 Routing: ');
+          const strong = document.createElement('strong');
+          strong.id = 'routingSummaryModel';
+          strong.textContent = `${label} (${mod})`;
+          rsEl.append(strong, allowRem ? ' · Runtime locale attivo (accesso remoto sbloccato)' : ' · Nessun dato inviato a server terzi');
+        }
+      };
+      updateRoutingSummary(activeProv, activeMod, Boolean(s.allow_remote), s.llm_is_local);
+      if (llmModelSelect) {
+        const expectedVal = `${activeProv}::${activeMod}`;
+        if (!Array.from(llmModelSelect.options).some(o => o.value === expectedVal)) {
+          const opt = document.createElement('option');
+          opt.value = expectedVal;
+          opt.textContent = `${activeProv === 'ollama' ? 'Ollama' : activeProv} · ${activeMod}`;
+          llmModelSelect.prepend(opt);
+        }
+        llmModelSelect.value = expectedVal;
       }
 
       // Privacy toggle
@@ -921,6 +995,188 @@
         method: 'POST',
         body: JSON.stringify({ allow_remote: privacyConsentToggle.checked })
       });
+      if (currentStatus) currentStatus.allow_remote = Boolean(privacyConsentToggle.checked);
+      await loadModels();
+      fetchStatus();
+    };
+
+    let lastModelsInfo = null;
+
+    async function loadModels(forceRefresh = false) {
+      try {
+        const info = await api(forceRefresh ? '/models?refresh=true' : '/models');
+        lastModelsInfo = info;
+        const activeProv = (currentStatus && currentStatus.llm_provider) || info.default_provider || 'ollama';
+        const activeMod = (currentStatus && currentStatus.llm_model) || (info.ollama && info.ollama.model) || 'gemma4:12b';
+        const ollamaList = (info.ollama && Array.isArray(info.ollama.models)) ? info.ollama.models : [];
+        const localRuntimes = info.local_runtimes || {};
+        const ggufModels = (info.local_gguf && Array.isArray(info.local_gguf.models)) ? info.local_gguf.models : [];
+        const customDirs = (info.local_gguf && Array.isArray(info.local_gguf.custom_dirs)) ? info.local_gguf.custom_dirs : [];
+        const allowRemote = Boolean(info.allow_remote);
+        if (currentStatus) currentStatus.allow_remote = allowRemote;
+        const codexOauth = info.codex_oauth || {};
+        const cloud = info.cloud_providers || {};
+
+        const seen = new Set();
+        llmModelSelect.innerHTML = '';
+
+        const appendGroup = (groupLabel, items) => {
+          const valid = [];
+          items.forEach(ent => {
+            const val = `${ent.provider}::${ent.model}`;
+            if (seen.has(val)) return;
+            seen.add(val);
+            valid.push({ ...ent, val });
+          });
+          if (!valid.length) return;
+          const grp = document.createElement('optgroup');
+          grp.label = groupLabel;
+          valid.forEach(ent => {
+            const opt = document.createElement('option');
+            opt.value = ent.val;
+            opt.textContent = ent.label;
+            grp.appendChild(opt);
+          });
+          llmModelSelect.appendChild(grp);
+        };
+
+        const localItems = [{
+          provider: activeProv,
+          model: activeMod,
+          label: `${activeProv} · ${activeProv === 'gguf' ? activeMod.split(/[\\/]/).pop() : activeMod}`
+        }];
+        ollamaList.forEach(m => localItems.push({ provider: 'ollama', model: m, label: `Ollama · ${m}` }));
+        Object.entries(localRuntimes).forEach(([rid, rinfo]) => {
+          if (rinfo && rinfo.status === 'online' && Array.isArray(rinfo.models)) {
+            rinfo.models.forEach(m => localItems.push({ provider: rid, model: m, label: `${rinfo.label || rid} · ${m}` }));
+          }
+        });
+        appendGroup('Runtime Locali Attivi', localItems);
+
+        if (ggufModels.length) {
+          appendGroup('GGUF / Unsloth su Disco', ggufModels.map(g => ({
+            provider: 'gguf',
+            model: g.path,
+            label: `${g.source === 'unsloth' ? 'Unsloth' : (g.source || 'GGUF')} · ${g.name}${g.quant ? ' · ' + g.quant : ''} (${g.size_label})`
+          })));
+        }
+
+        if (allowRemote) {
+          if (codexOauth.configured && Array.isArray(codexOauth.models)) {
+            appendGroup('ChatGPT Codex (Quote)', codexOauth.models.map(m => ({
+              provider: 'openai-codex',
+              model: m,
+              label: `ChatGPT Codex · ${m}`
+            })));
+          }
+          if (cloud.openrouter && Array.isArray(cloud.openrouter.free_models) && (cloud.openrouter.configured || (info.remote_api && info.remote_api.configured))) {
+            appendGroup('Cloud Gratuiti (OpenRouter :free)', cloud.openrouter.free_models.map(m => ({
+              provider: 'openrouter',
+              model: m,
+              label: `OpenRouter Free · ${m}`
+            })));
+          }
+          if (cloud.ollama_cloud && cloud.ollama_cloud.configured && Array.isArray(cloud.ollama_cloud.models)) {
+            appendGroup('Ollama Cloud', cloud.ollama_cloud.models.map(m => ({
+              provider: 'ollama-cloud',
+              model: m,
+              label: `Ollama Cloud · ${m}`
+            })));
+          }
+          const paidItems = [];
+          if (cloud.openai && cloud.openai.configured) {
+            (cloud.openai.models || ['gpt-4o-mini']).forEach(m => paidItems.push({ provider: 'openai', model: m, label: `OpenAI API · ${m}` }));
+          }
+          if (cloud.anthropic && cloud.anthropic.configured) {
+            (cloud.anthropic.models || ['claude-3-5-sonnet-20241022']).forEach(m => paidItems.push({ provider: 'anthropic', model: m, label: `Anthropic API · ${m}` }));
+          }
+          appendGroup('Cloud API', paidItems);
+        }
+
+        llmModelSelect.value = `${activeProv}::${activeMod}`;
+
+        const dirsList = document.getElementById('localDirsList');
+        if (dirsList) {
+          dirsList.innerHTML = '';
+          customDirs.forEach(dirPath => {
+            const chip = document.createElement('span');
+            chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:6px;border:1px solid rgba(148,163,184,0.25);';
+            chip.textContent = dirPath + ' ';
+            const rm = document.createElement('button');
+            rm.type = 'button';
+            rm.textContent = '×';
+            rm.onclick = async () => {
+              await api('/models/local-dirs', { method: 'POST', body: JSON.stringify({ action: 'remove', path: dirPath }) });
+              loadModels(false);
+            };
+            chip.appendChild(rm);
+            dirsList.appendChild(chip);
+          });
+        }
+      } catch (_) {}
+    }
+
+    llmModelSelect.onchange = async () => {
+      const rawVal = llmModelSelect.value || '';
+      const sepIdx = rawVal.indexOf('::');
+      const llm_provider = sepIdx !== -1 ? rawVal.slice(0, sepIdx) : 'ollama';
+      const llm_model = sepIdx !== -1 ? rawVal.slice(sepIdx + 2) : rawVal;
+      if (!llm_model) return;
+      const runtimeUrl = lastModelsInfo && lastModelsInfo.local_runtimes && lastModelsInfo.local_runtimes[llm_provider]
+        ? lastModelsInfo.local_runtimes[llm_provider].url
+        : null;
+      await api('/playback/config', {
+        method: 'POST',
+        body: JSON.stringify({ llm_model, llm_provider, ...(runtimeUrl ? { llm_base_url: runtimeUrl } : {}) })
+      });
+      fetchStatus();
+    };
+
+    refreshModelsBtn.onclick = () => loadModels(true);
+    document.getElementById('localDirsBtn').onclick = () => {
+      const p = document.getElementById('localDirsPanel');
+      p.style.display = p.style.display === 'none' ? 'flex' : 'none';
+    };
+    const customRuntimeDefaults = {
+      ollama: 'http://127.0.0.1:11434',
+      unsloth_studio: 'http://127.0.0.1:8888/v1',
+      lmstudio: 'http://127.0.0.1:1234/v1',
+      llamacpp: 'http://127.0.0.1:8080/v1',
+      jan: 'http://127.0.0.1:1337/v1',
+      koboldcpp: 'http://127.0.0.1:5001/v1',
+      vllm: 'http://127.0.0.1:8000/v1',
+      custom: 'http://127.0.0.1:8000/v1'
+    };
+    document.getElementById('customRuntimeSelect').onchange = (e) => {
+      const rid = e.target.value;
+      const urlInp = document.getElementById('customRuntimeUrlInput');
+      const rtUrl = rid === 'ollama'
+        ? (lastModelsInfo && lastModelsInfo.ollama && lastModelsInfo.ollama.url)
+        : (lastModelsInfo && lastModelsInfo.local_runtimes && lastModelsInfo.local_runtimes[rid] && lastModelsInfo.local_runtimes[rid].url);
+      urlInp.value = rtUrl || customRuntimeDefaults[rid] || '';
+    };
+    document.getElementById('applyCustomRuntimeBtn').onclick = async () => {
+      const llm_provider = document.getElementById('customRuntimeSelect').value || 'ollama';
+      const llm_base_url = (document.getElementById('customRuntimeUrlInput').value || '').trim();
+      const llm_model = (document.getElementById('customRuntimeModelInput').value || '').trim();
+      if (!llm_model) return;
+      try {
+        await api('/playback/config', {
+          method: 'POST',
+          body: JSON.stringify({ llm_model, llm_provider, ...(llm_base_url ? { llm_base_url } : {}) })
+        });
+        loadModels(false);
+      } catch (err) { alert(err.message); }
+    };
+    document.getElementById('addLocalDirBtn').onclick = async () => {
+      const inp = document.getElementById('localDirInput');
+      const val = (inp.value || '').trim();
+      if (!val) return;
+      try {
+        await api('/models/local-dirs', { method: 'POST', body: JSON.stringify({ action: 'add', path: val }) });
+        inp.value = '';
+        loadModels(false);
+      } catch (err) { alert(err.message); }
     };
 
     librarySelect.onchange = async () => {
@@ -1089,6 +1345,7 @@
 
     // Initialize
     loadLibrary();
+    loadModels();
     pollStatus();
   </script>
 </body>

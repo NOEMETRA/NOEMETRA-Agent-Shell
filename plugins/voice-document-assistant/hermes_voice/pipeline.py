@@ -70,6 +70,8 @@ class HermesVoiceAssistant:
 
         self.library_path = Path(library_path or prof_dir / "voice_library.json")
         ensure_voice_dir(self.library_path.parent)
+        self.model_dirs_path = prof_dir / "voice_model_dirs.json"
+        saved_local_dirs = self._load_saved_model_dirs()
 
         bm_path = Path(bookmark_path or prof_dir / "reading_state.json")
         c_dir = Path(cache_dir or prof_dir / "audio_cache")
@@ -78,7 +80,10 @@ class HermesVoiceAssistant:
 
         with bind_voice_profile_scope(home_dir=self.home_dir, profile=self.profile):
             self.tts = tts_engine or PocketTTSEngine(cache_dir=c_dir, lazy_load=True)
-            self.router = model_router or ModelRouter(home_dir=self.home_dir)
+            self.router = model_router or ModelRouter(home_dir=self.home_dir, local_model_dirs=saved_local_dirs)
+            if model_router is not None and saved_local_dirs and hasattr(self.router, "set_local_model_dirs"):
+                merged = list(dict.fromkeys([*(getattr(self.router, "local_model_dirs", []) or []), *saved_local_dirs]))
+                self.router.set_local_model_dirs(merged)
         self.extractor = DocumentExtractor()
 
         self.player = DocumentPlayer(
@@ -297,6 +302,13 @@ class HermesVoiceAssistant:
         doc_title = self.current_document.title if self.current_document else ""
         total_pages = self.current_document.total_pages if self.current_document else 0
 
+        raw_prov = str(getattr(self.router, "_raw_provider", "") or "")
+        exposed_provider = (
+            raw_prov
+            if (self.router.default_provider == "openai_compatible" and raw_prov in ("lmstudio", "llamacpp", "unsloth_studio", "jan", "koboldcpp", "vllm", "custom"))
+            else self.router.default_provider
+        )
+
         return PlayerStatusResponse(
             state=bm.state,
             doc_id=bm.doc_id,
@@ -311,6 +323,9 @@ class HermesVoiceAssistant:
             tts_model=self.tts.language,
             speed=self.player.speed,
             skip_headers_footers=self.player.skip_headers_footers,
+            llm_model=self.router.ollama_model,
+            llm_provider=exposed_provider,
+            llm_is_local=self.router.is_active_endpoint_local(),
             client_playback=self.player.client_playback,
             allow_remote=self.router.allow_remote,
             home_fingerprint=compute_home_fingerprint(self.home_dir),
@@ -389,3 +404,49 @@ class HermesVoiceAssistant:
         if _is_active_doc():
             self._last_answer = grounded_answer
         return grounded_answer
+
+    def _load_saved_model_dirs(self) -> List[str]:
+        if not self.model_dirs_path.exists():
+            return []
+        try:
+            payload = json.loads(self.model_dirs_path.read_text(encoding="utf-8"))
+            dirs = payload.get("local_model_dirs", []) if isinstance(payload, dict) else []
+            return [str(d).strip() for d in dirs if str(d or "").strip()]
+        except Exception as e:
+            logger.warning(f"Errore lettura cartelle modelli locali da {self.model_dirs_path}: {e}")
+            return []
+
+    def _save_model_dirs(self, dirs: List[str]) -> List[str]:
+        cleaned = self.router.set_local_model_dirs(dirs)
+        try:
+            ensure_voice_dir(self.model_dirs_path.parent)
+            self.model_dirs_path.write_text(
+                json.dumps({"local_model_dirs": cleaned}, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning(f"Impossibile salvare le cartelle modelli locali: {e}")
+        return cleaned
+
+    def add_local_model_dir(self, path_str: str) -> List[str]:
+        """Validate and persist a custom local directory containing GGUF/Unsloth models."""
+        raw = str(path_str or "").strip()
+        if not raw:
+            raise ValueError("Percorso cartella modelli vuoto.")
+        candidate = Path(raw).expanduser()
+        if not candidate.is_dir():
+            raise ValueError(f"La cartella specificata non esiste o non è accessibile: '{candidate}'.")
+        resolved = str(candidate.resolve())
+        current = list(getattr(self.router, "local_model_dirs", []) or [])
+        if resolved not in current:
+            current.append(resolved)
+        return self._save_model_dirs(current)
+
+    def remove_local_model_dir(self, path_str: str) -> List[str]:
+        """Remove a custom local GGUF directory from profile persistence."""
+        target = str(path_str or "").strip()
+        current = [
+            d for d in (getattr(self.router, "local_model_dirs", []) or [])
+            if d != target
+        ]
+        return self._save_model_dirs(current)

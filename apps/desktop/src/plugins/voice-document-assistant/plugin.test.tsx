@@ -284,6 +284,64 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
     })
 
     const calls: Array<{ body?: unknown; method?: string; path: string }> = []
+    let activeLlmModel = 'gemma4:12b'
+    let activeLlmProvider = 'ollama'
+    let allowRemote = false
+    const customLocalDirs: string[] = []
+
+    const buildModelsPayload = () => ({
+      default_provider: activeLlmProvider,
+      allow_remote: allowRemote,
+      ollama: {
+        url: 'http://127.0.0.1:11434',
+        model: activeLlmModel,
+        status: 'online',
+        models: ['gemma4:12b', 'qwen2.5:14b']
+      },
+      local_runtimes: {
+        lmstudio: {
+          id: 'lmstudio',
+          label: 'LM Studio',
+          url: 'http://127.0.0.1:1234/v1',
+          status: 'online',
+          models: ['qwen3-14b-instruct']
+        }
+      },
+      local_gguf: {
+        scan_dirs: ['C:/models'],
+        custom_dirs: [...customLocalDirs],
+        llama_server_available: true,
+        models: [
+          {
+            id: 'C:/models/unsloth-qwen3-14b-UD-Q4_K_M.gguf',
+            name: 'Unsloth/Qwen3-14B',
+            path: 'C:/models/unsloth-qwen3-14b-UD-Q4_K_M.gguf',
+            size_label: '8.9 GB',
+            source: 'unsloth',
+            quant: 'UD-Q4_K_M'
+          }
+        ]
+      },
+      codex: { configured: false },
+      codex_oauth: {
+        configured: true,
+        auth_mode: 'chatgpt',
+        models: ['gpt-5.4', 'gpt-5.4-mini']
+      },
+      cloud_providers: {
+        openrouter: {
+          configured: true,
+          free_models: ['meta-llama/llama-3.3-70b-instruct:free'],
+          models: ['meta-llama/llama-3.3-70b-instruct:free']
+        },
+        ollama_cloud: {
+          configured: true,
+          models: ['gpt-oss:120b-cloud']
+        }
+      },
+      remote_api: { configured: true }
+    })
+
     const api = vi.fn(async (req: { body?: unknown; method?: string; path: string }) => {
       calls.push({ path: req.path, method: req.method, body: req.body })
 
@@ -301,10 +359,33 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
           tts_model: 'italian',
           speed: 1.0,
           skip_headers_footers: true,
+          llm_model: activeLlmModel,
+          llm_provider: activeLlmProvider,
           client_playback: true,
-          allow_remote: false,
+          allow_remote: allowRemote,
           agents: { librarian: 'ready', analyst: 'ready', verifier: 'ready', detail: '' }
         }
+      }
+      if (req.path === '/api/plugins/voice-document-assistant/models' || req.path === '/api/plugins/voice-document-assistant/models?refresh=true') {
+        return buildModelsPayload()
+      }
+      if (req.path === '/api/plugins/voice-document-assistant/config/privacy' && req.method === 'POST') {
+        allowRemote = Boolean((req.body as { allow_remote?: boolean })?.allow_remote)
+        return { allow_remote: allowRemote }
+      }
+      if (req.path === '/api/plugins/voice-document-assistant/models/local-dirs' && req.method === 'POST') {
+        const body = (req.body || {}) as { action?: string; path?: string }
+        if (body.action === 'add' && body.path) customLocalDirs.push(body.path)
+        return buildModelsPayload()
+      }
+      if (req.path === '/api/plugins/voice-document-assistant/playback/config' && req.method === 'POST') {
+        const body = (req.body || {}) as { llm_model?: string; llm_provider?: string }
+        if (body.llm_model === 'fail-rollback-model') {
+          throw new Error('Backend config error')
+        }
+        if (body.llm_model) activeLlmModel = body.llm_model
+        if (body.llm_provider) activeLlmProvider = body.llm_provider
+        return { status: 'success', llm_model: activeLlmModel, llm_provider: activeLlmProvider }
       }
       if (req.path === '/api/plugins/voice-document-assistant/document/doc-rich') {
         return sampleDoc
@@ -401,6 +482,85 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
     await waitFor(() => {
       expect(view.container.querySelector('.hv-search-count')?.textContent).toBe('1 / 1')
       expect(view.container.querySelector('mark.hv-search-mark')?.textContent).toBe('GeoJSON')
+    })
+
+    // Analyst LLM model selector loads Ollama, LM Studio, GGUF/Unsloth locally, then Codex/OpenRouter/Ollama Cloud when remote enabled
+    const llmSelect = view.container.querySelector('select[aria-label="Modello Analista"]') as HTMLSelectElement
+    expect(llmSelect).not.toBeNull()
+    await waitFor(() => {
+      const optValues = Array.from(llmSelect.options).map(o => o.value)
+      expect(optValues).toContain('ollama::qwen2.5:14b')
+      expect(optValues).toContain('lmstudio::qwen3-14b-instruct')
+      expect(optValues).toContain('gguf::C:/models/unsloth-qwen3-14b-UD-Q4_K_M.gguf')
+      expect(optValues).not.toContain('openai-codex::gpt-5.4')
+      expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('Ollama Locale (gemma4:12b)')
+    })
+    fireEvent.change(llmSelect, { target: { value: 'ollama::qwen2.5:14b' } })
+    await waitFor(() => {
+      expect(calls.some(c =>
+        c.path === '/api/plugins/voice-document-assistant/playback/config' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_model === 'qwen2.5:14b' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_provider === 'ollama'
+      )).toBe(true)
+      expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('Ollama Locale (qwen2.5:14b)')
+    })
+
+    // Add custom Unsloth folder and configure custom local runtime + model via folder drawer
+    const folderBtn = view.container.querySelector('button[aria-label="Cartelle modelli locali"]') as HTMLButtonElement
+    fireEvent.click(folderBtn)
+    const dirInput = view.container.querySelector('.hv-folder-dir-row input') as HTMLInputElement
+    fireEvent.change(dirInput, { target: { value: 'D:/AI/Unsloth' } })
+    fireEvent.click(Array.from(view.container.querySelectorAll('.hv-folder-dir-row button')).find(b => b.textContent === 'Aggiungi')!)
+    await waitFor(() => {
+      expect(calls.some(c =>
+        c.path === '/api/plugins/voice-document-assistant/models/local-dirs' &&
+        (c.body as { path?: string })?.path === 'D:/AI/Unsloth'
+      )).toBe(true)
+      expect(view.container.textContent).toContain('D:/AI/Unsloth')
+    })
+
+    const rtSelect = view.container.querySelector('.hv-custom-runtime-row select[aria-label="Runtime locale"]') as HTMLSelectElement
+    const rtUrlInput = view.container.querySelector('.hv-custom-runtime-row input[aria-label="Endpoint runtime locale"]') as HTMLInputElement
+    const rtModelInput = view.container.querySelector('.hv-custom-runtime-row input[aria-label="ID modello locale"]') as HTMLInputElement
+    fireEvent.change(rtSelect, { target: { value: 'unsloth_studio' } })
+    expect(rtUrlInput.value).toBe('http://127.0.0.1:8888/v1')
+    fireEvent.change(rtModelInput, { target: { value: 'unsloth/Qwen3-14B' } })
+    fireEvent.click(Array.from(view.container.querySelectorAll('.hv-custom-runtime-row button')).find(b => b.textContent === 'Applica')!)
+    await waitFor(() => {
+      expect(calls.some(c =>
+        c.path === '/api/plugins/voice-document-assistant/playback/config' &&
+        (c.body as { llm_model?: string; llm_provider?: string; llm_base_url?: string })?.llm_model === 'unsloth/Qwen3-14B' &&
+        (c.body as { llm_provider?: string })?.llm_provider === 'unsloth_studio' &&
+        (c.body as { llm_base_url?: string })?.llm_base_url === 'http://127.0.0.1:8888/v1'
+      )).toBe(true)
+      expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('Unsloth Studio (unsloth/Qwen3-14B)')
+    })
+
+    // Failed config write rolls back optimistic selection cleanly
+    fireEvent.change(rtModelInput, { target: { value: 'fail-rollback-model' } })
+    fireEvent.click(Array.from(view.container.querySelectorAll('.hv-custom-runtime-row button')).find(b => b.textContent === 'Applica')!)
+    await waitFor(() => {
+      expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('Unsloth Studio (unsloth/Qwen3-14B)')
+    })
+
+    // Enable remote providers -> exposes ChatGPT Codex (OAuth), OpenRouter Free, and Ollama Cloud
+    const privacyToggle = view.container.querySelector('.hv-privacy-bar input[type="checkbox"]') as HTMLInputElement
+    fireEvent.click(privacyToggle)
+    await waitFor(() => {
+      const optValues = Array.from(llmSelect.options).map(o => o.value)
+      expect(optValues).toContain('openai-codex::gpt-5.4')
+      expect(optValues).toContain('openrouter::meta-llama/llama-3.3-70b-instruct:free')
+      expect(optValues).toContain('ollama-cloud::gpt-oss:120b-cloud')
+    })
+
+    fireEvent.change(llmSelect, { target: { value: 'openai-codex::gpt-5.4' } })
+    await waitFor(() => {
+      expect(calls.some(c =>
+        c.path === '/api/plugins/voice-document-assistant/playback/config' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_model === 'gpt-5.4' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_provider === 'openai-codex'
+      )).toBe(true)
+      expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('ChatGPT Codex (Quote) (gpt-5.4)')
     })
 
     view.unmount()

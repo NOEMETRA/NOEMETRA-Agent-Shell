@@ -904,9 +904,96 @@ const CSS = `
 .hv-msg-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 8px;
   margin-top: 6px;
+}
+
+.hv-msg-model-tag {
+  font-size: 10.5px;
+  color: var(--muted-foreground, #94a3b8);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.hv-chat-model-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.14));
+  background: color-mix(in srgb, var(--background, #080c14) 86%, transparent);
+  flex-wrap: wrap;
+}
+
+.hv-chat-model-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--muted-foreground, #94a3b8);
+  white-space: nowrap;
+}
+
+.hv-llm-select {
+  flex: 1;
+  min-width: 170px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.hv-ollama-pill {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.22));
+  color: var(--muted-foreground, #94a3b8);
+  white-space: nowrap;
+}
+
+.hv-ollama-pill-online {
+  border-color: rgba(16, 185, 129, 0.4);
+  color: #34d399;
+  background: rgba(16, 185, 129, 0.1);
+}
+
+.hv-local-dirs-panel {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.14));
+  background: color-mix(in srgb, var(--background, #080c14) 92%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hv-local-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.hv-local-dirs-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hv-local-dir-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--background, #0f172a) 80%, transparent);
+  border: 1px solid var(--ui-stroke-tertiary, rgba(148, 163, 184, 0.22));
+  color: var(--foreground, #e2e8f0);
+}
+
+.hv-model-hint {
+  font-size: 11px;
+  color: var(--muted-foreground, #94a3b8);
 }
 
 .hv-msg-speak-btn {
@@ -940,6 +1027,7 @@ function createVoicePlaybackController(ctx) {
   const chatMessages = atom([])
   const isAsking = atom(false)
   const library = atom([])
+  const modelsInfo = atom(null)
 
   let disposed = false
   let cancelTimer = null
@@ -1035,6 +1123,11 @@ function createVoicePlaybackController(ctx) {
     return reqPromise
   }
 
+  let llmWriteSeq = 0
+  let llmWriteQueue = Promise.resolve()
+  let lastConfirmedLlm = null
+  let pendingBaselineLlm = null
+
   const scheduleNextPoll = (delayMs = 600) => {
     if (disposed) return
     if (cancelTimer) {
@@ -1054,6 +1147,12 @@ function createVoicePlaybackController(ctx) {
     try {
       const s = await ctx.rest('/status')
       if (disposed || currentGen !== pollGen || currentScopeKey() !== scopeAtPoll) return
+      if (s?.llm_model) {
+        lastConfirmedLlm = {
+          llm_model: s.llm_model,
+          llm_provider: s.llm_provider || 'ollama'
+        }
+      }
       if (s?.tts_model && cachedTtsModel && s.tts_model !== cachedTtsModel) {
         audioPrefetchCache.clear()
       }
@@ -1262,6 +1361,7 @@ function createVoicePlaybackController(ctx) {
     status.set(null)
     docData.set(null)
     library.set([])
+    modelsInfo.set(null)
     viewPage.set(1)
     chatMessages.set([])
     isAsking.set(false)
@@ -1282,7 +1382,9 @@ function createVoicePlaybackController(ctx) {
     chatMessages,
     isAsking,
     library,
+    modelsInfo,
     setLibrary: (docs) => library.set(docs),
+    setModelsInfo: (info) => modelsInfo.set(info),
     currentScopeKey,
     setDocData: (d) => docData.set(d),
     setViewPage: (p) => viewPage.set(p),
@@ -1361,6 +1463,64 @@ function createVoicePlaybackController(ctx) {
         body: { skip_headers_footers: Boolean(enabled) }
       })
       scheduleNextPoll(0)
+    },
+    setLlmModel: (llmModel, llmProvider = 'ollama', llmBaseUrl = null) => {
+      const cleanModel = String(llmModel || '').trim()
+      const cleanProvider = String(llmProvider || 'ollama').trim() || 'ollama'
+      const cleanBaseUrl = llmBaseUrl ? String(llmBaseUrl).trim() : ''
+      if (!cleanModel) return Promise.resolve()
+      const writeSeq = ++llmWriteSeq
+      pollGen += 1
+      const cur = status.get()
+      if (!pendingBaselineLlm) {
+        if (lastConfirmedLlm) {
+          pendingBaselineLlm = { ...lastConfirmedLlm }
+        } else if (cur) {
+          pendingBaselineLlm = {
+            llm_model: cur.llm_model,
+            llm_provider: cur.llm_provider || 'ollama'
+          }
+        }
+      }
+      if (cur) {
+        status.set({ ...cur, llm_model: cleanModel, llm_provider: cleanProvider })
+      }
+      const task = llmWriteQueue.then(async () => {
+        try {
+          await ctx.rest('/playback/config', {
+            method: 'POST',
+            body: {
+              llm_model: cleanModel,
+              llm_provider: cleanProvider,
+              ...(cleanBaseUrl ? { llm_base_url: cleanBaseUrl } : {})
+            }
+          })
+          lastConfirmedLlm = { llm_model: cleanModel, llm_provider: cleanProvider }
+          if (writeSeq === llmWriteSeq) {
+            pendingBaselineLlm = null
+          }
+        } catch (err) {
+          if (writeSeq === llmWriteSeq) {
+            const rollback = lastConfirmedLlm || pendingBaselineLlm
+            pendingBaselineLlm = null
+            const latest = status.get()
+            if (latest && rollback?.llm_model) {
+              status.set({
+                ...latest,
+                llm_model: rollback.llm_model,
+                llm_provider: rollback.llm_provider || latest.llm_provider
+              })
+            }
+          }
+          throw err
+        } finally {
+          if (writeSeq === llmWriteSeq) {
+            scheduleNextPoll(0)
+          }
+        }
+      })
+      llmWriteQueue = task.catch(() => {})
+      return task
     },
     invalidatePrefetch: () => {
       audioPrefetchCache.clear()
@@ -1869,6 +2029,7 @@ function VoiceDocumentPage({ ctx, controller }) {
   const chatMessages = useValue(controller.chatMessages)
   const isAsking = useValue(controller.isAsking)
   const library = useValue(controller.library)
+  const modelsInfo = useValue(controller.modelsInfo)
   const [questionInput, setQuestionInput] = useState('')
   const [isRecording, setIsRecording] = useState(false)
   const [tocOpen, setTocOpen] = useState(false)
@@ -1878,6 +2039,11 @@ function VoiceDocumentPage({ ctx, controller }) {
   const [citationHighlight, setCitationHighlight] = useState(null)
   const [speakingMsgIdx, setSpeakingMsgIdx] = useState(null)
   const [isLoadingMsgSpeech, setIsLoadingMsgSpeech] = useState(false)
+  const [localDirsOpen, setLocalDirsOpen] = useState(false)
+  const [newLocalDirInput, setNewLocalDirInput] = useState('')
+  const [customRuntimeId, setCustomRuntimeId] = useState('ollama')
+  const [customRuntimeUrl, setCustomRuntimeUrl] = useState('http://127.0.0.1:11434')
+  const [customRuntimeModel, setCustomRuntimeModel] = useState('')
   const fileInputRef = useRef(null)
   const searchInputRef = useRef(null)
   const msgAudioRef = useRef(null)
@@ -1957,9 +2123,55 @@ function VoiceDocumentPage({ ctx, controller }) {
     }
   }
 
+  const refreshModels = async (forceRefresh = false) => {
+    const scopeAtStart = controller.currentScopeKey()
+    try {
+      const qs = forceRefresh ? '?refresh=true' : ''
+      const res = await ctx.rest(`/models${qs}`)
+      if (controller.currentScopeKey() !== scopeAtStart) return
+      if (res && typeof res === 'object') {
+        controller.setModelsInfo(res)
+      }
+    } catch (_) {}
+  }
+
+  const handleAddLocalDir = async () => {
+    const clean = newLocalDirInput.trim()
+    if (!clean) return
+    try {
+      const res = await ctx.rest('/models/local-dirs', {
+        method: 'POST',
+        body: { action: 'add', path: clean }
+      })
+      if (res && typeof res === 'object') {
+        controller.setModelsInfo(res)
+      }
+      setNewLocalDirInput('')
+      host.notify({ kind: 'info', message: `Cartella modelli aggiunta: ${clean}` })
+    } catch (err) {
+      host.notifyError(err, 'Errore aggiunta cartella modelli')
+    }
+  }
+
+  const handleRemoveLocalDir = async (dirPath) => {
+    try {
+      const res = await ctx.rest('/models/local-dirs', {
+        method: 'POST',
+        body: { action: 'remove', path: dirPath }
+      })
+      if (res && typeof res === 'object') {
+        controller.setModelsInfo(res)
+      }
+    } catch (err) {
+      host.notifyError(err, 'Errore rimozione cartella modelli')
+    }
+  }
+
   useEffect(() => {
     controller.setLibrary([])
+    controller.setModelsInfo(null)
     refreshLibrary()
+    refreshModels()
   }, [activeScope])
 
   // Playback handlers delegated to plugin-scoped controller
@@ -2152,6 +2364,7 @@ function VoiceDocumentPage({ ctx, controller }) {
         method: 'POST',
         body: { allow_remote }
       })
+      await refreshModels()
       host.notify({
         kind: allow_remote ? 'warning' : 'info',
         message: allow_remote
@@ -2160,6 +2373,82 @@ function VoiceDocumentPage({ ctx, controller }) {
       })
     } catch (err) {
       host.notifyError(err, 'Errore impostazione privacy')
+    }
+  }
+
+  const LOCAL_RUNTIME_DEFAULTS = {
+    ollama: 'http://127.0.0.1:11434',
+    lmstudio: 'http://127.0.0.1:1234/v1',
+    unsloth_studio: 'http://127.0.0.1:8888/v1',
+    llamacpp: 'http://127.0.0.1:8080/v1',
+    jan: 'http://127.0.0.1:1337/v1',
+    koboldcpp: 'http://127.0.0.1:5001/v1',
+    vllm: 'http://127.0.0.1:8000/v1',
+    custom: 'http://127.0.0.1:8000/v1'
+  }
+
+  const openLocalConfigDrawer = () => {
+    const rtCandidate = LOCAL_RUNTIME_DEFAULTS[activeLlmProvider] ? activeLlmProvider : 'ollama'
+    setCustomRuntimeId(rtCandidate)
+    const detectedUrl = rtCandidate === 'ollama'
+      ? (modelsInfo?.ollama?.url || LOCAL_RUNTIME_DEFAULTS.ollama)
+      : (modelsInfo?.local_runtimes?.[rtCandidate]?.url || LOCAL_RUNTIME_DEFAULTS[rtCandidate] || '')
+    setCustomRuntimeUrl(detectedUrl)
+    if (LOCAL_RUNTIME_DEFAULTS[activeLlmProvider] && activeLlmModel) {
+      setCustomRuntimeModel(activeLlmModel)
+    }
+    setLocalDirsOpen(true)
+  }
+
+  const handleCustomRuntimeSelect = (e) => {
+    const rid = e.target.value
+    setCustomRuntimeId(rid)
+    const detectedUrl = rid === 'ollama'
+      ? (modelsInfo?.ollama?.url || LOCAL_RUNTIME_DEFAULTS.ollama)
+      : (modelsInfo?.local_runtimes?.[rid]?.url || LOCAL_RUNTIME_DEFAULTS[rid] || '')
+    setCustomRuntimeUrl(detectedUrl)
+    const detectedModels = rid === 'ollama'
+      ? ollamaModels
+      : (Array.isArray(modelsInfo?.local_runtimes?.[rid]?.models) ? modelsInfo.local_runtimes[rid].models : [])
+    if (detectedModels.length > 0) {
+      setCustomRuntimeModel(detectedModels[0])
+    }
+  }
+
+  const handleApplyCustomLocalRuntime = async () => {
+    const cleanModel = String(customRuntimeModel || '').trim()
+    if (!cleanModel) {
+      host.notify({ kind: 'warning', message: 'Inserisci l\'ID o tag del modello locale da utilizzare.' })
+      return
+    }
+    const cleanUrl = String(customRuntimeUrl || '').trim() || null
+    try {
+      await controller.setLlmModel(cleanModel, customRuntimeId, cleanUrl)
+      await refreshModels(false)
+      host.notify({ kind: 'info', message: `Modello Analista impostato su: ${cleanModel} (${customRuntimeId})` })
+    } catch (err) {
+      host.notifyError(err, 'Errore configurazione runtime locale')
+    }
+  }
+
+  const handleLlmModelChange = async (e) => {
+    const rawVal = e.target.value
+    if (!rawVal) return
+    if (rawVal === '__configure_local__') {
+      openLocalConfigDrawer()
+      return
+    }
+    const sepIdx = rawVal.indexOf('::')
+    const provider = sepIdx !== -1 ? rawVal.slice(0, sepIdx) : 'ollama'
+    const model = sepIdx !== -1 ? rawVal.slice(sepIdx + 2) : rawVal
+    const runtimeUrl = provider === 'ollama'
+      ? (modelsInfo?.ollama?.url || null)
+      : (modelsInfo?.local_runtimes?.[provider]?.url || null)
+    try {
+      await controller.setLlmModel(model, provider, runtimeUrl)
+      host.notify({ kind: 'info', message: `Modello Analista impostato su: ${model} (${provider})` })
+    } catch (err) {
+      host.notifyError(err, 'Errore cambio modello Analista')
     }
   }
 
@@ -2305,6 +2594,192 @@ function VoiceDocumentPage({ ctx, controller }) {
   const totalPages = docData?.total_pages || 1
   const isPlaying = status?.state === 'playing'
   const isPaused = status?.state === 'paused'
+
+  const activeLlmProvider = status?.llm_provider || modelsInfo?.default_provider || 'ollama'
+  const activeLlmModel = status?.llm_model || modelsInfo?.ollama?.model || 'gemma4:12b'
+  const ollamaModels = Array.isArray(modelsInfo?.ollama?.models) ? modelsInfo.ollama.models : []
+  const ollamaOnline = modelsInfo?.ollama?.status === 'online'
+  const localRuntimes = modelsInfo?.local_runtimes && typeof modelsInfo.local_runtimes === 'object' ? modelsInfo.local_runtimes : {}
+  const ggufModels = Array.isArray(modelsInfo?.local_gguf?.models) ? modelsInfo.local_gguf.models : []
+  const llamaServerAvailable = Boolean(modelsInfo?.local_gguf?.llama_server_available)
+  const customLocalDirs = Array.isArray(modelsInfo?.local_gguf?.custom_dirs) ? modelsInfo.local_gguf.custom_dirs : []
+  const codexOauthInfo = modelsInfo?.codex_oauth || null
+  const cloudProviders = modelsInfo?.cloud_providers || null
+  const activeLlmValue = `${activeLlmProvider}::${activeLlmModel}`
+
+  const onlineLocalRuntimeEntries = Object.entries(localRuntimes).filter(
+    ([, info]) => info && info.status === 'online'
+  )
+  const localModelTotalCount =
+    ollamaModels.length +
+    ggufModels.length +
+    onlineLocalRuntimeEntries.reduce(
+      (acc, [, info]) => acc + (Array.isArray(info.models) ? info.models.length : 0),
+      0
+    )
+
+  const PROVIDER_DISPLAY_NAMES = {
+    ollama: 'Ollama Locale',
+    'openai-codex': 'ChatGPT Codex (Quote)',
+    openrouter: 'OpenRouter',
+    'ollama-cloud': 'Ollama Cloud',
+    gguf: 'GGUF / Unsloth Locale',
+    lmstudio: 'LM Studio',
+    unsloth_studio: 'Unsloth Studio',
+    llamacpp: 'llama.cpp Locale',
+    jan: 'Jan Locale',
+    koboldcpp: 'KoboldCpp Locale',
+    vllm: 'vLLM Locale',
+    custom: 'Runtime Locale Custom',
+    openai_compatible: 'Locale OpenAI-Compat'
+  }
+
+  const llmGroups = useMemo(() => {
+    const groups = []
+    const seen = new Set()
+    const pushInto = (groupItems, provider, model, label, opts = {}) => {
+      const value = opts.explicitValue || `${provider}::${model}`
+      if (seen.has(value)) return
+      seen.add(value)
+      groupItems.push({ value, provider, model, label, disabled: Boolean(opts.disabled) })
+    }
+
+    const activeGroup = []
+    const activeDisplayModel = activeLlmProvider === 'gguf'
+      ? (String(activeLlmModel).split(/[\\/]/).pop() || activeLlmModel)
+      : activeLlmModel
+    const activeProviderName = PROVIDER_DISPLAY_NAMES[activeLlmProvider] || activeLlmProvider
+    pushInto(
+      activeGroup,
+      activeLlmProvider,
+      activeLlmModel,
+      `${activeProviderName} · ${activeDisplayModel}`
+    )
+    for (const m of ollamaModels) {
+      if (m && typeof m === 'string') {
+        pushInto(activeGroup, 'ollama', m, `Ollama · ${m}`)
+      }
+    }
+    for (const [rid, info] of onlineLocalRuntimeEntries) {
+      const rLabel = info.label || PROVIDER_DISPLAY_NAMES[rid] || rid
+      const rModels = Array.isArray(info.models) ? info.models : []
+      if (rModels.length > 0) {
+        for (const m of rModels) {
+          if (m && typeof m === 'string') {
+            pushInto(activeGroup, rid, m, `${rLabel} · ${m}`)
+          }
+        }
+      } else {
+        pushInto(
+          activeGroup,
+          rid,
+          '',
+          `${rLabel} (online · nessun modello caricato)`,
+          { explicitValue: `__empty_runtime__::${rid}`, disabled: true }
+        )
+      }
+    }
+    pushInto(
+      activeGroup,
+      'custom',
+      '',
+      '⚙ Inserisci runtime / modello locale manuale...',
+      { explicitValue: '__configure_local__' }
+    )
+    groups.push({ label: 'Runtime Locali Attivi', items: activeGroup })
+
+    if (ggufModels.length > 0) {
+      const ggufGroup = []
+      for (const g of ggufModels) {
+        if (g && g.path) {
+          const srcTag = g.source === 'unsloth' ? 'Unsloth' : (g.source || 'GGUF')
+          const quantTag = g.quant ? ` · ${g.quant}` : ''
+          const sizeTag = g.size_label ? ` (${g.size_label})` : ''
+          pushInto(ggufGroup, 'gguf', g.path, `${srcTag} · ${g.name}${quantTag}${sizeTag}`)
+        }
+      }
+      if (ggufGroup.length > 0) {
+        groups.push({ label: 'GGUF / Unsloth su Disco', items: ggufGroup })
+      }
+    }
+
+    if (status?.allow_remote) {
+      if (codexOauthInfo?.configured && Array.isArray(codexOauthInfo.models) && codexOauthInfo.models.length > 0) {
+        const codexGroup = []
+        for (const m of codexOauthInfo.models) {
+          if (m && typeof m === 'string') {
+            pushInto(codexGroup, 'openai-codex', m, `ChatGPT Codex · ${m}`)
+          }
+        }
+        if (codexGroup.length > 0) {
+          groups.push({ label: 'ChatGPT Codex (Quote ChatGPT)', items: codexGroup })
+        }
+      }
+
+      const orInfo = cloudProviders?.openrouter
+      if (orInfo && (orInfo.configured || (!cloudProviders && modelsInfo?.remote_api?.configured))) {
+        const freeGroup = []
+        for (const m of (Array.isArray(orInfo.free_models) ? orInfo.free_models : [])) {
+          if (m && typeof m === 'string') {
+            pushInto(freeGroup, 'openrouter', m, `OpenRouter Free · ${m}`)
+          }
+        }
+        if (freeGroup.length > 0) {
+          groups.push({ label: 'Cloud Gratuiti (OpenRouter :free)', items: freeGroup })
+        }
+      }
+
+      const ocInfo = cloudProviders?.ollama_cloud
+      if (ocInfo?.configured && Array.isArray(ocInfo.models) && ocInfo.models.length > 0) {
+        const ocGroup = []
+        for (const m of ocInfo.models) {
+          if (m && typeof m === 'string') {
+            pushInto(ocGroup, 'ollama-cloud', m, `Ollama Cloud · ${m}`)
+          }
+        }
+        if (ocGroup.length > 0) {
+          groups.push({ label: 'Ollama Cloud', items: ocGroup })
+        }
+      }
+
+      const paidGroup = []
+      if (cloudProviders) {
+        if (cloudProviders.openai?.configured) {
+          for (const m of (cloudProviders.openai.models || ['gpt-4o-mini'])) {
+            pushInto(paidGroup, 'openai', m, `OpenAI API · ${m}`)
+          }
+        }
+        if (cloudProviders.anthropic?.configured) {
+          for (const m of (cloudProviders.anthropic.models || ['claude-3-5-sonnet-20241022'])) {
+            pushInto(paidGroup, 'anthropic', m, `Anthropic API · ${m}`)
+          }
+        }
+      } else if (modelsInfo?.remote_api?.configured) {
+        pushInto(paidGroup, 'openai', 'gpt-4o-mini', 'OpenAI · gpt-4o-mini (remoto)')
+        pushInto(paidGroup, 'anthropic', 'claude-3-5-sonnet-20241022', 'Anthropic · claude-3-5-sonnet (remoto)')
+      }
+      if (paidGroup.length > 0) {
+        groups.push({ label: 'Cloud API (OpenAI / Anthropic)', items: paidGroup })
+      }
+    }
+
+    return groups
+  }, [
+    activeLlmProvider,
+    activeLlmModel,
+    ollamaModels.join('|'),
+    JSON.stringify(onlineLocalRuntimeEntries),
+    JSON.stringify(ggufModels),
+    status?.allow_remote,
+    JSON.stringify(codexOauthInfo),
+    JSON.stringify(cloudProviders),
+    modelsInfo?.remote_api?.configured
+  ])
+
+  const providerLabel = PROVIDER_DISPLAY_NAMES[activeLlmProvider] || activeLlmProvider
+  const activeModelDisplay = activeLlmProvider === 'gguf'
+    ? (String(activeLlmModel).split(/[\\/]/).pop() || activeLlmModel)
+    : activeLlmModel
 
   return jsxs('div', {
     className: 'hv-container',
@@ -2755,7 +3230,7 @@ function VoiceDocumentPage({ ctx, controller }) {
                             className: 'hv-agent-status',
                             children: [
                               jsx('span', { className: `hv-status-dot ${isAsking || status?.agents?.analyst === 'generating' ? 'hv-dot-busy' : 'hv-dot-ok'}` }),
-                              isAsking || status?.agents?.analyst === 'generating' ? 'Generazione...' : 'Ollama Pronto'
+                              isAsking || status?.agents?.analyst === 'generating' ? 'Generazione...' : activeModelDisplay
                             ]
                           })
                         ]
@@ -2796,6 +3271,160 @@ function VoiceDocumentPage({ ctx, controller }) {
               jsxs('div', {
                 className: 'hv-chat-section',
                 children: [
+                  jsxs('div', {
+                    className: 'hv-chat-model-bar',
+                    children: [
+                      jsxs('span', {
+                        className: 'hv-chat-model-label',
+                        children: [
+                          jsx(Codicon, { name: 'chip', size: '0.85rem' }),
+                          'Modello Analista'
+                        ]
+                      }),
+                      jsx('select', {
+                        className: 'hv-select hv-llm-select',
+                        'aria-label': 'Modello Analista',
+                        value: activeLlmValue,
+                        onChange: handleLlmModelChange,
+                        disabled: isAsking,
+                        children: llmGroups.map(grp => jsxs('optgroup', {
+                          label: grp.label,
+                          children: grp.items.map(opt => jsx('option', {
+                            value: opt.value,
+                            disabled: Boolean(opt.disabled),
+                            children: opt.label
+                          }, opt.value))
+                        }, grp.label))
+                      }),
+                      jsx('button', {
+                        type: 'button',
+                        className: 'hv-btn hv-btn-icon',
+                        onClick: () => refreshModels(true),
+                        title: 'Aggiorna modelli locali e cloud',
+                        'aria-label': 'Aggiorna modelli',
+                        children: jsx(Codicon, { name: 'refresh', size: '0.8rem' })
+                      }),
+                      jsx('button', {
+                        type: 'button',
+                        className: `hv-btn hv-btn-icon ${localDirsOpen ? 'hv-btn-primary' : ''}`,
+                        onClick: () => (localDirsOpen ? setLocalDirsOpen(false) : openLocalConfigDrawer()),
+                        title: 'Configura runtime locale / modello o cartelle GGUF & Unsloth',
+                        'aria-label': 'Cartelle modelli locali',
+                        children: jsx(Codicon, { name: 'folder', size: '0.8rem' })
+                      }),
+                      jsx('span', {
+                        className: `hv-ollama-pill ${ollamaOnline || localModelTotalCount > 0 ? 'hv-ollama-pill-online' : ''}`,
+                        title: modelsInfo?.ollama?.url || 'http://127.0.0.1:11434',
+                        children: [
+                          ollamaOnline ? `Ollama (${ollamaModels.length})` : 'Ollama offline',
+                          onlineLocalRuntimeEntries.length > 0 ? ` · Runtime (${onlineLocalRuntimeEntries.length})` : '',
+                          ggufModels.length > 0 ? ` · GGUF (${ggufModels.length})` : '',
+                          codexOauthInfo?.configured ? ' · Codex' : ''
+                        ].join('')
+                      })
+                    ]
+                  }),
+                  localDirsOpen
+                    ? jsxs('div', {
+                        className: 'hv-local-dirs-panel',
+                        children: [
+                          jsx('div', {
+                            className: 'hv-model-hint',
+                            children: 'Configura un runtime locale o specifica manualmente URL/porta e ID del modello locale (es. Unsloth Studio, Ollama, LM Studio, llama.cpp):'
+                          }),
+                          jsxs('div', {
+                            className: 'hv-local-dir-row hv-custom-runtime-row',
+                            children: [
+                              jsxs('select', {
+                                className: 'hv-select',
+                                'aria-label': 'Runtime locale',
+                                value: customRuntimeId,
+                                onChange: handleCustomRuntimeSelect,
+                                children: [
+                                  jsx('option', { value: 'ollama', children: 'Ollama' }),
+                                  jsx('option', { value: 'unsloth_studio', children: 'Unsloth Studio' }),
+                                  jsx('option', { value: 'lmstudio', children: 'LM Studio' }),
+                                  jsx('option', { value: 'llamacpp', children: 'llama.cpp Server' }),
+                                  jsx('option', { value: 'jan', children: 'Jan' }),
+                                  jsx('option', { value: 'koboldcpp', children: 'KoboldCpp' }),
+                                  jsx('option', { value: 'vllm', children: 'vLLM' }),
+                                  jsx('option', { value: 'custom', children: 'Custom OpenAI-Compat' })
+                                ]
+                              }),
+                              jsx('input', {
+                                className: 'hv-input',
+                                'aria-label': 'Endpoint runtime locale',
+                                placeholder: 'URL locale (es. http://127.0.0.1:8888/v1)',
+                                value: customRuntimeUrl,
+                                onChange: (e) => setCustomRuntimeUrl(e.target.value)
+                              }),
+                              jsx('input', {
+                                className: 'hv-input',
+                                'aria-label': 'ID modello locale',
+                                placeholder: 'ID/Tag modello (es. gemma4:12b, unsloth/Qwen3...)',
+                                value: customRuntimeModel,
+                                onChange: (e) => setCustomRuntimeModel(e.target.value),
+                                onKeyDown: (e) => { if (e.key === 'Enter') handleApplyCustomLocalRuntime() }
+                              }),
+                              jsx('button', {
+                                type: 'button',
+                                className: 'hv-btn hv-btn-primary',
+                                onClick: handleApplyCustomLocalRuntime,
+                                disabled: !customRuntimeModel.trim(),
+                                children: 'Applica'
+                              })
+                            ]
+                          }),
+                          jsx('div', {
+                            className: 'hv-model-hint',
+                            children: llamaServerAvailable
+                              ? 'llama-server rilevato su questo PC: i file GGUF / Unsloth su disco sono avviabili direttamente.'
+                              : 'llama-server non rilevato su disco: avvia Unsloth Studio / Ollama / LM Studio o installa llama-server per usare GGUF diretti.'
+                          }),
+                          jsx('div', {
+                            className: 'hv-model-hint',
+                            children: 'Cartelle personalizzate per rilevare GGUF / Unsloth su qualsiasi PC (vengono già scansionate cache HF, LM Studio, Jan e llama.cpp):'
+                          }),
+                          jsxs('div', {
+                            className: 'hv-local-dir-row hv-folder-dir-row',
+                            children: [
+                              jsx('input', {
+                                className: 'hv-input',
+                                placeholder: 'Percorso cartella modelli (es. D:\\AI\\Unsloth o ~/models)...',
+                                value: newLocalDirInput,
+                                onChange: (e) => setNewLocalDirInput(e.target.value),
+                                onKeyDown: (e) => { if (e.key === 'Enter') handleAddLocalDir() }
+                              }),
+                              jsx('button', {
+                                type: 'button',
+                                className: 'hv-btn hv-btn-primary',
+                                onClick: handleAddLocalDir,
+                                disabled: !newLocalDirInput.trim(),
+                                children: 'Aggiungi'
+                              })
+                            ]
+                          }),
+                          customLocalDirs.length > 0
+                            ? jsx('div', {
+                                className: 'hv-local-dirs-list',
+                                children: customLocalDirs.map((dirPath) => jsxs('span', {
+                                  className: 'hv-local-dir-chip',
+                                  children: [
+                                    jsx('span', { children: dirPath }),
+                                    jsx('button', {
+                                      type: 'button',
+                                      style: { background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', padding: 0 },
+                                      onClick: () => handleRemoveLocalDir(dirPath),
+                                      title: 'Rimuovi cartella',
+                                      children: '×'
+                                    })
+                                  ]
+                                }, dirPath))
+                              })
+                            : null
+                        ]
+                      })
+                    : null,
                   jsx('div', {
                     className: 'hv-chat-history',
                     children: chatMessages.length === 0
@@ -2883,6 +3512,10 @@ function VoiceDocumentPage({ ctx, controller }) {
                                     jsxs('div', {
                                       className: 'hv-msg-actions',
                                       children: [
+                                        jsx('span', {
+                                          className: 'hv-msg-model-tag',
+                                          children: msg.model_used || activeLlmModel
+                                        }),
                                         jsxs('button', {
                                           type: 'button',
                                           className: 'hv-msg-speak-btn',
@@ -2949,10 +3582,10 @@ function VoiceDocumentPage({ ctx, controller }) {
                   jsxs('span', {
                     className: 'hv-privacy-status',
                     children: [
-                      jsx(Codicon, { name: 'shield-check', size: '0.9rem', style: { color: '#10b981' } }),
+                      jsx(Codicon, { name: 'shield-check', size: '0.9rem', style: { color: status?.allow_remote ? '#f59e0b' : '#10b981' } }),
                       'Routing: ',
-                      jsx('strong', { style: { color: 'var(--foreground, #f1f5f9)' }, children: 'Ollama Locale (gemma4:12b)' }),
-                      ' · Privacy locale attiva'
+                      jsx('strong', { style: { color: 'var(--foreground, #f1f5f9)' }, children: `${providerLabel} (${activeModelDisplay})` }),
+                      status?.allow_remote ? ' · Provider remoti autorizzati' : ' · Privacy locale attiva'
                     ]
                   }),
                   jsxs('label', {
