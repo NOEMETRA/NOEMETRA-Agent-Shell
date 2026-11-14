@@ -225,12 +225,16 @@ _OLLAMA_CLOUD_FALLBACK: List[str] = [
 ]
 
 _CODEX_MODELS_FALLBACK: List[str] = [
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
+    "gpt-5.5",
+    "gpt-5.4-mini",
+    "gpt-5.4",
 ]
 
 _CLOUD_CATALOG_CACHE: Dict[str, tuple[float, Any]] = {}
@@ -364,12 +368,17 @@ def _fetch_codex_oauth_catalog(refresh: bool = False) -> List[str]:
             creds = resolve_codex_runtime_credentials(read_only=True)
             tok = creds.get("api_key")
             base_url = creds.get("base_url")
+            if tok and _codex_access_token_is_expiring(tok, 60):
+                with suppress(Exception):
+                    refreshed = resolve_codex_runtime_credentials(read_only=False)
+                    tok = refreshed.get("api_key") or tok
+                    base_url = refreshed.get("base_url") or base_url
             if tok and not _codex_access_token_is_expiring(tok, 0):
                 access_token = tok
         if access_token:
             models = list(get_codex_model_ids(access_token=access_token, base_url=base_url) or [])
         else:
-            models = list(DEFAULT_CODEX_MODELS)
+            models = list(get_codex_model_ids() or DEFAULT_CODEX_MODELS)
 
     if not models:
         models = list(_CODEX_MODELS_FALLBACK)
@@ -835,7 +844,11 @@ class ModelRouter:
 
     def set_allow_remote(self, allowed: bool) -> None:
         """Update explicit user authorization for remote network transmission."""
+        prev = bool(getattr(self, "allow_remote", False))
         self.allow_remote = bool(allowed)
+        if not prev and self.allow_remote:
+            for key in ("openai_codex", "openrouter", "ollama_cloud"):
+                _CLOUD_CATALOG_CACHE.pop(key, None)
         logger.info(f"Autorizzazione provider remoti aggiornata a: {self.allow_remote}")
 
     def set_model(self, model_name: str) -> None:

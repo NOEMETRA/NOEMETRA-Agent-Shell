@@ -935,9 +935,16 @@ const CSS = `
   white-space: nowrap;
 }
 
+.hv-provider-select {
+  flex: 0 1 180px;
+  min-width: 145px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
 .hv-llm-select {
-  flex: 1;
-  min-width: 170px;
+  flex: 1 1 190px;
+  min-width: 165px;
   padding: 5px 10px;
   font-size: 12px;
 }
@@ -2044,6 +2051,8 @@ function VoiceDocumentPage({ ctx, controller }) {
   const [customRuntimeId, setCustomRuntimeId] = useState('ollama')
   const [customRuntimeUrl, setCustomRuntimeUrl] = useState('http://127.0.0.1:11434')
   const [customRuntimeModel, setCustomRuntimeModel] = useState('')
+  const [selectedProvider, setSelectedProvider] = useState('ollama')
+  const prevBackendProviderRef = useRef('ollama')
   const fileInputRef = useRef(null)
   const searchInputRef = useRef(null)
   const msgAudioRef = useRef(null)
@@ -2171,7 +2180,7 @@ function VoiceDocumentPage({ ctx, controller }) {
     controller.setLibrary([])
     controller.setModelsInfo(null)
     refreshLibrary()
-    refreshModels()
+    refreshModels(true)
   }, [activeScope])
 
   // Playback handlers delegated to plugin-scoped controller
@@ -2364,7 +2373,7 @@ function VoiceDocumentPage({ ctx, controller }) {
         method: 'POST',
         body: { allow_remote }
       })
-      await refreshModels()
+      await refreshModels(allow_remote)
       host.notify({
         kind: allow_remote ? 'warning' : 'info',
         message: allow_remote
@@ -2387,15 +2396,24 @@ function VoiceDocumentPage({ ctx, controller }) {
     custom: 'http://127.0.0.1:8000/v1'
   }
 
-  const openLocalConfigDrawer = () => {
-    const rtCandidate = LOCAL_RUNTIME_DEFAULTS[activeLlmProvider] ? activeLlmProvider : 'ollama'
-    setCustomRuntimeId(rtCandidate)
-    const detectedUrl = rtCandidate === 'ollama'
+  const openLocalConfigDrawer = (preferredProv = null) => {
+    const candidate = typeof preferredProv === 'string' && LOCAL_RUNTIME_DEFAULTS[preferredProv]
+      ? preferredProv
+      : (LOCAL_RUNTIME_DEFAULTS[selectedProvider]
+          ? selectedProvider
+          : (LOCAL_RUNTIME_DEFAULTS[activeLlmProvider] ? activeLlmProvider : 'ollama'))
+    setCustomRuntimeId(candidate)
+    const detectedUrl = candidate === 'ollama'
       ? (modelsInfo?.ollama?.url || LOCAL_RUNTIME_DEFAULTS.ollama)
-      : (modelsInfo?.local_runtimes?.[rtCandidate]?.url || LOCAL_RUNTIME_DEFAULTS[rtCandidate] || '')
+      : (modelsInfo?.local_runtimes?.[candidate]?.url || LOCAL_RUNTIME_DEFAULTS[candidate] || '')
     setCustomRuntimeUrl(detectedUrl)
-    if (LOCAL_RUNTIME_DEFAULTS[activeLlmProvider] && activeLlmModel) {
+    if (candidate === activeLlmProvider && activeLlmModel) {
       setCustomRuntimeModel(activeLlmModel)
+    } else {
+      const rtModels = candidate === 'ollama'
+        ? (Array.isArray(modelsInfo?.ollama?.models) ? modelsInfo.ollama.models : [])
+        : (Array.isArray(modelsInfo?.local_runtimes?.[candidate]?.models) ? modelsInfo.local_runtimes[candidate].models : [])
+      setCustomRuntimeModel(rtModels[0] || '')
     }
     setLocalDirsOpen(true)
   }
@@ -2424,31 +2442,12 @@ function VoiceDocumentPage({ ctx, controller }) {
     const cleanUrl = String(customRuntimeUrl || '').trim() || null
     try {
       await controller.setLlmModel(cleanModel, customRuntimeId, cleanUrl)
+      prevBackendProviderRef.current = customRuntimeId
+      setSelectedProvider(customRuntimeId)
       await refreshModels(false)
       host.notify({ kind: 'info', message: `Modello Analista impostato su: ${cleanModel} (${customRuntimeId})` })
     } catch (err) {
       host.notifyError(err, 'Errore configurazione runtime locale')
-    }
-  }
-
-  const handleLlmModelChange = async (e) => {
-    const rawVal = e.target.value
-    if (!rawVal) return
-    if (rawVal === '__configure_local__') {
-      openLocalConfigDrawer()
-      return
-    }
-    const sepIdx = rawVal.indexOf('::')
-    const provider = sepIdx !== -1 ? rawVal.slice(0, sepIdx) : 'ollama'
-    const model = sepIdx !== -1 ? rawVal.slice(sepIdx + 2) : rawVal
-    const runtimeUrl = provider === 'ollama'
-      ? (modelsInfo?.ollama?.url || null)
-      : (modelsInfo?.local_runtimes?.[provider]?.url || null)
-    try {
-      await controller.setLlmModel(model, provider, runtimeUrl)
-      host.notify({ kind: 'info', message: `Modello Analista impostato su: ${model} (${provider})` })
-    } catch (err) {
-      host.notifyError(err, 'Errore cambio modello Analista')
     }
   }
 
@@ -2605,7 +2604,6 @@ function VoiceDocumentPage({ ctx, controller }) {
   const customLocalDirs = Array.isArray(modelsInfo?.local_gguf?.custom_dirs) ? modelsInfo.local_gguf.custom_dirs : []
   const codexOauthInfo = modelsInfo?.codex_oauth || null
   const cloudProviders = modelsInfo?.cloud_providers || null
-  const activeLlmValue = `${activeLlmProvider}::${activeLlmModel}`
 
   const onlineLocalRuntimeEntries = Object.entries(localRuntimes).filter(
     ([, info]) => info && info.status === 'online'
@@ -2621,9 +2619,9 @@ function VoiceDocumentPage({ ctx, controller }) {
   const PROVIDER_DISPLAY_NAMES = {
     ollama: 'Ollama Locale',
     'openai-codex': 'ChatGPT Codex (Quote)',
-    openrouter: 'OpenRouter',
+    openrouter: 'OpenRouter (:free)',
     'ollama-cloud': 'Ollama Cloud',
-    gguf: 'GGUF / Unsloth Locale',
+    gguf: 'Unsloth / GGUF su Disco',
     lmstudio: 'LM Studio',
     unsloth_studio: 'Unsloth Studio',
     llamacpp: 'llama.cpp Locale',
@@ -2631,150 +2629,271 @@ function VoiceDocumentPage({ ctx, controller }) {
     koboldcpp: 'KoboldCpp Locale',
     vllm: 'vLLM Locale',
     custom: 'Runtime Locale Custom',
-    openai_compatible: 'Locale OpenAI-Compat'
+    openai_compatible: 'Locale OpenAI-Compat',
+    openai: 'OpenAI API',
+    anthropic: 'Anthropic API'
   }
 
-  const llmGroups = useMemo(() => {
-    const groups = []
+  useEffect(() => {
+    if (activeLlmProvider && activeLlmProvider !== prevBackendProviderRef.current) {
+      prevBackendProviderRef.current = activeLlmProvider
+      setSelectedProvider(activeLlmProvider)
+    }
+  }, [activeLlmProvider])
+
+  const getModelsForProvider = (prov) => {
+    const items = []
     const seen = new Set()
-    const pushInto = (groupItems, provider, model, label, opts = {}) => {
-      const value = opts.explicitValue || `${provider}::${model}`
-      if (seen.has(value)) return
-      seen.add(value)
-      groupItems.push({ value, provider, model, label, disabled: Boolean(opts.disabled) })
+    const pushModel = (modelId, label, opts = {}) => {
+      if (!modelId && !opts.explicitValue) return
+      const val = opts.explicitValue || String(modelId)
+      if (seen.has(val)) return
+      seen.add(val)
+      items.push({ value: val, label: label || val, disabled: Boolean(opts.disabled) })
     }
 
-    const activeGroup = []
-    const activeDisplayModel = activeLlmProvider === 'gguf'
-      ? (String(activeLlmModel).split(/[\\/]/).pop() || activeLlmModel)
-      : activeLlmModel
-    const activeProviderName = PROVIDER_DISPLAY_NAMES[activeLlmProvider] || activeLlmProvider
-    pushInto(
-      activeGroup,
-      activeLlmProvider,
-      activeLlmModel,
-      `${activeProviderName} · ${activeDisplayModel}`
-    )
-    for (const m of ollamaModels) {
-      if (m && typeof m === 'string') {
-        pushInto(activeGroup, 'ollama', m, `Ollama · ${m}`)
+    if (prov === 'ollama') {
+      if (activeLlmProvider === 'ollama' && activeLlmModel) {
+        pushModel(activeLlmModel, activeLlmModel)
       }
-    }
-    for (const [rid, info] of onlineLocalRuntimeEntries) {
-      const rLabel = info.label || PROVIDER_DISPLAY_NAMES[rid] || rid
-      const rModels = Array.isArray(info.models) ? info.models : []
-      if (rModels.length > 0) {
-        for (const m of rModels) {
-          if (m && typeof m === 'string') {
-            pushInto(activeGroup, rid, m, `${rLabel} · ${m}`)
-          }
-        }
-      } else {
-        pushInto(
-          activeGroup,
-          rid,
-          '',
-          `${rLabel} (online · nessun modello caricato)`,
-          { explicitValue: `__empty_runtime__::${rid}`, disabled: true }
-        )
+      for (const m of ollamaModels) {
+        if (m && typeof m === 'string') pushModel(m, m)
       }
+      if (items.length === 0) {
+        pushModel('', ollamaOnline ? 'Nessun modello Ollama scaricato' : 'Ollama offline — avvia Ollama o configura URL', {
+          explicitValue: '__empty__::ollama',
+          disabled: true
+        })
+      }
+      pushModel('', '⚙ Tag Ollama / URL manuale...', { explicitValue: '__configure_local__' })
+      return items
     }
-    pushInto(
-      activeGroup,
-      'custom',
-      '',
-      '⚙ Inserisci runtime / modello locale manuale...',
-      { explicitValue: '__configure_local__' }
-    )
-    groups.push({ label: 'Runtime Locali Attivi', items: activeGroup })
 
-    if (ggufModels.length > 0) {
-      const ggufGroup = []
+    if (prov === 'gguf') {
       for (const g of ggufModels) {
         if (g && g.path) {
           const srcTag = g.source === 'unsloth' ? 'Unsloth' : (g.source || 'GGUF')
           const quantTag = g.quant ? ` · ${g.quant}` : ''
           const sizeTag = g.size_label ? ` (${g.size_label})` : ''
-          pushInto(ggufGroup, 'gguf', g.path, `${srcTag} · ${g.name}${quantTag}${sizeTag}`)
+          pushModel(g.path, `${srcTag} · ${g.name}${quantTag}${sizeTag}`)
         }
       }
-      if (ggufGroup.length > 0) {
-        groups.push({ label: 'GGUF / Unsloth su Disco', items: ggufGroup })
+      if (activeLlmProvider === 'gguf' && activeLlmModel) {
+        const baseName = String(activeLlmModel).split(/[\\/]/).pop() || activeLlmModel
+        pushModel(activeLlmModel, `Unsloth / GGUF · ${baseName}`)
       }
+      if (items.length === 0) {
+        pushModel('', 'Nessun GGUF / Unsloth su disco — aggiungi cartella (📁)', {
+          explicitValue: '__empty__::gguf',
+          disabled: true
+        })
+      }
+      pushModel('', '⚙ Aggiungi cartella Unsloth / GGUF...', { explicitValue: '__configure_local__' })
+      return items
     }
 
-    if (status?.allow_remote) {
-      if (codexOauthInfo?.configured && Array.isArray(codexOauthInfo.models) && codexOauthInfo.models.length > 0) {
-        const codexGroup = []
-        for (const m of codexOauthInfo.models) {
-          if (m && typeof m === 'string') {
-            pushInto(codexGroup, 'openai-codex', m, `ChatGPT Codex · ${m}`)
-          }
-        }
-        if (codexGroup.length > 0) {
-          groups.push({ label: 'ChatGPT Codex (Quote ChatGPT)', items: codexGroup })
-        }
+    if (localRuntimes[prov] || LOCAL_RUNTIME_DEFAULTS[prov] || prov === 'openai_compatible') {
+      const rInfo = localRuntimes[prov]
+      const rModels = Array.isArray(rInfo?.models) ? rInfo.models : []
+      if (activeLlmProvider === prov && activeLlmModel) {
+        pushModel(activeLlmModel, activeLlmModel)
       }
+      for (const m of rModels) {
+        if (m && typeof m === 'string') pushModel(m, m)
+      }
+      if (items.length === 0) {
+        const rName = PROVIDER_DISPLAY_NAMES[prov] || prov
+        const msg = rInfo?.status === 'online'
+          ? `${rName} online — nessun modello caricato`
+          : `${rName} offline — avvia l'app o configura URL`
+        pushModel('', msg, { explicitValue: `__empty__::${prov}`, disabled: true })
+      }
+      pushModel('', '⚙ Configura URL / ID modello...', { explicitValue: '__configure_local__' })
+      return items
+    }
 
+    if (prov === 'openai-codex') {
+      if (activeLlmProvider === 'openai-codex' && activeLlmModel) pushModel(activeLlmModel, activeLlmModel)
+      for (const m of (Array.isArray(codexOauthInfo?.models) ? codexOauthInfo.models : [])) {
+        if (m && typeof m === 'string') pushModel(m, m)
+      }
+      return items
+    }
+
+    if (prov === 'openrouter') {
+      if (activeLlmProvider === 'openrouter' && activeLlmModel) pushModel(activeLlmModel, activeLlmModel)
+      for (const m of (Array.isArray(cloudProviders?.openrouter?.free_models) ? cloudProviders.openrouter.free_models : [])) {
+        if (m && typeof m === 'string') pushModel(m, m)
+      }
+      return items
+    }
+
+    if (prov === 'ollama-cloud') {
+      if (activeLlmProvider === 'ollama-cloud' && activeLlmModel) pushModel(activeLlmModel, activeLlmModel)
+      for (const m of (Array.isArray(cloudProviders?.ollama_cloud?.models) ? cloudProviders.ollama_cloud.models : [])) {
+        if (m && typeof m === 'string') pushModel(m, m)
+      }
+      return items
+    }
+
+    if (prov === 'openai') {
+      if (activeLlmProvider === 'openai' && activeLlmModel) pushModel(activeLlmModel, activeLlmModel)
+      for (const m of (cloudProviders?.openai?.models || ['gpt-4o-mini'])) {
+        if (m && typeof m === 'string') pushModel(m, m)
+      }
+      return items
+    }
+
+    if (prov === 'anthropic') {
+      if (activeLlmProvider === 'anthropic' && activeLlmModel) pushModel(activeLlmModel, activeLlmModel)
+      for (const m of (cloudProviders?.anthropic?.models || ['claude-3-5-sonnet-20241022'])) {
+        if (m && typeof m === 'string') pushModel(m, m)
+      }
+      return items
+    }
+
+    if (activeLlmModel) pushModel(activeLlmModel, activeLlmModel)
+    return items
+  }
+
+  const providerGroups = useMemo(() => {
+    const groups = []
+    const localItems = []
+    const seen = new Set()
+    const pushProv = (target, value, label) => {
+      if (!value || seen.has(value)) return
+      seen.add(value)
+      target.push({ value, label })
+    }
+
+    pushProv(localItems, 'ollama', `Ollama Locale (${ollamaModels.length})`)
+    pushProv(localItems, 'gguf', `Unsloth / GGUF (${ggufModels.length})`)
+    const unslothInfo = localRuntimes.unsloth_studio
+    const unslothCount = Array.isArray(unslothInfo?.models) ? unslothInfo.models.length : 0
+    pushProv(
+      localItems,
+      'unsloth_studio',
+      unslothInfo?.status === 'online' ? `Unsloth Studio (${unslothCount})` : 'Unsloth Studio (offline)'
+    )
+
+    for (const [rid, info] of onlineLocalRuntimeEntries) {
+      if (rid === 'unsloth_studio') continue
+      const rLabel = info.label || PROVIDER_DISPLAY_NAMES[rid] || rid
+      const rCount = Array.isArray(info.models) ? info.models.length : 0
+      pushProv(localItems, rid, `${rLabel} (${rCount})`)
+    }
+    if (activeLlmProvider && !status?.allow_remote && !seen.has(activeLlmProvider)) {
+      pushProv(localItems, activeLlmProvider, PROVIDER_DISPLAY_NAMES[activeLlmProvider] || activeLlmProvider)
+    }
+    if (selectedProvider && !seen.has(selectedProvider) && !['openai-codex', 'openrouter', 'ollama-cloud', 'openai', 'anthropic'].includes(selectedProvider)) {
+      pushProv(localItems, selectedProvider, PROVIDER_DISPLAY_NAMES[selectedProvider] || selectedProvider)
+    }
+    pushProv(localItems, '__configure_local__', '⚙ Altro runtime locale...')
+    groups.push({ label: 'Runtime Locali', items: localItems })
+
+    if (status?.allow_remote) {
+      const cloudItems = []
+      if (codexOauthInfo?.configured && Array.isArray(codexOauthInfo.models) && codexOauthInfo.models.length > 0) {
+        pushProv(cloudItems, 'openai-codex', `ChatGPT Codex (${codexOauthInfo.models.length})`)
+      }
       const orInfo = cloudProviders?.openrouter
       if (orInfo && (orInfo.configured || (!cloudProviders && modelsInfo?.remote_api?.configured))) {
-        const freeGroup = []
-        for (const m of (Array.isArray(orInfo.free_models) ? orInfo.free_models : [])) {
-          if (m && typeof m === 'string') {
-            pushInto(freeGroup, 'openrouter', m, `OpenRouter Free · ${m}`)
-          }
-        }
-        if (freeGroup.length > 0) {
-          groups.push({ label: 'Cloud Gratuiti (OpenRouter :free)', items: freeGroup })
-        }
+        const freeCount = Array.isArray(orInfo.free_models) ? orInfo.free_models.length : 0
+        if (freeCount > 0) pushProv(cloudItems, 'openrouter', `OpenRouter Free (${freeCount})`)
       }
-
       const ocInfo = cloudProviders?.ollama_cloud
       if (ocInfo?.configured && Array.isArray(ocInfo.models) && ocInfo.models.length > 0) {
-        const ocGroup = []
-        for (const m of ocInfo.models) {
-          if (m && typeof m === 'string') {
-            pushInto(ocGroup, 'ollama-cloud', m, `Ollama Cloud · ${m}`)
-          }
-        }
-        if (ocGroup.length > 0) {
-          groups.push({ label: 'Ollama Cloud', items: ocGroup })
-        }
+        pushProv(cloudItems, 'ollama-cloud', `Ollama Cloud (${ocInfo.models.length})`)
       }
-
-      const paidGroup = []
       if (cloudProviders) {
-        if (cloudProviders.openai?.configured) {
-          for (const m of (cloudProviders.openai.models || ['gpt-4o-mini'])) {
-            pushInto(paidGroup, 'openai', m, `OpenAI API · ${m}`)
-          }
-        }
-        if (cloudProviders.anthropic?.configured) {
-          for (const m of (cloudProviders.anthropic.models || ['claude-3-5-sonnet-20241022'])) {
-            pushInto(paidGroup, 'anthropic', m, `Anthropic API · ${m}`)
-          }
-        }
+        if (cloudProviders.openai?.configured) pushProv(cloudItems, 'openai', 'OpenAI API')
+        if (cloudProviders.anthropic?.configured) pushProv(cloudItems, 'anthropic', 'Anthropic API')
       } else if (modelsInfo?.remote_api?.configured) {
-        pushInto(paidGroup, 'openai', 'gpt-4o-mini', 'OpenAI · gpt-4o-mini (remoto)')
-        pushInto(paidGroup, 'anthropic', 'claude-3-5-sonnet-20241022', 'Anthropic · claude-3-5-sonnet (remoto)')
+        pushProv(cloudItems, 'openai', 'OpenAI API')
+        pushProv(cloudItems, 'anthropic', 'Anthropic API')
       }
-      if (paidGroup.length > 0) {
-        groups.push({ label: 'Cloud API (OpenAI / Anthropic)', items: paidGroup })
+      if (cloudItems.length > 0) {
+        groups.push({ label: 'Cloud / Remoti', items: cloudItems })
       }
     }
 
     return groups
   }, [
     activeLlmProvider,
-    activeLlmModel,
-    ollamaModels.join('|'),
-    JSON.stringify(onlineLocalRuntimeEntries),
-    JSON.stringify(ggufModels),
+    selectedProvider,
+    ollamaModels.length,
+    ggufModels.length,
+    JSON.stringify(localRuntimes),
     status?.allow_remote,
     JSON.stringify(codexOauthInfo),
     JSON.stringify(cloudProviders),
     modelsInfo?.remote_api?.configured
   ])
+
+  const effectiveProvider = selectedProvider || activeLlmProvider || 'ollama'
+  const modelOptions = useMemo(() => getModelsForProvider(effectiveProvider), [
+    effectiveProvider,
+    activeLlmProvider,
+    activeLlmModel,
+    ollamaOnline,
+    ollamaModels.join('|'),
+    JSON.stringify(localRuntimes),
+    JSON.stringify(ggufModels),
+    JSON.stringify(codexOauthInfo),
+    JSON.stringify(cloudProviders)
+  ])
+
+  const realModelOptions = modelOptions.filter((o) => !o.disabled && o.value !== '__configure_local__')
+  const selectedModelValue = effectiveProvider === activeLlmProvider && realModelOptions.some((o) => o.value === activeLlmModel)
+    ? activeLlmModel
+    : (realModelOptions[0]?.value || modelOptions[0]?.value || '')
+
+  const handleProviderChange = async (e) => {
+    const nextProv = e.target.value
+    if (!nextProv) return
+    if (nextProv === '__configure_local__') {
+      openLocalConfigDrawer()
+      return
+    }
+    setSelectedProvider(nextProv)
+    const nextRealModels = getModelsForProvider(nextProv).filter((o) => !o.disabled && o.value !== '__configure_local__')
+    if (nextRealModels.length === 0) {
+      return
+    }
+    const targetModel = nextProv === activeLlmProvider && nextRealModels.some((o) => o.value === activeLlmModel)
+      ? activeLlmModel
+      : nextRealModels[0].value
+    const runtimeUrl = nextProv === 'ollama'
+      ? (modelsInfo?.ollama?.url || null)
+      : (localRuntimes?.[nextProv]?.url || null)
+    try {
+      await controller.setLlmModel(targetModel, nextProv, runtimeUrl)
+      prevBackendProviderRef.current = nextProv
+      host.notify({ kind: 'info', message: `Modello Analista impostato su: ${targetModel} (${PROVIDER_DISPLAY_NAMES[nextProv] || nextProv})` })
+    } catch (err) {
+      host.notifyError(err, 'Errore cambio runtime Analista')
+    }
+  }
+
+  const handleModelSelectionChange = async (e) => {
+    const model = e.target.value
+    if (!model) return
+    if (model === '__configure_local__') {
+      openLocalConfigDrawer(effectiveProvider)
+      return
+    }
+    const provider = effectiveProvider
+    const runtimeUrl = provider === 'ollama'
+      ? (modelsInfo?.ollama?.url || null)
+      : (localRuntimes?.[provider]?.url || null)
+    try {
+      await controller.setLlmModel(model, provider, runtimeUrl)
+      prevBackendProviderRef.current = provider
+      host.notify({ kind: 'info', message: `Modello Analista impostato su: ${model} (${PROVIDER_DISPLAY_NAMES[provider] || provider})` })
+    } catch (err) {
+      host.notifyError(err, 'Errore cambio modello Analista')
+    }
+  }
 
   const providerLabel = PROVIDER_DISPLAY_NAMES[activeLlmProvider] || activeLlmProvider
   const activeModelDisplay = activeLlmProvider === 'gguf'
@@ -3278,23 +3397,34 @@ function VoiceDocumentPage({ ctx, controller }) {
                         className: 'hv-chat-model-label',
                         children: [
                           jsx(Codicon, { name: 'chip', size: '0.85rem' }),
-                          'Modello Analista'
+                          'Analista'
                         ]
+                      }),
+                      jsx('select', {
+                        className: 'hv-select hv-provider-select',
+                        'aria-label': 'Provider Analista',
+                        value: effectiveProvider,
+                        onChange: handleProviderChange,
+                        disabled: isAsking,
+                        children: providerGroups.map(grp => jsxs('optgroup', {
+                          label: grp.label,
+                          children: grp.items.map(opt => jsx('option', {
+                            value: opt.value,
+                            children: opt.label
+                          }, opt.value))
+                        }, grp.label))
                       }),
                       jsx('select', {
                         className: 'hv-select hv-llm-select',
                         'aria-label': 'Modello Analista',
-                        value: activeLlmValue,
-                        onChange: handleLlmModelChange,
+                        value: selectedModelValue,
+                        onChange: handleModelSelectionChange,
                         disabled: isAsking,
-                        children: llmGroups.map(grp => jsxs('optgroup', {
-                          label: grp.label,
-                          children: grp.items.map(opt => jsx('option', {
-                            value: opt.value,
-                            disabled: Boolean(opt.disabled),
-                            children: opt.label
-                          }, opt.value))
-                        }, grp.label))
+                        children: modelOptions.map(opt => jsx('option', {
+                          value: opt.value,
+                          disabled: Boolean(opt.disabled),
+                          children: opt.label
+                        }, opt.value))
                       }),
                       jsx('button', {
                         type: 'button',

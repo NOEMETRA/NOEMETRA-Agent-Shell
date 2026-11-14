@@ -484,18 +484,25 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
       expect(view.container.querySelector('mark.hv-search-mark')?.textContent).toBe('GeoJSON')
     })
 
-    // Analyst LLM model selector loads Ollama, LM Studio, GGUF/Unsloth locally, then Codex/OpenRouter/Ollama Cloud when remote enabled
+    // Analyst cascading selectors: Provider Analista -> Modello Analista (each runtime shows only its own models)
+    const providerSelect = view.container.querySelector('select[aria-label="Provider Analista"]') as HTMLSelectElement
     const llmSelect = view.container.querySelector('select[aria-label="Modello Analista"]') as HTMLSelectElement
+    expect(providerSelect).not.toBeNull()
     expect(llmSelect).not.toBeNull()
     await waitFor(() => {
+      const provValues = Array.from(providerSelect.options).map(o => o.value)
+      expect(provValues).toContain('ollama')
+      expect(provValues).toContain('gguf')
+      expect(provValues).toContain('unsloth_studio')
+      expect(provValues).toContain('lmstudio')
+      expect(provValues).not.toContain('openai-codex')
       const optValues = Array.from(llmSelect.options).map(o => o.value)
-      expect(optValues).toContain('ollama::qwen2.5:14b')
-      expect(optValues).toContain('lmstudio::qwen3-14b-instruct')
-      expect(optValues).toContain('gguf::C:/models/unsloth-qwen3-14b-UD-Q4_K_M.gguf')
-      expect(optValues).not.toContain('openai-codex::gpt-5.4')
+      expect(optValues).toContain('qwen2.5:14b')
+      expect(optValues).not.toContain('qwen3-14b-instruct')
+      expect(optValues).not.toContain('C:/models/unsloth-qwen3-14b-UD-Q4_K_M.gguf')
       expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('Ollama Locale (gemma4:12b)')
     })
-    fireEvent.change(llmSelect, { target: { value: 'ollama::qwen2.5:14b' } })
+    fireEvent.change(llmSelect, { target: { value: 'qwen2.5:14b' } })
     await waitFor(() => {
       expect(calls.some(c =>
         c.path === '/api/plugins/voice-document-assistant/playback/config' &&
@@ -503,6 +510,17 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
         (c.body as { llm_model?: string; llm_provider?: string })?.llm_provider === 'ollama'
       )).toBe(true)
       expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('Ollama Locale (qwen2.5:14b)')
+    })
+    fireEvent.change(providerSelect, { target: { value: 'gguf' } })
+    await waitFor(() => {
+      const optValues = Array.from(llmSelect.options).map(o => o.value)
+      expect(optValues).toContain('C:/models/unsloth-qwen3-14b-UD-Q4_K_M.gguf')
+      expect(optValues).not.toContain('qwen2.5:14b')
+      expect(calls.some(c =>
+        c.path === '/api/plugins/voice-document-assistant/playback/config' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_model === 'C:/models/unsloth-qwen3-14b-UD-Q4_K_M.gguf' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_provider === 'gguf'
+      )).toBe(true)
     })
 
     // Add custom Unsloth folder and configure custom local runtime + model via folder drawer
@@ -543,24 +561,38 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
       expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('Unsloth Studio (unsloth/Qwen3-14B)')
     })
 
-    // Enable remote providers -> exposes ChatGPT Codex (OAuth), OpenRouter Free, and Ollama Cloud
+    // Enable remote providers -> exposes ChatGPT Codex (OAuth), OpenRouter Free, and Ollama Cloud in Provider selector
     const privacyToggle = view.container.querySelector('.hv-privacy-bar input[type="checkbox"]') as HTMLInputElement
     fireEvent.click(privacyToggle)
     await waitFor(() => {
-      const optValues = Array.from(llmSelect.options).map(o => o.value)
-      expect(optValues).toContain('openai-codex::gpt-5.4')
-      expect(optValues).toContain('openrouter::meta-llama/llama-3.3-70b-instruct:free')
-      expect(optValues).toContain('ollama-cloud::gpt-oss:120b-cloud')
+      const provValues = Array.from(providerSelect.options).map(o => o.value)
+      expect(provValues).toContain('openai-codex')
+      expect(provValues).toContain('openrouter')
+      expect(provValues).toContain('ollama-cloud')
     })
 
-    fireEvent.change(llmSelect, { target: { value: 'openai-codex::gpt-5.4' } })
+    fireEvent.change(providerSelect, { target: { value: 'openai-codex' } })
     await waitFor(() => {
+      const optValues = Array.from(llmSelect.options).map(o => o.value)
+      expect(optValues).toContain('gpt-5.4')
+      expect(optValues).toContain('gpt-5.4-mini')
+      expect(optValues).not.toContain('qwen2.5:14b')
       expect(calls.some(c =>
         c.path === '/api/plugins/voice-document-assistant/playback/config' &&
         (c.body as { llm_model?: string; llm_provider?: string })?.llm_model === 'gpt-5.4' &&
         (c.body as { llm_model?: string; llm_provider?: string })?.llm_provider === 'openai-codex'
       )).toBe(true)
       expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('ChatGPT Codex (Quote) (gpt-5.4)')
+    })
+
+    fireEvent.change(llmSelect, { target: { value: 'gpt-5.4-mini' } })
+    await waitFor(() => {
+      expect(calls.some(c =>
+        c.path === '/api/plugins/voice-document-assistant/playback/config' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_model === 'gpt-5.4-mini' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_provider === 'openai-codex'
+      )).toBe(true)
+      expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('ChatGPT Codex (Quote) (gpt-5.4-mini)')
     })
 
     view.unmount()

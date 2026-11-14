@@ -975,6 +975,38 @@ def test_explicit_api_key_not_reused_across_cloud_providers_and_object_models_pr
     assert router.is_active_endpoint_local() is False
 
 
+def test_codex_native_oauth_catalog_live_and_cache_invalidation(monkeypatch):
+    """Native Hermes Codex OAuth exposes live gpt-6-astra and 6.1 models and invalidates offline cache on allow_remote."""
+    from hermes_voice import model_router as mr
+
+    mr._CLOUD_CATALOG_CACHE.clear()
+    monkeypatch.setattr("hermes_cli.auth.get_auth_status", lambda prov: {"logged_in": prov == "openai-codex"})
+    monkeypatch.setattr("hermes_cli.auth._codex_access_token_is_expiring", lambda tok, skew=0: False)
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_codex_runtime_credentials",
+        lambda read_only=True: {"api_key": "tok-native-hermes", "base_url": "https://chatgpt.com/backend-api/codex"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models.get_codex_model_ids",
+        lambda access_token=None, base_url=None: (
+            ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-5.4"]
+            if access_token == "tok-native-hermes"
+            else ["gpt-6.1-terra", "gpt-5.4"]
+        ),
+    )
+
+    router = ModelRouter(allow_remote=False)
+    offline_status = router.get_providers_status(refresh=True)
+    assert "gpt-6-astra" not in offline_status["codex_oauth"]["models"]
+    assert "gpt-6.1-terra" in offline_status["codex_oauth"]["models"]
+
+    router.set_allow_remote(True)
+    assert "openai_codex" not in mr._CLOUD_CATALOG_CACHE
+    live_status = router.get_providers_status(refresh=True)
+    assert "gpt-6-astra" in live_status["codex_oauth"]["models"]
+    assert "gpt-6.1-sol" in live_status["codex_oauth"]["models"]
+
+
 
 
 
