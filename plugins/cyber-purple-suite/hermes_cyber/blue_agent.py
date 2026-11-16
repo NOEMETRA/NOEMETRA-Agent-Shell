@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from typing import Dict, List, Optional, Tuple
 
@@ -17,13 +19,42 @@ from hermes_cyber.observer import PrivacyScrubber
 from hermes_cyber.router_bridge import ModelRouter, invoke_router_json
 
 
+def _yaml_scalar(value: str) -> str:
+    """Format a string safely as a single-line YAML scalar."""
+    s = str(value)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in s):
+        return json.dumps(s, ensure_ascii=False)
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _yara_escape(value: str) -> str:
+    """Escape backslashes, double quotes, and control chars for YARA double-quoted strings."""
+    out: List[str] = []
+    for ch in str(value):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 32 or ord(ch) == 127:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _build_sigma_yaml(spec: SigmaRuleSpec) -> str:
-    kw_lines = "\n".join(f"      - '{k}'" for k in spec.detection_keywords) or "      - 'suspicious'"
+    kw_lines = "\n".join(f"      - {_yaml_scalar(k)}" for k in spec.detection_keywords) or "      - 'suspicious'"
     exc_lines = ""
     if spec.exclude_fields:
         flat_exc = [v for vals in spec.exclude_fields.values() for v in vals]
         if flat_exc:
-            exc_items = "\n".join(f"      - '{v}'" for v in flat_exc)
+            exc_items = "\n".join(f"      - {_yaml_scalar(v)}" for v in flat_exc)
             exc_lines = f"  filter_verified:\n    raw|contains:\n{exc_items}\n"
             cond = "selection_keywords and not filter_verified"
         else:
@@ -34,29 +65,36 @@ def _build_sigma_yaml(spec: SigmaRuleSpec) -> str:
     category = spec.logsource.get("category", "application")
     product = spec.logsource.get("product", "noemetra")
     return (
-        f"title: {spec.title}\n"
-        f"id: {spec.id}\n"
-        f"status: {spec.status}\n"
-        f"description: {spec.description}\n"
+        f"title: {_yaml_scalar(spec.title)}\n"
+        f"id: {_yaml_scalar(spec.id)}\n"
+        f"status: {_yaml_scalar(spec.status)}\n"
+        f"description: {_yaml_scalar(spec.description)}\n"
         f"logsource:\n"
-        f"  category: {category}\n"
-        f"  product: {product}\n"
+        f"  category: {_yaml_scalar(category)}\n"
+        f"  product: {_yaml_scalar(product)}\n"
         f"detection:\n"
         f"  selection_keywords:\n"
         f"    raw|contains:\n"
         f"{kw_lines}\n"
         f"{exc_lines}"
         f"  condition: {cond}\n"
-        f"level: {spec.level}\n"
+        f"level: {_yaml_scalar(spec.level)}\n"
     )
 
 
 def _build_yara_text(rule: YaraRuleSpec) -> str:
-    str_defs = "\n".join(f'        $s{i} = "{s}" nocase' for i, s in enumerate(rule.strings, start=1))
+    safe_strings = rule.strings or ["suspicious"]
+    str_defs = "\n".join(
+        f'        $s{i} = "{_yara_escape(s)}" nocase'
+        for i, s in enumerate(safe_strings, start=1)
+    )
+    safe_name = re.sub(r"[^A-Za-z0-9_]", "_", str(rule.rule_name or "Custom_Rule"))
+    if safe_name and safe_name[0].isdigit():
+        safe_name = f"Rule_{safe_name}"
     return (
-        f"rule {rule.rule_name} {{\n"
+        f"rule {safe_name} {{\n"
         f"    meta:\n"
-        f'        description = "{rule.description}"\n'
+        f'        description = "{_yara_escape(rule.description)}"\n'
         f"    strings:\n"
         f"{str_defs}\n"
         f"    condition:\n"
@@ -244,7 +282,17 @@ def _synthesize_deterministic_blue_report(
         )
 
     # Case D: Confirmed Exploitable Code Chain (SQLi + SSRF + Privileged Container)
-    if _has_any(all_raw, ("sql_concat", "requests.get", "169.254.169.254", "privileged: true", "select ")):
+    has_sql_chain = any(
+        "sql_concat" in e.entities.get("sinks", []) or "union select" in e.raw_content.lower()
+        for e in evs
+        if not e.is_benign_baseline
+    )
+    has_ssrf_chain = any(
+        "ssrf_fetch" in e.entities.get("sinks", []) or "169.254.169.254" in e.raw_content
+        for e in evs
+        if not e.is_benign_baseline
+    )
+    if (has_sql_chain and has_ssrf_chain) or "169.254.169.254" in all_raw:
         c1 = _find_evs("select ", "requests.get", "169.254.169.254", "privileged: true")
         contradictions.append(ContradictionItem(
             claim_challenged="Whether internal allowlists mitigate `/api/v1/export` exposure",

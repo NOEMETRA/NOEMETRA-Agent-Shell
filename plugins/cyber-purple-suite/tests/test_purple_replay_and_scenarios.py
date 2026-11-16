@@ -1,5 +1,9 @@
 """End-to-end tests across all 6 dialectical scenarios, Purple Replay, and Benchmark."""
 
+import re
+
+import yaml
+
 from hermes_cyber.models import VerdictType
 from hermes_cyber.pipeline import CyberPurpleAssistant
 from hermes_cyber.scenarios import _SCENARIOS
@@ -92,5 +96,45 @@ def test_generic_sink_with_benign_prefix_generates_literal_rules_and_full_replay
         assert expected_sub in kws
         assert all(s != "cmd_exec" for s in report.blue_report.yara_rule.strings)
         assert report.verdict.replay.detection_coverage == 1.0
+
+
+def test_quoted_and_backslash_sql_literals_produce_valid_sigma_yaml_and_yara(tmp_path):
+    assistant = CyberPurpleAssistant(home_dir=tmp_path, allow_remote=False, use_llm=False)
+
+    samples = [
+        'query = "INSERT INTO users VALUES (\'" + user_input + "\')"',
+        'application started\nquery = "INSERT INTO users VALUES (\'\\\\admin\\\\" + user_input + "\')"',
+    ]
+    for idx, content in enumerate(samples):
+        report = assistant.analyze_custom(
+            title=f'SQL: "Quotes" & Backslashes #{idx}',
+            content=content,
+            source_kind="code",
+        )
+        parsed_sigma = yaml.safe_load(report.blue_report.sigma_rule.yaml_text)
+        assert isinstance(parsed_sigma, dict)
+        assert (
+            parsed_sigma["detection"]["selection_keywords"]["raw|contains"]
+            == report.blue_report.sigma_rule.detection_keywords
+        )
+        assert report.verdict.replay.detection_coverage == 1.0
+
+        raw_yara = report.blue_report.yara_rule.raw_rule
+        yara_str_lines = [ln.strip() for ln in raw_yara.splitlines() if ln.strip().startswith("$s")]
+        assert len(yara_str_lines) == len(report.blue_report.yara_rule.strings)
+        for line in yara_str_lines:
+            assert re.match(
+                r'^\$s\d+\s*=\s*"(?:[^"\\]|\\.)*"\s+nocase$', line
+            ), f"Invalid YARA literal line: {line}"
+
+        # Also verify rerun_replay preserves valid YAML even with control characters / mixed quotes
+        assistant.rerun_replay(
+            case_id=report.case_id,
+            detection_keywords=[*report.blue_report.sigma_rule.detection_keywords, "line1\n'\"\\line2"],
+        )
+        tuned = assistant.get_case(report.case_id)
+        parsed_tuned = yaml.safe_load(tuned.blue_report.sigma_rule.yaml_text)
+        assert "line1\n'\"\\line2" in parsed_tuned["detection"]["selection_keywords"]["raw|contains"]
+
 
 

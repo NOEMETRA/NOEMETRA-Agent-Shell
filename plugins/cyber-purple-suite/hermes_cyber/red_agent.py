@@ -44,11 +44,26 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         return matched
 
     # Track 1: Code / IaC SQLi -> SSRF -> IMDS -> Container Escape chain
-    sql_evs = _evs_matching(lambda e: "sql_concat" in e.entities.get("sinks", []) or "select " in e.raw_content.lower())
-    ssrf_evs = _evs_matching(lambda e: "ssrf_fetch" in e.entities.get("sinks", []) or "169.254.169.254" in e.raw_content)
-    priv_evs = _evs_matching(lambda e: "container_priv" in e.entities.get("sinks", []) or "privileged: true" in e.raw_content.lower())
+    sql_evs = [
+        e.evidence_id
+        for e in threat_evs
+        if "sql_concat" in e.entities.get("sinks", []) or "union select" in e.raw_content.lower()
+    ]
+    ssrf_evs = [
+        e.evidence_id
+        for e in threat_evs
+        if "ssrf_fetch" in e.entities.get("sinks", []) or "169.254.169.254" in e.raw_content
+    ]
+    priv_evs = [
+        e.evidence_id
+        for e in threat_evs
+        if "container_priv" in e.entities.get("sinks", []) or "privileged: true" in e.raw_content.lower()
+    ]
 
-    if sql_evs or ssrf_evs:
+    if (sql_evs and ssrf_evs) or "169.254.169.254" in all_raw:
+        for eid in [*sql_evs, *ssrf_evs, *priv_evs]:
+            if eid not in cited:
+                cited.append(eid)
         ep = next((ep for ev in threat_evs for ep in ev.entities.get("endpoints", [])), "/api/v1/export")
         if sql_evs:
             kill_chain.append(MitreStep(
@@ -110,11 +125,16 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         )
 
     # Track 2: Token Leak + Encoded PowerShell + DNS Exfiltration (or Deserialization / Shell Spawn)
-    dns_evs = _evs_matching(lambda e: _has_any(e.raw_content, ("qtype=txt", "dns_src=", "exfil", "c2-sync")))
-    exec_evs = _evs_matching(lambda e: _has_any(e.raw_content, ("powershell", "sh -c", "pickle.loads", "curl ", "vssadmin")))
-    token_evs = _evs_matching(lambda e: _has_any(e.raw_content, ("token_leak", "bearer ", "eyj")))
+    dns_evs = [e.evidence_id for e in threat_evs if _has_any(e.raw_content, ("qtype=txt", "c2-sync"))]
+    exec_evs = [
+        e.evidence_id
+        for e in threat_evs
+        if _has_any(e.raw_content, ("powershell", "sh -c", "pickle.loads", "curl ", "vssadmin"))
+    ]
+    token_evs = [e.evidence_id for e in threat_evs if _has_any(e.raw_content, ("token_leak",))]
 
-    if token_evs or dns_evs:
+    if dns_evs or token_evs:
+        cited = list(dict.fromkeys([*token_evs, *exec_evs, *dns_evs]))
         if token_evs:
             kill_chain.append(MitreStep(
                 tactic="Credential Access",
