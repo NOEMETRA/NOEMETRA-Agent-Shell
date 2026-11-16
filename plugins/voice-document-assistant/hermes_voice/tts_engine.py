@@ -1062,7 +1062,6 @@ class PocketTTSEngine:
         auto_switch_english: bool = True,
     ):
         self.language = language
-        self.voice = voice
         self._explicit_voice = voice != "giovanni"
         self.quantize = quantize
         self._lazy_load = lazy_load
@@ -1075,6 +1074,7 @@ class PocketTTSEngine:
         self._voice_state = None
         self._sample_rate: int = 24000
         self._model_pool: Dict[Tuple[str, str], Tuple[object, object, int]] = {}
+        self.voice = voice if self._explicit_voice else self._primary_model_spec(language)[1]
 
         if not lazy_load:
             with self._lock:
@@ -1092,10 +1092,13 @@ class PocketTTSEngine:
         else:
             base_lang = mode
 
-        if base_lang == "english":
-            target_voice = self.voice if (self._explicit_voice and self.voice != "giovanni") else _DEFAULT_VOICE_FOR_MODEL["english"]
+        if getattr(self, "_explicit_voice", False):
+            if base_lang == "english" and self.voice == "giovanni":
+                target_voice = _DEFAULT_VOICE_FOR_MODEL["english"]
+            else:
+                target_voice = self.voice or _DEFAULT_VOICE_FOR_MODEL.get(base_lang, "giovanni")
         else:
-            target_voice = self.voice or _DEFAULT_VOICE_FOR_MODEL.get(base_lang, "giovanni")
+            target_voice = _DEFAULT_VOICE_FOR_MODEL.get(base_lang, "giovanni")
         return base_lang, target_voice
 
     def set_model(self, language: str) -> None:
@@ -1213,6 +1216,7 @@ class PocketTTSEngine:
                 data = data[:, 0]
             return data, sr
 
+        used_fallback = False
         with self._lock:
             if is_primary:
                 self._ensure_loaded()
@@ -1231,6 +1235,7 @@ class PocketTTSEngine:
                     )
                     self._ensure_loaded()
                     model, voice_state, sr = self._model, self._voice_state, self.sample_rate
+                    used_fallback = True
 
             import torch
 
@@ -1247,7 +1252,7 @@ class PocketTTSEngine:
 
         audio_np = audio_np.squeeze().astype(np.float32)
 
-        if use_cache:
+        if use_cache and not used_fallback:
             try:
                 ensure_voice_dir(self.cache_dir)
                 sf.write(str(cache_file), audio_np, sr)

@@ -577,11 +577,26 @@ def test_tts_engine_routes_english_and_bilingual_with_offline_fallback(monkeypat
         assert "November sixteenth, twenty twenty-six" in calls[1][2]
 
         # 3. Default 'italian' mode also switches to 'english' on English text, falling back safely if 'english' fails offline
+        #    AND must NOT poison the English cache key when fallback occurs; later switching to 'english' & back restores default voices.
         calls.clear()
         fail_english_load["enabled"] = True
         fb_eng = PocketTTSEngine(language="italian", cache_dir=Path(tmpdir) / "c3", lazy_load=True)
-        fb_audio, _ = fb_eng.synthesize("The contract expires on November 16, 2026.", use_cache=False)
+        fb_audio, _ = fb_eng.synthesize("Hello and welcome to the system.", use_cache=True)
         assert len(fb_audio) == 1200
+        assert calls[-1][0] == "italian" and calls[-1][1] == "giovanni"
+
+        # Connectivity returns -> explicit english mode must invoke real english/alba (no poisoned cache hit!)
+        fail_english_load["enabled"] = False
+        fb_eng.set_model("english")
+        assert fb_eng.voice == "alba"
+        en_after, _ = fb_eng.synthesize("Hello and welcome to the system.", use_cache=True)
+        assert len(en_after) == 1200
+        assert calls[-1][0] == "english" and calls[-1][1] == "alba"
+
+        # Switching back to italian restores default voice 'giovanni' (not 'alba') and reuses cached model
+        fb_eng.set_model("italian")
+        assert fb_eng.voice == "giovanni"
+        fb_eng.synthesize("Frase italiana di verifica.", use_cache=False)
         assert calls[-1][0] == "italian" and calls[-1][1] == "giovanni"
 
 
