@@ -1,0 +1,14 @@
+name: cyber-purple-suite
+version: 1.0.0
+description: "Suite Purple Team multi-agente avversaria: kill-chain Red Team, investigazione forense delle contraddizioni, Sigma/YARA Replay e benchmark comparativo."
+author: "NOEMETRA Security Team"
+entry_point: "hermes_plugin.cyber_plugin:register"
+tools:
+  - cyber_analyze_scenario
+  - cyber_analyze_artifact
+  - cyber_run_purple_benchmark
+  - cyber_get_status
+dashboard:
+  manifest: "dashboard/manifest.json"
+desktop:
+  entry: "desktop/plugin.js"

@@ -1,0 +1,11 @@
+{
+  "name": "cyber-purple-suite",
+  "label": "NOEMETRA Cyber",
+  "description": "Suite Purple Team multi-agente: kill-chain Red Team, investigazione forense delle contraddizioni, Sigma/YARA Replay e Arena multi-modello.",
+  "version": "1.0.0",
+  "api": "plugin_api.py",
+  "tab": {
+    "path": "/cyber-purple",
+    "position": "after:skills"
+  }
+}

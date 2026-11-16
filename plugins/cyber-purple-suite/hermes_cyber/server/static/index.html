@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NOEMETRA Cyber Purple Suite</title>
+  <style>
+    :root {
+      --bg: #070b12; --card: #0e1624; --border: rgba(148, 163, 184, 0.18);
+      --fg: #f1f5f9; --muted: #94a3b8;
+      --red: #f43f5e; --blue: #38bdf8; --purple: #a855f7; --green: #10b981; --amber: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, Segoe UI, sans-serif; background: var(--bg); color: var(--fg); }
+    header { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); background: #0a101b; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    select, input, textarea, button { background: #0c1422; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 13px; }
+    button { cursor: pointer; font-weight: 600; }
+    button.primary { background: linear-gradient(135deg, #be123c, #7e22ce); border-color: rgba(168, 85, 247, 0.5); }
+    .grid { display: grid; grid-template-columns: 360px 1fr; gap: 14px; padding: 16px; min-height: calc(100vh - 64px); }
+    .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; overflow: auto; }
+    .ev-item { font-family: ui-monospace, Consolas, monospace; font-size: 12px; padding: 8px; border-radius: 8px; border: 1px solid transparent; margin-bottom: 6px; background: rgba(15, 23, 42, 0.7); }
+    .ev-item.active { border-color: var(--purple); background: rgba(168, 85, 247, 0.14); }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; margin-right: 4px; }
+    .b-red { background: rgba(244, 63, 94, 0.16); color: #fda4af; }
+    .b-blue { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; }
+    .b-purple { background: rgba(168, 85, 247, 0.2); color: #d8b4fe; }
+    .b-green { background: rgba(16, 185, 129, 0.16); color: #6ee7b7; }
+    .b-amber { background: rgba(245, 158, 11, 0.18); color: #fcd34d; }
+    pre { background: #050911; padding: 10px; border-radius: 8px; overflow-x: auto; font-size: 12px; border: 1px solid var(--border); }
+    @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <strong style="font-size:15px;">NOEMETRA Cyber Purple Suite</strong>
+      <span id="privacyBadge" class="badge b-green">Solo Locale + Scrubber</span>
+    </div>
+    <div class="row">
+      <label class="row"><input type="checkbox" id="allowRemoteChk"> Consenti Cloud (PII/IP Scrubbing)</label>
+      <label class="row"><input type="checkbox" id="useLlmChk"> Arricchimento LLM</label>
+      <select id="redProv"></select><select id="redModel"></select>
+      <select id="blueProv"></select><select id="blueModel"></select>
+      <button class="primary" onclick="runBenchmark()">Benchmark Single vs Purple</button>
+    </div>
+  </header>
+  <div class="grid">
+    <div class="panel">
+      <h3 style="margin-top:0;">Scenari & Artefatti</h3>
+      <div class="row" style="margin-bottom:8px;">
+        <select id="scenarioSelect" style="flex:1;"></select>
+        <button class="primary" onclick="analyzeSelectedScenario()">Analizza</button>
+      </div>
+      <details>
+        <summary style="cursor:pointer;color:var(--muted);margin-bottom:8px;">Analisi Artefatto Custom (Log / Codice / YAML)</summary>
+        <input id="customTitle" placeholder="Titolo caso" style="width:100%;margin-bottom:6px;">
+        <textarea id="customContent" rows="5" placeholder="Incolla log JSONL/Syslog, HTTP trace, codice Python o YAML IaC..." style="width:100%;margin-bottom:6px;"></textarea>
+        <button onclick="analyzeCustom()" style="width:100%;">Avvia Audit Purple</button>
+      </details>
+      <h4>Evidenze Verbatim (<span id="evCount">0</span>)</h4>
+      <div id="evList"></div>
+    </div>
+    <div class="panel" id="reportPanel">
+      <p style="color:var(--muted);">Seleziona uno scenario o incolla un artefatto per avviare lo scontro Red Operator vs Blue Critic e il Purple Replay.</p>
+    </div>
+  </div>
+  <script>
+    const API = '/api/plugins/cyber-purple-suite';
+    let currentReport = null;
+    async function apiFetch(path, opts) {
+      const res = await fetch(API + path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+    function populateModelSelects(modelsInfo) {
+      const allowRemote = Boolean(modelsInfo.allow_remote);
+      document.getElementById('allowRemoteChk').checked = allowRemote;
+      document.getElementById('privacyBadge').textContent = allowRemote ? 'Cloud + Scrubber IP/Secret' : 'Solo Locale (Air-Gapped)';
+      document.getElementById('privacyBadge').className = 'badge ' + (allowRemote ? 'b-amber' : 'b-green');
+      const opts = [['ollama', modelsInfo.ollama?.models || ['gemma4:12b']]];
+      Object.entries(modelsInfo.local_runtimes || {}).forEach(([k, v]) => opts.push([k, v.models || []]));
+      if (allowRemote) {
+        if (modelsInfo.codex_oauth?.configured) opts.push(['openai-codex', modelsInfo.codex_oauth.models || []]);
+        if (modelsInfo.cloud_providers?.openrouter?.free_models?.length) opts.push(['openrouter', modelsInfo.cloud_providers.openrouter.free_models]);
+        if (modelsInfo.cloud_providers?.ollama_cloud?.models?.length) opts.push(['ollama-cloud', modelsInfo.cloud_providers.ollama_cloud.models]);
+        if (modelsInfo.cloud_providers?.opencode_free?.models?.length) opts.push(['opencode-free', modelsInfo.cloud_providers.opencode_free.models]);
+      }
+      [['redProv', 'redModel', modelsInfo.red_provider, modelsInfo.red_model], ['blueProv', 'blueModel', modelsInfo.blue_provider, modelsInfo.blue_model]].forEach(([pId, mId, curP, curM]) => {
+        const pSel = document.getElementById(pId);
+        const mSel = document.getElementById(mId);
+        pSel.innerHTML = opts.map(([p]) => `<option value="${p}">${p}</option>`).join('');
+        pSel.value = opts.some(([p]) => p === curP) ? curP : 'ollama';
+        const mList = (opts.find(([p]) => p === pSel.value) || ['', ['gemma4:12b']])[1];
+        mSel.innerHTML = (mList.length ? mList : [curM || 'gemma4:12b']).map(m => `<option value="${m}">${m}</option>`).join('');
+        if (curM) mSel.value = curM;
+      });
+    }
+    async function saveConfig() {
+      await apiFetch('/config', {
+        method: 'POST',
+        body: JSON.stringify({
+          allow_remote: document.getElementById('allowRemoteChk').checked,
+          use_llm: document.getElementById('useLlmChk').checked,
+          red_provider: document.getElementById('redProv').value,
+          red_model: document.getElementById('redModel').value,
+          blue_provider: document.getElementById('blueProv').value,
+          blue_model: document.getElementById('blueModel').value,
+        })
+      });
+      populateModelSelects(await apiFetch('/models'));
+    }
+    ['allowRemoteChk', 'useLlmChk', 'redProv', 'redModel', 'blueProv', 'blueModel'].forEach(id => {
+      document.getElementById(id).addEventListener('change', saveConfig);
+    });
+    function highlightEvidence(eid) {
+      document.querySelectorAll('.ev-item').forEach(el => el.classList.remove('active'));
+      const target = document.getElementById('ev-' + eid);
+      if (target) { target.classList.add('active'); target.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+    }
+    function renderReport(r) {
+      currentReport = r;
+      document.getElementById('evCount').textContent = String(r.ingestion.evidences.length);
+      document.getElementById('evList').innerHTML = r.ingestion.evidences.map(ev =>
+        `<div class="ev-item" id="ev-${ev.evidence_id}"><div><span class="badge b-purple">${ev.evidence_id}</span><span class="badge">${ev.source_type}</span></div><div>${ev.raw_content.replace(/</g,'&lt;')}</div></div>`
+      ).join('');
+      const v = r.verdict;
+      const citeBtn = eid => `<button type="button" class="badge b-purple" onclick="highlightEvidence('${eid}')">${eid}</button>`;
+      document.getElementById('reportPanel').innerHTML = `
+        <div style="border-left:4px solid var(--purple);padding-left:12px;margin-bottom:14px;">
+          <span class="badge b-purple">${v.verdict}</span>
+          <span class="badge b-green">Confidence: ${Math.round(v.confidence_score * 100)}%</span>
+          <span class="badge b-blue">Replay Coverage: ${Math.round(v.replay.detection_coverage * 100)}%</span>
+          <span class="badge b-green">Baseline FPR: ${Math.round(v.replay.false_positive_rate * 100)}%</span>
+          <h3 style="margin:6px 0;">${v.winning_hypothesis}</h3>
+          <p style="color:var(--muted);margin:4px 0;">${v.rationale}</p>
+          <p><strong>Test Discriminante:</strong> <code>${v.discriminating_test}</code></p>
+        </div>
+        <h4 style="color:var(--red);">Red Operator — Kill-Chain & Audit Probes</h4>
+        ${r.red_report.kill_chain.map(k => `<p><span class="badge b-red">${k.technique_id}</span> <strong>${k.tactic}:</strong> ${k.technique_name} — ${k.reachability_proof} ${k.evidence_ids.map(citeBtn).join('')}</p>`).join('')}
+        ${r.red_report.probes.map(p => `<pre>${p.probe_id} [${p.safety_level}] ${p.title}\nPayload: ${p.payload_or_command}\nIOC attesa: ${p.expected_ioc}</pre>`).join('')}
+        <h4 style="color:var(--blue);">Blue Investigator & Critic — Contraddizioni, Sigma, YARA, Patch</h4>
+        ${r.blue_report.contradictions.map(c => `<p><span class="badge b-blue">${c.impact_on_hypothesis}</span> ${c.explanation} ${c.contradicting_evidence_ids.map(citeBtn).join('')}</p>`).join('')}
+        <pre>${r.blue_report.sigma_rule.yaml_text.replace(/</g,'&lt;')}</pre>
+        <pre>${r.blue_report.remediation_patch.replace(/</g,'&lt;')}</pre>
+      `;
+    }
+    async function analyzeSelectedScenario() {
+      renderReport(await apiFetch('/analyze/scenario', { method: 'POST', body: JSON.stringify({ scenario_id: document.getElementById('scenarioSelect').value }) }));
+    }
+    async function analyzeCustom() {
+      renderReport(await apiFetch('/analyze/custom', { method: 'POST', body: JSON.stringify({ title: document.getElementById('customTitle').value || 'Custom Artifact', content: document.getElementById('customContent').value }) }));
+    }
+    async function runBenchmark() {
+      const b = await apiFetch('/benchmark', { method: 'POST' });
+      document.getElementById('reportPanel').innerHTML = `<h3>Benchmark Comparativo (${b.total_scenarios} Scenari)</h3>
+        <p><span class="badge b-red">Single-Agent Accuracy: ${Math.round(b.single_agent_accuracy*100)}% (FPR ${Math.round(b.single_agent_fpr*100)}%)</span>
+        <span class="badge b-green">Purple Multi-Agent Accuracy: ${Math.round(b.purple_multi_agent_accuracy*100)}% (FPR ${Math.round(b.purple_fpr*100)}%)</span>
+        <span class="badge b-purple">Astensione Ambigui: ${Math.round(b.abstention_accuracy*100)}%</span></p>
+        ${b.results.map(x => `<p><strong>${x.title}</strong>: Atteso=<code>${x.expected_verdict}</code> | Single=<code>${x.single_agent_verdict}</code> | Purple=<code>${x.purple_multi_agent_verdict}</code></p>`).join('')}`;
+    }
+    (async () => {
+      const [{ scenarios }, models, status] = await Promise.all([apiFetch('/scenarios'), apiFetch('/models'), apiFetch('/status')]);
+      document.getElementById('scenarioSelect').innerHTML = scenarios.map(s => `<option value="${s.scenario_id}">${s.title} [${s.expected_verdict}]</option>`).join('');
+      populateModelSelects(models);
+      document.getElementById('useLlmChk').checked = Boolean(status.use_llm);
+      if (status.active_case) renderReport(status.active_case);
+    })();
+  </script>
+</body>
+</html>
