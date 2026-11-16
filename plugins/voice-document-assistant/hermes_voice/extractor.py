@@ -19,12 +19,16 @@ from hermes_voice.models import DocumentPage, ExtractedDocument, SentenceSpan
 
 logger = logging.getLogger(__name__)
 
-# Common Italian and technical abbreviations that should not trigger sentence boundary splits
+# Common Italian, English, month, and technical abbreviations that should not trigger sentence boundary splits
 ITALIAN_ABBREVIATIONS = {
     "dott", "dott.ssa", "prof", "prof.ssa", "avv", "ing", "sig", "sig.ra",
-    "dr", "art", "artt", "p", "pp", "pag", "pagg", "es", "ecc", "vol", "cap",
-    "n", "sez", "all", "rif", "lett", "comma", "c.d", "c.p", "c.c", "v",
-    "par", "fig", "tab", "cod", "rev", "ver", "vs", "s.p.a", "s.r.l",
+    "mr", "mrs", "ms", "dr", "art", "artt", "p", "pp", "pag", "pagg",
+    "es", "ecc", "etc", "vol", "cap", "n", "no", "sez", "all", "rif", "lett",
+    "comma", "c.d", "c.p", "c.c", "v", "par", "fig", "tab", "cod", "rev", "ver",
+    "vs", "s.p.a", "s.r.l", "inc", "ltd", "scad", "prot",
+    # Abbreviated Italian & English months (e.g. "16 nov. 2026", "Nov. 16, 2026")
+    "gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "sett", "ott", "nov", "dic",
+    "jan", "aug", "sep", "sept", "oct", "dec",
 }
 
 _LIST_OR_SECTION_PREFIX_RE = re.compile(

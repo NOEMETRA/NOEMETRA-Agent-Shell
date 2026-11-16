@@ -152,7 +152,7 @@ def main() -> None:
 
     # Command: benchmark
     bench_parser = subparsers.add_parser("benchmark", help="Esegue benchmark di Pocket TTS e Ollama")
-    bench_parser.add_argument("--language", default="italian", choices=["italian", "italian_24l"])
+    bench_parser.add_argument("--language", default="italian", choices=["italian", "italian_24l", "english", "auto", "auto_24l"])
 
     args = parser.parse_args()
 

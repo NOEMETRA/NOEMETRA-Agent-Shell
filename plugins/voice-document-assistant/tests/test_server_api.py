@@ -89,6 +89,14 @@ def test_api_playback_config():
     assert data["speed"] == 1.25
     assert data["allow_remote"] is False
 
+    for mode in ("english", "auto", "italian"):
+        res_mode = client.post(
+            "/api/plugins/voice-document-assistant/playback/config",
+            json={"tts_model": mode},
+        )
+        assert res_mode.status_code == 200
+        assert res_mode.json()["tts_model"] == mode
+
 
 def test_api_ask_question(monkeypatch):
     assistant = get_assistant()

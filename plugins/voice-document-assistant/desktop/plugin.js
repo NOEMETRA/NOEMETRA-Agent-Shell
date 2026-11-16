@@ -2983,8 +2983,10 @@ function VoiceDocumentPage({ ctx, controller }) {
                 value: status?.tts_model || 'italian',
                 onChange: handleModelChange,
                 children: [
-                  jsx('option', { value: 'italian', children: 'Pocket TTS: italian (Fast 2.6x)' }),
-                  jsx('option', { value: 'italian_24l', children: 'Pocket TTS: italian_24l (Hi-Fi 24L)' })
+                  jsx('option', { value: 'italian', children: 'Pocket TTS: Italiano (Fast 2.6x)' }),
+                  jsx('option', { value: 'italian_24l', children: 'Pocket TTS: Italiano Hi-Fi (24L)' }),
+                  jsx('option', { value: 'auto', children: 'Pocket TTS: Auto (IT + EN)' }),
+                  jsx('option', { value: 'english', children: 'Pocket TTS: English (Alba)' })
                 ]
               }),
               // Speed selector

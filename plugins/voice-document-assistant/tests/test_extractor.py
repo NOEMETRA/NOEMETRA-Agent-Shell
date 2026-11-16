@@ -152,3 +152,15 @@ def test_extractor_tags_repeated_headers_and_footers_verbatim():
             ("9 novembre 2026 - Documento | Pagina 2", True),
         ]
 
+
+def test_extractor_preserves_abbreviated_month_dates():
+    extractor = DocumentExtractor()
+    assert extractor._split_into_sentences("Data: 16 nov. 2026 - Oggetto del contratto.") == [
+        "Data: 16 nov. 2026 - Oggetto del contratto.",
+    ]
+    assert extractor._split_into_sentences("Signed on Nov. 16, 2026. Effective immediately.") == [
+        "Signed on Nov. 16, 2026.",
+        "Effective immediately.",
+    ]
+
+

@@ -497,6 +497,95 @@ def test_player_skips_headers_and_footers_when_enabled(tmp_path):
     assert bm_p2_raw.current_sentence_index == 3
 
 
+def test_normalize_text_for_tts_extended_dates_and_english():
+    from hermes_voice.tts_engine import detect_speech_language, normalize_text_for_tts
+
+    # Italian ordinal dates, abbreviated months, start-of-line dot dates, US unambiguous, ranges, ISO timestamps
+    assert normalize_text_for_tts("1° gennaio 2026") == "primo gennaio duemilaventisei"
+    assert normalize_text_for_tts("1º febbraio 2025") == "primo febbraio duemilaventicinque"
+    assert normalize_text_for_tts("16 nov. 2026") == "sedici novembre duemilaventisei"
+    assert normalize_text_for_tts("13.11.2026 - Verbale") == "tredici novembre duemilaventisei, Verbale"
+    assert normalize_text_for_tts("11/16/2026") == "sedici novembre duemilaventisei"
+    assert normalize_text_for_tts("Data 3/2026") == "Data marzo duemilaventisei"
+    assert normalize_text_for_tts("12-15/11/2026") == "dal dodici al quindici novembre duemilaventisei"
+    assert normalize_text_for_tts("2026-11-16T22:43:36Z") == "sedici novembre duemilaventisei, ore ventidue e quarantatré"
+    # Guard against false-positive month abbreviations in English phrases
+    assert "september" not in normalize_text_for_tts("1 set of 5 may help").lower()
+    assert "settembre" not in normalize_text_for_tts("1 set of 5 may help").lower()
+
+    # English language detection and English-native normalization (dates, versions, %, /, operators)
+    en_sample = "The contract was signed on 11/16/2026 (version v2.6, 50% discount)."
+    assert detect_speech_language(en_sample) == "en"
+    assert normalize_text_for_tts(en_sample) == (
+        "The contract was signed on November sixteenth, twenty twenty-six version two point six, fifty percent discount."
+    )
+    assert normalize_text_for_tts("16th November 2026", language="en") == "November sixteenth, twenty twenty-six"
+    assert normalize_text_for_tts("Client/Server 25°C", language="en") == "Client slash Server twenty-five degrees Celsius"
+
+
+def test_tts_engine_routes_english_and_bilingual_with_offline_fallback(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from hermes_voice.tts_engine import PocketTTSEngine
+
+    calls = []
+    fail_english_load = {"enabled": False}
+
+    class FakeLangModel:
+        def __init__(self, lang: str):
+            self.lang = lang
+            self.config = SimpleNamespace(mimi=SimpleNamespace(sample_rate=24000))
+
+        def to(self, device: str):
+            return self
+
+        def get_state_for_audio_prompt(self, voice: str):
+            return {"lang": self.lang, "voice": voice}
+
+        def generate_audio(self, model_state, text_to_generate: str, copy_state: bool = True):
+            calls.append((self.lang, model_state["voice"], text_to_generate))
+            return np.ones(1200, dtype=np.float32) * 0.2
+
+    class FakeFactory:
+        @staticmethod
+        def load_model(language: str, quantize: bool = False):
+            if language == "english" and fail_english_load["enabled"]:
+                raise ConnectionError("Offline HF hub for english")
+            return FakeLangModel(language)
+
+    monkeypatch.setitem(sys.modules, "pocket_tts", SimpleNamespace(TTSModel=FakeFactory))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Explicit 'english' mode uses 'english' model + default voice 'alba' (not 'giovanni')
+        eng = PocketTTSEngine(language="english", cache_dir=Path(tmpdir) / "c1", lazy_load=True)
+        audio_en, sr = eng.synthesize("Signed on 11/16/2026 with 50% discount.", use_cache=False)
+        assert sr == 24000 and len(audio_en) == 1200
+        assert calls[-1][0] == "english"
+        assert calls[-1][1] == "alba"
+        assert "November sixteenth, twenty twenty-six" in calls[-1][2]
+        assert "fifty percent" in calls[-1][2]
+
+        # 2. Auto/bilingual mode routes Italian clause -> ('italian', 'giovanni') and English clause -> ('english', 'alba')
+        calls.clear()
+        auto_eng = PocketTTSEngine(language="auto", cache_dir=Path(tmpdir) / "c2", lazy_load=True)
+        bilingual = "Questo documento è valido dal 16/11/2026. The contract was signed on 11/16/2026."
+        mixed_audio, _ = auto_eng.synthesize(bilingual, use_cache=False)
+        assert len(mixed_audio) > 2400  # 2 segments + 60ms pause
+        assert calls[0][0] == "italian" and calls[0][1] == "giovanni"
+        assert "sedici novembre duemilaventisei" in calls[0][2]
+        assert calls[1][0] == "english" and calls[1][1] == "alba"
+        assert "November sixteenth, twenty twenty-six" in calls[1][2]
+
+        # 3. Default 'italian' mode also switches to 'english' on English text, falling back safely if 'english' fails offline
+        calls.clear()
+        fail_english_load["enabled"] = True
+        fb_eng = PocketTTSEngine(language="italian", cache_dir=Path(tmpdir) / "c3", lazy_load=True)
+        fb_audio, _ = fb_eng.synthesize("The contract expires on November 16, 2026.", use_cache=False)
+        assert len(fb_audio) == 1200
+        assert calls[-1][0] == "italian" and calls[-1][1] == "giovanni"
+
+
+
 
 
 

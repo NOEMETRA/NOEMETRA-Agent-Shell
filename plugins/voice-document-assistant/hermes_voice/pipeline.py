@@ -272,7 +272,7 @@ class HermesVoiceAssistant:
         return self.player.seek_to_sentence(sentence_index)
 
     def set_tts_model(self, model_name: str) -> None:
-        """Switch Pocket TTS model ('italian' or 'italian_24l') safely."""
+        """Switch Pocket TTS model ('italian', 'italian_24l', 'english', 'auto', 'auto_24l') safely."""
         was_playing = (self.player.state == PlayerState.PLAYING)
         if was_playing:
             self.player.pause()

@@ -137,7 +137,7 @@ class PlayerStatusResponse(BaseModel):
     total_sentences: int = 0
     current_sentence_text: str = ""
     audio_seconds_offset: float = 0.0
-    tts_model: str = "italian"  # "italian" | "italian_24l"
+    tts_model: str = "italian"  # "italian" | "italian_24l" | "english" | "auto" | "auto_24l"
     speed: float = 1.0
     skip_headers_footers: bool = True
     llm_model: str = "gemma4:12b"
