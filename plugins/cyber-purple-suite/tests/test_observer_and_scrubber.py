@@ -49,3 +49,36 @@ def test_cyber_observer_ingests_mixed_code_iac_and_baseline_verbatim():
     assert "container_priv" in result.evidences[2].entities["sinks"]
     assert result.evidences[3].is_benign_baseline is True
     assert result.summary_stats["benign_baseline_records"] == 1
+
+
+def test_privacy_scrubber_redacts_json_quoted_secrets_and_tokens():
+    scrubber = PrivacyScrubber()
+    raw_json = '{"password": "my-super-secret", "token": "opaque-value-123", "ip": "10.24.0.8"}'
+    scrubbed, stats = scrubber.scrub(raw_json)
+    assert "my-super-secret" not in scrubbed
+    assert "opaque-value-123" not in scrubbed
+    assert "10.24.0.8" not in scrubbed
+    assert stats["secrets"] == 2
+    assert stats["private_ips"] == 1
+    assert scrubber.unscrub(scrubbed) == raw_json
+
+
+def test_bundled_plugins_namespace_coexistence():
+    import importlib.util
+    from pathlib import Path
+
+    plugins_root = Path(__file__).resolve().parents[2]
+    voice_init = plugins_root / "voice-document-assistant" / "__init__.py"
+    cyber_init = plugins_root / "cyber-purple-suite" / "__init__.py"
+
+    spec_c = importlib.util.spec_from_file_location("test_cyber_pkg", cyber_init)
+    mod_c = importlib.util.module_from_spec(spec_c)
+    spec_c.loader.exec_module(mod_c)
+
+    spec_v = importlib.util.spec_from_file_location("test_voice_pkg", voice_init)
+    mod_v = importlib.util.module_from_spec(spec_v)
+    spec_v.loader.exec_module(mod_v)
+
+    assert hasattr(mod_c, "cyber_analyze_scenario")
+    assert hasattr(mod_v, "voice_load_document")
+

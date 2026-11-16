@@ -59,3 +59,19 @@ def test_interactive_replay_tuning_detects_missed_evasion_when_weakened(tmp_path
     assert tuned_replay.detection_coverage == 1.0
     assert tuned_replay.evasion_caught_rate == 1.0
     assert tuned_replay.false_positive_rate == 0.0
+
+    # Verify tuned Sigma configuration & YAML are persisted onto the saved case
+    reloaded = CyberPurpleAssistant(home_dir=tmp_path, allow_remote=False, use_llm=False).get_case(report.case_id)
+    assert reloaded.blue_report.sigma_rule.detection_keywords == ["169.254.169.254", "0251.0376.0251.0376"]
+    assert "0251.0376.0251.0376" in reloaded.blue_report.sigma_rule.yaml_text
+    assert reloaded.verdict.replay.detection_coverage == 1.0
+
+
+def test_benign_or_neutral_custom_telemetry_abstains_without_fake_attack(tmp_path):
+    assistant = CyberPurpleAssistant(home_dir=tmp_path, allow_remote=False, use_llm=False)
+    report = assistant.analyze_custom(title="Routine Healthcheck", content="GET /health status=200", source_kind="http")
+    assert report.verdict.verdict == VerdictType.INSUFFICIENT_EVIDENCE
+    assert report.red_report.kill_chain == []
+    assert "adm_rossi" not in report.red_report.primary_hypothesis
+    assert "pickle" not in report.blue_report.competing_hypothesis.lower()
+

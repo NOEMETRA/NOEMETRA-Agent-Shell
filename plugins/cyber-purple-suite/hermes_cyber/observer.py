@@ -18,8 +18,11 @@ _BEARER_OR_KEY_RE = re.compile(
     r"ghp_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,})\b",
     re.IGNORECASE,
 )
+_SECRET_QUOTED_RE = re.compile(
+    r"""(?i)(['"]?(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)['"]?\s*[=:]\s*)(["'])([^"'\r\n]{4,})\2"""
+)
 _SECRET_ASSIGN_RE = re.compile(
-    r"(?i)(\b(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)\s*[=:]\s*['\"]?)([^\s'\",;]{4,})(['\"]?)"
+    r"""(?i)(\b(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)\s*[=:]\s*)([^\s'"`,;{}]{4,})"""
 )
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 
@@ -76,9 +79,21 @@ class PrivacyScrubber:
         s = _JWT_RE.sub(_repl_secret, text)
         s = _BEARER_OR_KEY_RE.sub(_repl_secret, s)
 
+        def _repl_quoted(m: re.Match[str]) -> str:
+            val = m.group(3)
+            if "<REDACTED_SECRET_" in val:
+                return m.group(0)
+            alias = self._token_for("secrets", "REDACTED_SECRET", val)
+            return f"{m.group(1)}{m.group(2)}{alias}{m.group(2)}"
+
+        s = _SECRET_QUOTED_RE.sub(_repl_quoted, s)
+
         def _repl_assign(m: re.Match[str]) -> str:
-            alias = self._token_for("secrets", "REDACTED_SECRET", m.group(2))
-            return f"{m.group(1)}{alias}{m.group(3)}"
+            val = m.group(2)
+            if "<REDACTED_SECRET_" in val:
+                return m.group(0)
+            alias = self._token_for("secrets", "REDACTED_SECRET", val)
+            return f"{m.group(1)}{alias}"
 
         s = _SECRET_ASSIGN_RE.sub(_repl_assign, s)
 

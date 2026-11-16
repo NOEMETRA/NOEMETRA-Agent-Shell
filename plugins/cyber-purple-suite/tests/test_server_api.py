@@ -38,7 +38,7 @@ def test_cyber_api_status_scenarios_analyze_replay_and_benchmark():
     assert rep["verdict"]["verdict"] == "FALSE_POSITIVE_BENIGN"
     case_id = rep["case_id"]
 
-    # Interactive replay rerun endpoint
+    # Interactive replay rerun endpoint + persisted Sigma rule verification
     rp = client.post(
         "/api/plugins/cyber-purple-suite/replay",
         json={
@@ -49,6 +49,11 @@ def test_cyber_api_status_scenarios_analyze_replay_and_benchmark():
     )
     assert rp.status_code == 200
     assert rp.json()["detection_coverage"] == 1.0
+
+    fetched = client.get(f"/api/plugins/cyber-purple-suite/cases/{case_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["blue_report"]["sigma_rule"]["detection_keywords"] == ["delete shadows", "wbadmin delete"]
+    assert "wbadmin delete" in fetched.json()["blue_report"]["sigma_rule"]["yaml_text"]
 
     # Benchmark endpoint
     bm = client.post("/api/plugins/cyber-purple-suite/benchmark")

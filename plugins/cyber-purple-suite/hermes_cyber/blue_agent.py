@@ -348,48 +348,124 @@ def _synthesize_deterministic_blue_report(
             model_used="deterministic",
         )
 
-    # Case F: WAF Bypass / Pickle Deserialization / Shell Spawn (or generic exploit)
-    c_evs = _find_evs("pickle.loads", "sh -c", "curl ", "eval(", "os.system") or [e.evidence_id for e in evs[:2]]
-    contradictions.append(ContradictionItem(
-        claim_challenged="Edge WAF `ALLOWED` status guarantees benign payload",
-        contradicting_evidence_ids=c_evs,
-        explanation="WAF inspected only URL query string, missing `pickle.loads(base64.b64decode(...))` code execution triggering `sh -c curl`.",
-        impact_on_hypothesis="contextualizes",
-    ))
+    # Case F: Explicit WAF Bypass / Pickle Deserialization / Shell Spawn
+    if _has_any(all_raw, ("pickle.loads", "waf_status=allowed", "sh -c")):
+        c_evs = _find_evs("pickle.loads", "sh -c", "curl ", "waf_status=allowed")
+        contradictions.append(ContradictionItem(
+            claim_challenged="Edge WAF `ALLOWED` status guarantees benign payload",
+            contradicting_evidence_ids=c_evs,
+            explanation="WAF inspected only URL query string, missing `pickle.loads(base64.b64decode(...))` code execution triggering `sh -c curl`.",
+            impact_on_hypothesis="contextualizes",
+        ))
+        sigma = SigmaRuleSpec(
+            title="Worker Shell Fork & Unsafe Deserialization (HTTP WAF Bypass)",
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, "noemetra-pickle-shell")),
+            description="Detects web workers spawning sh/dash curl/wget reverse stagers or pickle deserialization payloads.",
+            logsource={"category": "process_creation", "product": "linux"},
+            detection_keywords=["sh -c", "pickle.loads", "curl http", "wget ", "/api/v2/session/restore"],
+            exclude_fields={"health": ["healthcheck=200 ok", "benign=true"]},
+            level="critical",
+        )
+        sigma.yaml_text = _build_sigma_yaml(sigma)
+        yara = YaraRuleSpec(
+            rule_name="Pickle_Base64_Reverse_Shell",
+            description="Detects unsafe pickle deserialization + Linux shell stager patterns.",
+            strings=["pickle.loads", "sh -c curl", "/bin/sh -c wget"],
+            condition="any of them",
+        )
+        yara.raw_rule = _build_yara_text(yara)
+        return BlueInvestigationReport(
+            competing_hypothesis="Alternative Tested (Benign Healthcheck + Safe WAF PASS): Refuted — Python worker spawned unauthorized shell & external egress.",
+            confidence=0.19,
+            contradictions=contradictions,
+            sigma_rule=sigma,
+            yara_rule=yara,
+            remediation_patch=(
+                "--- a/app/session.py\n"
+                "+++ b/app/session.py\n"
+                "- def restore_session_blob(raw_b64: str): return pickle.loads(base64.b64decode(raw_b64))\n"
+                "+ def restore_session_blob(raw_b64: str): return hmac_verified_json_loads(raw_b64)"
+            ),
+            hardening_steps=[
+                "Eliminate `pickle.loads` on untrusted HTTP headers/bodies; use HMAC-signed JSON.",
+                "Enable WAF body/header inspection and seccomp/AppArmor restricting `python3 -> sh/dash/curl` execve.",
+            ],
+            cited_evidence_ids=cited,
+            model_used="deterministic",
+        )
+
+    # Case G: Generic sinks/indicators vs clean/routine telemetry abstention
+    sink_evs = [ev for ev in evs if (not ev.is_benign_baseline) and (ev.entities.get("sinks") or ev.entities.get("indicators"))]
+    if sink_evs and red_plan.kill_chain:
+        kws = sorted({
+            *[ind for ev in sink_evs for ind in ev.entities.get("indicators", [])],
+            *[s for ev in sink_evs for s in ev.entities.get("sinks", [])],
+        })[:6] or ["unauthorized", "eval("]
+        c_ids = [ev.evidence_id for ev in sink_evs[:4]]
+        for eid in c_ids:
+            if eid not in cited:
+                cited.append(eid)
+        sigma = SigmaRuleSpec(
+            title="Custom Artifact Threat Indicator & Execution Sink Monitor",
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"noemetra-custom-{ingestion.sha256}")),
+            description="Monitors dangerous execution sinks or threat indicators identified in the submitted artifact.",
+            logsource={"category": "application", "product": "noemetra"},
+            detection_keywords=kws,
+            exclude_fields={"health": ["healthcheck=200 ok", "benign=true"]},
+            level="medium",
+        )
+        sigma.yaml_text = _build_sigma_yaml(sigma)
+        yara = YaraRuleSpec(
+            rule_name="Custom_Artifact_Sink_Indicator",
+            description="Matches threat indicators extracted from submitted telemetry.",
+            strings=kws[:4],
+            condition="any of them",
+        )
+        yara.raw_rule = _build_yara_text(yara)
+        return BlueInvestigationReport(
+            competing_hypothesis="Contextual Evaluation: Verify whether flagged execution/config sinks are reachable by untrusted input.",
+            confidence=0.35,
+            contradictions=[ContradictionItem(
+                claim_challenged="Exploitability context of matched sinks/indicators",
+                contradicting_evidence_ids=c_ids,
+                explanation="Matched indicators require verifying untrusted data flow and upstream access controls.",
+                impact_on_hypothesis="contextualizes",
+            )],
+            sigma_rule=sigma,
+            yara_rule=yara,
+            remediation_patch="# Enforce strict input validation and sandbox least-privilege on flagged sinks.",
+            hardening_steps=["Review referenced EV records for caller authentication and input sanitization."],
+            cited_evidence_ids=cited,
+            model_used="deterministic",
+        )
+
+    # No threat signal present: abstain cleanly without fabricating attack defenses
     sigma = SigmaRuleSpec(
-        title="Worker Shell Fork & Unsafe Deserialization (HTTP WAF Bypass)",
-        id=str(uuid.uuid5(uuid.NAMESPACE_DNS, "noemetra-pickle-shell")),
-        description="Detects web workers spawning sh/dash curl/wget reverse stagers or pickle deserialization payloads.",
-        logsource={"category": "process_creation", "product": "linux"},
-        detection_keywords=["sh -c", "pickle.loads", "curl http", "wget ", "/api/v2/session/restore"],
-        exclude_fields={"health": ["healthcheck=200 ok", "benign=true"]},
-        level="critical",
+        title="Baseline Monitoring Rule (Insufficient Threat Evidence)",
+        id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"noemetra-neutral-{ingestion.sha256}")),
+        description="Placeholder rule emitted when submitted telemetry contains no threat indicators.",
+        logsource={"category": "application", "product": "noemetra"},
+        detection_keywords=["unauthorized", "failed", "shell=True"],
+        exclude_fields={"health": ["status=200", "healthcheck=200 ok", "benign=true"]},
+        level="low",
     )
     sigma.yaml_text = _build_sigma_yaml(sigma)
     yara = YaraRuleSpec(
-        rule_name="Pickle_Base64_Reverse_Shell",
-        description="Detects unsafe pickle deserialization + Linux shell stager patterns.",
-        strings=["pickle.loads", "sh -c curl", "/bin/sh -c wget"],
+        rule_name="Neutral_Baseline_Placeholder",
+        description="No malicious byte strings detected in artifact.",
+        strings=["unauthorized"],
         condition="any of them",
     )
     yara.raw_rule = _build_yara_text(yara)
     return BlueInvestigationReport(
-        competing_hypothesis="Alternative Tested (Benign Healthcheck + Safe WAF PASS): Refuted — Python worker spawned unauthorized shell & external egress.",
-        confidence=0.19,
-        contradictions=contradictions,
+        competing_hypothesis="Routine / Neutral Telemetry — no attack indicators or unsafe sinks observed to confirm a threat.",
+        confidence=0.65,
+        contradictions=[],
         sigma_rule=sigma,
         yara_rule=yara,
-        remediation_patch=(
-            "--- a/app/session.py\n"
-            "+++ b/app/session.py\n"
-            "- def restore_session_blob(raw_b64: str): return pickle.loads(base64.b64decode(raw_b64))\n"
-            "+ def restore_session_blob(raw_b64: str): return hmac_verified_json_loads(raw_b64)"
-        ),
-        hardening_steps=[
-            "Eliminate `pickle.loads` on untrusted HTTP headers/bodies; use HMAC-signed JSON.",
-            "Enable WAF body/header inspection and seccomp/AppArmor restricting `python3 -> sh/dash/curl` execve.",
-        ],
-        cited_evidence_ids=cited,
+        remediation_patch="# No remediation required based on currently submitted records.",
+        hardening_steps=["Provide deeper process, auth, or network logs if an investigation is expected."],
+        cited_evidence_ids=[],
         model_used="deterministic",
     )
 

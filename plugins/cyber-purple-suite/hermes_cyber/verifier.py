@@ -195,7 +195,17 @@ class PurpleVerifier:
         sup_a = round(min(0.97, max(0.05, clean_red.confidence - 0.25 * refutes_count - 0.15 * weakens_count)), 3)
         sup_b = round(min(0.97, max(0.05, clean_blue.confidence + 0.10 * refutes_count)), 3)
 
-        if has_telemetry_gap or abs(sup_a - sup_b) < 0.18:
+        if len(clean_red.kill_chain) == 0:
+            verdict = VerdictType.INSUFFICIENT_EVIDENCE
+            winning = "INSUFFICIENT_EVIDENCE — No offensive kill-chain, exploit sink, or hostile indicator verified in submitted records."
+            confidence = 0.25
+            disc_test = (
+                "Provide additional process creation, authentication, DNS, or application handler telemetry if investigating a suspected incident."
+            )
+            rationale = (
+                "No concrete threat pattern matched submitted records; pipeline abstained instead of fabricating a synthetic attack."
+            )
+        elif has_telemetry_gap or abs(sup_a - sup_b) < 0.18:
             verdict = VerdictType.INSUFFICIENT_EVIDENCE
             winning = (
                 "INSUFFICIENT_EVIDENCE — Missing telemetry prevents discriminating compromise from authorized administrative activity."

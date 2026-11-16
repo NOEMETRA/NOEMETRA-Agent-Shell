@@ -315,50 +315,95 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
             model_used="deterministic",
         )
 
-    # Track 4: Generic WMI/SMB or custom telemetry
-    lat_evs = _evs_matching(lambda e: _has_any(e.raw_content, ("smb", "wmi", "wmic", "4624", "eval(", "os.system", "chmod 777")))
-    fallback_cited = lat_evs or [ev.evidence_id for ev in threat_evs[:3]]
-    for eid in fallback_cited:
-        if eid not in cited:
-            cited.append(eid)
-    kill_chain.append(MitreStep(
-        tactic="Lateral Movement",
-        technique_id="T1047",
-        technique_name="Windows Management Instrumentation / Admin Pivot",
-        description="Remote WMI/SMB administrative activity detected across privileged workstation-to-DB path.",
-        evidence_ids=fallback_cited,
-        reachability_proof="Host session 4624 followed by remote `wmic` enumeration on production database.",
-    ))
-    probes.append(RedProbe(
-        probe_id="RED-PRB-06",
-        title="Admin Session Provenance & LogonType Discrimination",
-        target_surface="db-prod-01 / kerberos-dc / openvpn-gw",
-        method_or_vector="Cross-log authentication verification",
-        payload_or_command="Query Security Event 4624 LogonType + TicketEncryption + OpenVPN session table for adm_rossi",
-        expected_ioc="RC4 NTLM LogonType=3 without VPN session proves Pass-the-Hash compromise",
-    ))
-    sim_events.extend([
-        SimulatedAttackEvent(
+    # Track 4: Explicit WMI/SMB lateral movement telemetry
+    lat_evs = _evs_matching(lambda e: _has_any(e.raw_content, ("smb", "wmi", "wmic", "4624", "pass-the-hash")))
+    if lat_evs:
+        kill_chain.append(MitreStep(
+            tactic="Lateral Movement",
+            technique_id="T1047",
+            technique_name="Windows Management Instrumentation / Admin Pivot",
+            description="Remote WMI/SMB administrative activity detected across workstation-to-server telemetry.",
+            evidence_ids=lat_evs,
+            reachability_proof="Host session / remote WMI command telemetry observed in cited records.",
+        ))
+        probes.append(RedProbe(
+            probe_id="RED-PRB-06",
+            title="Admin Session Provenance & LogonType Discrimination",
+            target_surface="auth / kerberos / vpn-gw",
+            method_or_vector="Cross-log authentication verification",
+            payload_or_command="Query Security Event 4624 LogonType + TicketEncryption + VPN session table",
+            expected_ioc="RC4 NTLM LogonType=3 without VPN session confirms Pass-the-Hash compromise",
+        ))
+        sim_events.extend([
+            SimulatedAttackEvent(
+                event_id="SIM-RED-01",
+                variant="baseline_attack",
+                log_line='host=db-prod-01 proto=SMB proc=wmic cmd="wmic /node:db-prod-01 process call create" TicketEncryption=RC4 LogonType=3',
+                mitre_technique_id="T1047",
+            ),
+            SimulatedAttackEvent(
+                event_id="SIM-RED-02",
+                variant="evasion_variant",
+                log_line='host=db-prod-01 proto=DCOM proc=powershell.exe cmd="Invoke-CimMethod -ClassName Win32_Process" LogonType=3',
+                mitre_technique_id="T1021",
+            ),
+        ])
+        return RedOperationPlan(
+            primary_hypothesis="Suspected Privileged Lateral Movement via WMI/SMB telemetry.",
+            confidence=0.62,
+            kill_chain=kill_chain,
+            blind_spots=["Missing VPN/Kerberos logon correlation leaves legitimate emergency admin vs stolen token indistinguishable."],
+            probes=probes,
+            simulated_events=sim_events,
+            cited_evidence_ids=cited,
+            model_used="deterministic",
+        )
+
+    # Track 4b: Generic code/command sinks or explicit security threat indicators
+    sink_evs = _evs_matching(lambda e: bool(e.entities.get("sinks")) or bool(e.entities.get("indicators")))
+    if sink_evs:
+        kill_chain.append(MitreStep(
+            tactic="Execution",
+            technique_id="T1059",
+            technique_name="Potentially Unsafe Sink / Threat Indicator Detected",
+            description="Security indicators or dangerous execution/config sinks identified verbatim in submitted artifact.",
+            evidence_ids=sink_evs,
+            reachability_proof=f"Matched concrete sinks/indicators in {', '.join(sink_evs[:4])}.",
+        ))
+        probes.append(RedProbe(
+            probe_id="RED-PRB-07",
+            title="Controlled Sink Reachability & Validation Audit",
+            target_surface=ingestion.title,
+            method_or_vector="Safe boundary input validation check",
+            payload_or_command=f"Inspect data-flow into sinks recorded in {', '.join(sink_evs[:3])}",
+            expected_ioc="Unhandled untrusted data reaching sink confirms exploitability",
+        ))
+        sim_events.append(SimulatedAttackEvent(
             event_id="SIM-RED-01",
             variant="baseline_attack",
-            log_line='host=db-prod-01 proto=SMB proc=wmic cmd="wmic /node:db-prod-01 process call create" TicketEncryption=RC4 LogonType=3',
-            mitre_technique_id="T1047",
-        ),
-        SimulatedAttackEvent(
-            event_id="SIM-RED-02",
-            variant="evasion_variant",
-            log_line='host=db-prod-01 proto=DCOM proc=powershell.exe cmd="Invoke-CimMethod -ClassName Win32_Process" LogonType=3',
-            mitre_technique_id="T1021",
-        ),
-    ])
+            log_line=threat_evs[0].raw_content,
+            mitre_technique_id="T1059",
+        ))
+        return RedOperationPlan(
+            primary_hypothesis="Concrete execution/config sink or threat indicator observed in submitted records.",
+            confidence=0.72,
+            kill_chain=kill_chain,
+            blind_spots=["Inspect upstream input sanitization and runtime egress isolation."],
+            probes=probes,
+            simulated_events=sim_events,
+            cited_evidence_ids=cited,
+            model_used="deterministic",
+        )
+
+    # Track 5: Benign or neutral telemetry -> abstain without inventing nonexistent attack scenarios
     return RedOperationPlan(
-        primary_hypothesis="Suspected Privileged Lateral Movement via WMI/SMB using account adm_rossi.",
-        confidence=0.62,
-        kill_chain=kill_chain,
-        blind_spots=["Missing VPN/Kerberos logon correlation leaves legitimate emergency admin vs stolen token indistinguishable."],
-        probes=probes,
-        simulated_events=sim_events,
-        cited_evidence_ids=cited,
+        primary_hypothesis="No concrete offensive kill-chain or exploit indicator identified in submitted records.",
+        confidence=0.15,
+        kill_chain=[],
+        blind_spots=["Telemetry contains no exploit sinks, error anomalies, or lateral-movement indicators."],
+        probes=[],
+        simulated_events=[],
+        cited_evidence_ids=[],
         model_used="deterministic",
     )
 

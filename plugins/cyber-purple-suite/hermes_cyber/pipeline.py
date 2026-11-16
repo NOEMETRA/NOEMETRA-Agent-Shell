@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from hermes_cyber.blue_agent import BlueInvestigatorAgent
+from hermes_cyber.blue_agent import BlueInvestigatorAgent, _build_sigma_yaml
 from hermes_cyber.models import (
     BenchmarkCaseResult,
     BenchmarkComparisonReport,
@@ -255,8 +255,18 @@ class CyberPurpleAssistant:
             custom_keywords=detection_keywords,
             custom_excludes=exclude_values,
         )
+        updated_blue = report.blue_report
+        if detection_keywords is not None or exclude_values is not None:
+            tuned_sigma = report.blue_report.sigma_rule.model_copy(deep=True)
+            if detection_keywords is not None:
+                tuned_sigma.detection_keywords = [k.strip() for k in detection_keywords if k.strip()]
+            if exclude_values is not None:
+                tuned_sigma.exclude_fields = {"custom_filter": [x.strip() for x in exclude_values if x.strip()]}
+            tuned_sigma.yaml_text = _build_sigma_yaml(tuned_sigma)
+            updated_blue = report.blue_report.model_copy(update={"sigma_rule": tuned_sigma})
+
         updated_verdict = report.verdict.model_copy(update={"replay": updated_replay})
-        self._cases[case_id] = report.model_copy(update={"verdict": updated_verdict})
+        self._cases[case_id] = report.model_copy(update={"blue_report": updated_blue, "verdict": updated_verdict})
         self._save_cases()
         return updated_replay
 
