@@ -18,8 +18,11 @@ _BEARER_OR_KEY_RE = re.compile(
     r"ghp_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,})\b",
     re.IGNORECASE,
 )
-_SECRET_QUOTED_RE = re.compile(
-    r"""(?i)(['"]?(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)['"]?\s*[=:]\s*)(["'])([^"'\r\n]{4,})\2"""
+_SECRET_DQUOTED_RE = re.compile(
+    r'''(?i)(['"]?(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)['"]?\s*[=:]\s*)"((?:[^"\\\r\n]|\\.){4,})"'''
+)
+_SECRET_SQUOTED_RE = re.compile(
+    r"""(?i)(['"]?(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)['"]?\s*[=:]\s*)'((?:[^'\\\r\n]|\\.){4,})'"""
 )
 _SECRET_ASSIGN_RE = re.compile(
     r"""(?i)(\b(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)\s*[=:]\s*)([^\s'"`,;{}]{4,})"""
@@ -79,14 +82,15 @@ class PrivacyScrubber:
         s = _JWT_RE.sub(_repl_secret, text)
         s = _BEARER_OR_KEY_RE.sub(_repl_secret, s)
 
-        def _repl_quoted(m: re.Match[str]) -> str:
-            val = m.group(3)
-            if "<REDACTED_SECRET_" in val:
-                return m.group(0)
-            alias = self._token_for("secrets", "REDACTED_SECRET", val)
-            return f"{m.group(1)}{m.group(2)}{alias}{m.group(2)}"
+        for quote_char, pattern in (('"', _SECRET_DQUOTED_RE), ("'", _SECRET_SQUOTED_RE)):
+            def _repl_quoted(m: re.Match[str], q: str = quote_char) -> str:
+                val = m.group(2)
+                if "<REDACTED_SECRET_" in val:
+                    return m.group(0)
+                alias = self._token_for("secrets", "REDACTED_SECRET", val)
+                return f"{m.group(1)}{q}{alias}{q}"
 
-        s = _SECRET_QUOTED_RE.sub(_repl_quoted, s)
+            s = pattern.sub(_repl_quoted, s)
 
         def _repl_assign(m: re.Match[str]) -> str:
             val = m.group(2)
@@ -153,9 +157,14 @@ def _extract_entities(raw: str, source_type: str) -> Tuple[Optional[str], Dict[s
             endpoints.append(ep)
 
     sinks: List[str] = []
+    sink_literals: List[str] = []
     for sink_name, pat in _SINK_PATTERNS:
-        if pat.search(raw):
+        matches = [m.group(0).strip()[:64] for m in pat.finditer(raw) if m.group(0).strip()]
+        if matches:
             sinks.append(sink_name)
+            for lit in matches:
+                if lit not in sink_literals:
+                    sink_literals.append(lit)
 
     indicators: List[str] = []
     for kw in _THREAT_KEYWORDS_RE.findall(raw):
@@ -169,6 +178,7 @@ def _extract_entities(raw: str, source_type: str) -> Tuple[Optional[str], Dict[s
         "processes": processes,
         "endpoints": endpoints,
         "sinks": sinks,
+        "sink_literals": sink_literals,
         "indicators": indicators,
     }
 

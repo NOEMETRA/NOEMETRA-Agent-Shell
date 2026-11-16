@@ -395,12 +395,27 @@ def _synthesize_deterministic_blue_report(
         )
 
     # Case G: Generic sinks/indicators vs clean/routine telemetry abstention
+    _sink_fallback_literals = {
+        "sql_concat": ["SELECT ", "INSERT ", "UPDATE ", "DELETE "],
+        "ssrf_fetch": ["requests.get(", "requests.post(", "urllib.request.urlopen(", "curl_exec("],
+        "cmd_exec": ["subprocess.run", "os.system", "shell=True", "eval("],
+        "deserialization": ["pickle.loads", "yaml.load(", "__reduce__", "ObjectInputStream"],
+        "container_priv": ["privileged: true", "hostPID: true", "0.0.0.0/0", "CAP_SYS_ADMIN"],
+    }
     sink_evs = [ev for ev in evs if (not ev.is_benign_baseline) and (ev.entities.get("sinks") or ev.entities.get("indicators"))]
     if sink_evs and red_plan.kill_chain:
-        kws = sorted({
-            *[ind for ev in sink_evs for ind in ev.entities.get("indicators", [])],
-            *[s for ev in sink_evs for s in ev.entities.get("sinks", [])],
-        })[:6] or ["unauthorized", "eval("]
+        ordered_kws: List[str] = []
+        for ev in sink_evs:
+            for item in [*ev.entities.get("sink_literals", []), *ev.entities.get("indicators", [])]:
+                if item and item not in ordered_kws:
+                    ordered_kws.append(item)
+        if not ordered_kws:
+            for ev in sink_evs:
+                for sink_cat in ev.entities.get("sinks", []):
+                    for fallback_lit in _sink_fallback_literals.get(sink_cat, []):
+                        if fallback_lit not in ordered_kws:
+                            ordered_kws.append(fallback_lit)
+        kws = ordered_kws[:6] or ["unauthorized", "eval("]
         c_ids = [ev.evidence_id for ev in sink_evs[:4]]
         for eid in c_ids:
             if eid not in cited:

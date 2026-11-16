@@ -75,3 +75,22 @@ def test_benign_or_neutral_custom_telemetry_abstains_without_fake_attack(tmp_pat
     assert "adm_rossi" not in report.red_report.primary_hypothesis
     assert "pickle" not in report.blue_report.competing_hypothesis.lower()
 
+
+def test_generic_sink_with_benign_prefix_generates_literal_rules_and_full_replay_coverage(tmp_path):
+    assistant = CyberPurpleAssistant(home_dir=tmp_path, allow_remote=False, use_llm=False)
+
+    for label, sink_line, expected_sub in [
+        ("subprocess", "application started\nsubprocess.run(user_input, shell=True)", "subprocess.run"),
+        ("os_system", "application started\nos.system(user_input)", "os.system"),
+    ]:
+        report = assistant.analyze_custom(title=f"Generic {label}", content=sink_line, source_kind="code")
+        assert len(report.red_report.kill_chain) >= 1
+        assert report.red_report.simulated_events[0].log_line != "application started"
+        assert expected_sub in report.red_report.simulated_events[0].log_line
+        kws = report.blue_report.sigma_rule.detection_keywords
+        assert "cmd_exec" not in kws
+        assert expected_sub in kws
+        assert all(s != "cmd_exec" for s in report.blue_report.yara_rule.strings)
+        assert report.verdict.replay.detection_coverage == 1.0
+
+

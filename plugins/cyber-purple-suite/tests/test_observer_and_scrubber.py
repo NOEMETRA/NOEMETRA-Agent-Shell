@@ -82,3 +82,24 @@ def test_bundled_plugins_namespace_coexistence():
     assert hasattr(mod_c, "cyber_analyze_scenario")
     assert hasattr(mod_v, "voice_load_document")
 
+
+def test_privacy_scrubber_redacts_embedded_opposite_quotes_and_escapes_in_secrets():
+    scrubber = PrivacyScrubber()
+    raw = (
+        'password="hunter\'s secret" '
+        "token='say \"hi\" friend' "
+        '{"api_key": "don\'t_leak_this_key!"} '
+        r'secret="esc\"quote\'123"'
+    )
+    scrubbed, stats = scrubber.scrub(raw)
+
+    assert "hunter's secret" not in scrubbed
+    assert 'say "hi" friend' not in scrubbed
+    assert "don't_leak_this_key!" not in scrubbed
+    assert r'esc\"quote\'123' not in scrubbed
+    assert stats["secrets"] == 4
+
+    restored = scrubber.unscrub(scrubbed)
+    assert restored == raw
+
+

@@ -362,6 +362,8 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
     # Track 4b: Generic code/command sinks or explicit security threat indicators
     sink_evs = _evs_matching(lambda e: bool(e.entities.get("sinks")) or bool(e.entities.get("indicators")))
     if sink_evs:
+        sink_id_set = set(sink_evs)
+        matched_sink_records = [e for e in threat_evs if e.evidence_id in sink_id_set]
         kill_chain.append(MitreStep(
             tactic="Execution",
             technique_id="T1059",
@@ -381,7 +383,7 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         sim_events.append(SimulatedAttackEvent(
             event_id="SIM-RED-01",
             variant="baseline_attack",
-            log_line=threat_evs[0].raw_content,
+            log_line=matched_sink_records[0].raw_content,
             mitre_technique_id="T1059",
         ))
         return RedOperationPlan(
