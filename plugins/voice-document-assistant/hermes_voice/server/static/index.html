@@ -1062,6 +1062,11 @@
         (Array.isArray(cloud.ollama_cloud && cloud.ollama_cloud.models) ? cloud.ollama_cloud.models : []).forEach(m => pushM(m, m));
         return items;
       }
+      if (prov === 'opencode-free') {
+        if (activeProv === 'opencode-free' && activeMod) pushM(activeMod, activeMod);
+        (Array.isArray(cloud.opencode_free && cloud.opencode_free.models) ? cloud.opencode_free.models : []).forEach(m => pushM(m, m));
+        return items;
+      }
       if (prov === 'openai') {
         if (activeProv === 'openai' && activeMod) pushM(activeMod, activeMod);
         ((cloud.openai && cloud.openai.models) || ['gpt-4o-mini']).forEach(m => pushM(m, m));
@@ -1137,6 +1142,9 @@
         }
         if (cloud.ollama_cloud && cloud.ollama_cloud.configured && Array.isArray(cloud.ollama_cloud.models) && cloud.ollama_cloud.models.length) {
           cloudProvs.push({ value: 'ollama-cloud', label: `Ollama Cloud (${cloud.ollama_cloud.models.length})` });
+        }
+        if (cloud.opencode_free && cloud.opencode_free.configured && Array.isArray(cloud.opencode_free.models) && cloud.opencode_free.models.length) {
+          cloudProvs.push({ value: 'opencode-free', label: `OpenCode Free (${cloud.opencode_free.models.length})` });
         }
         if (cloud.openai && cloud.openai.configured) cloudProvs.push({ value: 'openai', label: 'OpenAI API' });
         if (cloud.anthropic && cloud.anthropic.configured) cloudProvs.push({ value: 'anthropic', label: 'Anthropic API' });

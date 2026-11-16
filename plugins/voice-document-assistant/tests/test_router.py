@@ -1007,6 +1007,96 @@ def test_codex_native_oauth_catalog_live_and_cache_invalidation(monkeypatch):
     assert "gpt-6.1-sol" in live_status["codex_oauth"]["models"]
 
 
+def test_opencode_free_privacy_discovery_and_cli_ndjson(monkeypatch):
+    """OpenCode Free uses opencode CLI discovery, blocks allow_remote=False, and parses NDJSON events."""
+    import json
+    import types
+    from hermes_voice import model_router as mr
+
+    mr._CLOUD_CATALOG_CACHE.clear()
+    monkeypatch.setattr(mr.shutil, "which", lambda name: "opencode" if name == "opencode" else None)
+
+    seen_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        seen_cmds.append((cmd, kwargs))
+        if len(cmd) >= 3 and cmd[1] == "models" and cmd[2] == "opencode":
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "opencode/mimo-v2.6-flash-free\n"
+                    "opencode/deepseek-v4.1-flash-free\n"
+                    "opencode/paid-model\n"
+                    "opencode/big-pickle\n"
+                ),
+                stderr="",
+            )
+        if len(cmd) >= 2 and cmd[1] == "run":
+            ndjson = "\n".join([
+                json.dumps({"type": "step_start", "part": {"type": "step-start"}}),
+                json.dumps({"type": "text", "part": {"type": "text", "text": "Risposta "}}),
+                json.dumps({"type": "text", "part": {"type": "text", "text": "OpenCode OK."}}),
+            ])
+            return types.SimpleNamespace(returncode=0, stdout=ndjson, stderr="")
+        raise AssertionError(f"Unexpected cmd: {cmd}")
+
+    monkeypatch.setattr(mr.subprocess, "run", fake_run)
+
+    router = ModelRouter(default_provider="opencode-free", allow_remote=False)
+    assert router.is_active_endpoint_local() is False
+
+    # Offline status does not invoke subprocess `opencode models opencode`, still exposes fallback models
+    offline_status = router.get_providers_status(refresh=True)
+    assert seen_cmds == []
+    oc_free_offline = offline_status["cloud_providers"]["opencode_free"]
+    assert oc_free_offline["configured"] is True
+    assert oc_free_offline["authorized"] is False
+    assert "opencode/mimo-v2.6-flash-free" in oc_free_offline["models"]
+
+    # Privacy gate must block remote execution while allow_remote=False
+    with pytest.raises(PermissionError, match="PRIVACY"):
+        router.generate(prompt="Test privacy")
+
+    # Enabling allow_remote triggers live CLI catalog refresh + allows CLI run
+    router.set_allow_remote(True)
+    live_status = router.get_providers_status(refresh=True)
+    oc_free_live = live_status["cloud_providers"]["opencode_free"]
+    assert oc_free_live["authorized"] is True
+    assert oc_free_live["models"] == [
+        "opencode/mimo-v2.6-flash-free",
+        "opencode/deepseek-v4.1-flash-free",
+        "opencode/big-pickle",
+    ]
+    assert "opencode/paid-model" not in oc_free_live["models"]
+
+    router.set_model("opencode/deepseek-v4.1-flash-free")
+    answer = router.generate(prompt="Cosa dice il contratto?", system_prompt="Sii conciso.")
+    assert answer == "Risposta OpenCode OK."
+    assert router.last_model_used == "opencode/deepseek-v4.1-flash-free"
+
+    run_calls = [(c, kw) for (c, kw) in seen_cmds if len(c) >= 2 and c[1] == "run"]
+    assert len(run_calls) == 1
+    run_cmd, run_kwargs = run_calls[0]
+    assert "-m" in run_cmd and "opencode/deepseek-v4.1-flash-free" in run_cmd
+    assert "--pure" in run_cmd and "--format" in run_cmd and "json" in run_cmd
+    assert "Sii conciso." in run_kwargs["input"]
+    assert "Cosa dice il contratto?" in run_kwargs["input"]
+
+    # Error event from CLI surfaces cleanly
+    monkeypatch.setattr(
+        mr.subprocess,
+        "run",
+        lambda cmd, **kw: types.SimpleNamespace(
+            returncode=1,
+            stdout=json.dumps({"type": "error", "error": {"name": "RateLimit", "data": {"message": "Free limit reached"}}}),
+            stderr="",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="Free limit reached"):
+        router.generate(prompt="Trigger error")
+
+
+
 
 
 

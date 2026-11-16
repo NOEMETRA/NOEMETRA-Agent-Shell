@@ -2621,6 +2621,7 @@ function VoiceDocumentPage({ ctx, controller }) {
     'openai-codex': 'ChatGPT Codex (Quote)',
     openrouter: 'OpenRouter (:free)',
     'ollama-cloud': 'Ollama Cloud',
+    'opencode-free': 'OpenCode Free',
     gguf: 'Unsloth / GGUF su Disco',
     lmstudio: 'LM Studio',
     unsloth_studio: 'Unsloth Studio',
@@ -2736,6 +2737,14 @@ function VoiceDocumentPage({ ctx, controller }) {
       return items
     }
 
+    if (prov === 'opencode-free') {
+      if (activeLlmProvider === 'opencode-free' && activeLlmModel) pushModel(activeLlmModel, activeLlmModel)
+      for (const m of (Array.isArray(cloudProviders?.opencode_free?.models) ? cloudProviders.opencode_free.models : [])) {
+        if (m && typeof m === 'string') pushModel(m, m)
+      }
+      return items
+    }
+
     if (prov === 'openai') {
       if (activeLlmProvider === 'openai' && activeLlmModel) pushModel(activeLlmModel, activeLlmModel)
       for (const m of (cloudProviders?.openai?.models || ['gpt-4o-mini'])) {
@@ -2785,7 +2794,7 @@ function VoiceDocumentPage({ ctx, controller }) {
     if (activeLlmProvider && !status?.allow_remote && !seen.has(activeLlmProvider)) {
       pushProv(localItems, activeLlmProvider, PROVIDER_DISPLAY_NAMES[activeLlmProvider] || activeLlmProvider)
     }
-    if (selectedProvider && !seen.has(selectedProvider) && !['openai-codex', 'openrouter', 'ollama-cloud', 'openai', 'anthropic'].includes(selectedProvider)) {
+    if (selectedProvider && !seen.has(selectedProvider) && !['openai-codex', 'openrouter', 'ollama-cloud', 'opencode-free', 'openai', 'anthropic'].includes(selectedProvider)) {
       pushProv(localItems, selectedProvider, PROVIDER_DISPLAY_NAMES[selectedProvider] || selectedProvider)
     }
     pushProv(localItems, '__configure_local__', '⚙ Altro runtime locale...')
@@ -2804,6 +2813,10 @@ function VoiceDocumentPage({ ctx, controller }) {
       const ocInfo = cloudProviders?.ollama_cloud
       if (ocInfo?.configured && Array.isArray(ocInfo.models) && ocInfo.models.length > 0) {
         pushProv(cloudItems, 'ollama-cloud', `Ollama Cloud (${ocInfo.models.length})`)
+      }
+      const ocFreeInfo = cloudProviders?.opencode_free
+      if (ocFreeInfo?.configured && Array.isArray(ocFreeInfo.models) && ocFreeInfo.models.length > 0) {
+        pushProv(cloudItems, 'opencode-free', `OpenCode Free (${ocFreeInfo.models.length})`)
       }
       if (cloudProviders) {
         if (cloudProviders.openai?.configured) pushProv(cloudItems, 'openai', 'OpenAI API')

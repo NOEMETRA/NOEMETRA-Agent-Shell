@@ -205,6 +205,9 @@ _CODEX_OAUTH_ALIASES = frozenset({
 _OLLAMA_CLOUD_ALIASES = frozenset({
     "ollama-cloud", "ollama_cloud",
 })
+_OPENCODE_FREE_ALIASES = frozenset({
+    "opencode-free", "opencode_free", "opencode-zen-free",
+})
 _GGUF_LOCAL_ALIASES = frozenset({
     "gguf", "llamacpp-file",
 })
@@ -235,6 +238,17 @@ _CODEX_MODELS_FALLBACK: List[str] = [
     "gpt-5.5",
     "gpt-5.4-mini",
     "gpt-5.4",
+]
+
+_OPENCODE_FREE_FALLBACK: List[str] = [
+    "opencode/mimo-v2.6-flash-free",
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/nemotron-3.5-lightning-free",
+    "opencode/nemotron-3.5-super-vl-free",
+    "opencode/flint-40b-free",
+    "opencode/beam-free",
+    "opencode/big-pickle",
 ]
 
 _CLOUD_CATALOG_CACHE: Dict[str, tuple[float, Any]] = {}
@@ -387,6 +401,48 @@ def _fetch_codex_oauth_catalog(refresh: bool = False) -> List[str]:
     return list(models)
 
 
+def _is_opencode_cli_available() -> bool:
+    """Return True when the official `opencode` CLI binary is available in PATH."""
+    return bool(shutil.which("opencode"))
+
+
+def _fetch_opencode_free_catalog(refresh: bool = False) -> List[str]:
+    """Resolve OpenCode free models via `opencode models opencode` with TTL cache and fallback."""
+    cache_key = "opencode_free"
+    now = time.monotonic()
+    cached = _CLOUD_CATALOG_CACHE.get(cache_key)
+    if not refresh and cached and (now - cached[0]) < _CLOUD_CATALOG_TTL_SECONDS:
+        return list(cached[1])
+
+    models: List[str] = []
+    opencode_bin = shutil.which("opencode")
+    if refresh and opencode_bin:
+        try:
+            proc = subprocess.run(
+                [opencode_bin, "models", "opencode"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=10,
+            )
+            if proc.returncode == 0:
+                for raw_line in (proc.stdout or "").splitlines():
+                    mid = raw_line.strip()
+                    if not mid or not mid.startswith("opencode/"):
+                        continue
+                    if (mid.endswith("-free") or mid == "opencode/big-pickle") and mid not in models:
+                        models.append(mid)
+        except Exception as exc:
+            logger.debug("Fetch catalogo OpenCode Free fallito: %s", exc)
+
+    if not models:
+        models = list(_OPENCODE_FREE_FALLBACK)
+
+    _CLOUD_CATALOG_CACHE[cache_key] = (now, models)
+    return list(models)
+
+
 def _resolve_hermes_provider_id(provider_name: Optional[str]) -> Optional[str]:
     """Return canonical Hermes provider id when *provider_name* is a supported Hermes runtime provider."""
     norm = (provider_name or "").strip().lower()
@@ -395,6 +451,7 @@ def _resolve_hermes_provider_id(provider_name: Optional[str]) -> Optional[str]:
         or norm in ("auto", "default", "ollama")
         or norm in _OPENAI_COMPAT_LOCAL_ALIASES
         or norm in _GGUF_LOCAL_ALIASES
+        or norm in _OPENCODE_FREE_ALIASES
         or norm.startswith("custom:")
         or norm in ("remote", "api")
     ):
@@ -847,7 +904,7 @@ class ModelRouter:
         prev = bool(getattr(self, "allow_remote", False))
         self.allow_remote = bool(allowed)
         if not prev and self.allow_remote:
-            for key in ("openai_codex", "openrouter", "ollama_cloud"):
+            for key in ("openai_codex", "openrouter", "ollama_cloud", "opencode_free"):
                 _CLOUD_CATALOG_CACHE.pop(key, None)
         logger.info(f"Autorizzazione provider remoti aggiornata a: {self.allow_remote}")
 
@@ -890,6 +947,8 @@ class ModelRouter:
             self.default_provider = "openai-codex"
         elif raw in _OLLAMA_CLOUD_ALIASES:
             self.default_provider = "ollama-cloud"
+        elif raw in _OPENCODE_FREE_ALIASES:
+            self.default_provider = "opencode-free"
         elif raw in _GGUF_LOCAL_ALIASES:
             self.default_provider = "gguf"
         elif raw in _OPENAI_COMPAT_LOCAL_ALIASES or raw.startswith("custom:"):
@@ -922,7 +981,12 @@ class ModelRouter:
                 or "http://127.0.0.1:8000/v1"
             )
             return is_local_endpoint(str(candidate))
-        if prov in _CODEX_OAUTH_ALIASES or prov in _OLLAMA_CLOUD_ALIASES or prov in ("openrouter", "openai", "anthropic", "remote", "api"):
+        if (
+            prov in _CODEX_OAUTH_ALIASES
+            or prov in _OLLAMA_CLOUD_ALIASES
+            or prov in _OPENCODE_FREE_ALIASES
+            or prov in ("openrouter", "openai", "anthropic", "remote", "api")
+        ):
             if prov in ("remote", "api") and self.remote_base_url:
                 return is_local_endpoint(self.remote_base_url)
             if prov == self._initial_provider and self.remote_base_url:
@@ -1072,6 +1136,13 @@ class ModelRouter:
                 refresh=remote_refresh and ollama_cloud_configured,
             )
 
+            opencode_free_configured = _is_opencode_cli_available()
+            opencode_free_models = (
+                _fetch_opencode_free_catalog(refresh=remote_refresh)
+                if opencode_free_configured
+                else []
+            )
+
             openai_configured = bool(
                 _get_profile_scoped_secret("OPENAI_API_KEY")
                 or _is_hermes_provider_configured_offline("openai-api")
@@ -1089,6 +1160,7 @@ class ModelRouter:
                 or codex_oauth_configured
                 or openrouter_configured
                 or ollama_cloud_configured
+                or opencode_free_configured
                 or openai_configured
                 or anthropic_configured
             )
@@ -1140,6 +1212,12 @@ class ModelRouter:
                     "ollama_cloud": {
                         "configured": ollama_cloud_configured,
                         "models": ollama_cloud_models,
+                        "is_local": False,
+                        "authorized": self.allow_remote,
+                    },
+                    "opencode_free": {
+                        "configured": opencode_free_configured,
+                        "models": opencode_free_models,
                         "is_local": False,
                         "authorized": self.allow_remote,
                     },
@@ -1439,6 +1517,19 @@ class ModelRouter:
                     )
                 raise exc
 
+        elif selected_provider in _OPENCODE_FREE_ALIASES:
+            if not self.allow_remote:
+                raise PermissionError(
+                    "VIOLAZIONE VINCOLO PRIVACY: Il provider 'opencode-free' usa i server cloud di OpenCode Zen. "
+                    "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita. "
+                    "Per abilitarlo, impostare esplicitamente allow_remote=True con il consenso dell'utente."
+                )
+            return self._call_opencode_cli_run(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=model or self.ollama_model,
+            )
+
         else:
             canonical_hermes = _resolve_hermes_provider_id(selected_provider)
             if canonical_hermes is not None:
@@ -1569,6 +1660,99 @@ class ModelRouter:
             text = out_file.read_text(encoding="utf-8").strip() if out_file.is_file() else (proc.stdout or "").strip()
             self.last_model_used = target_model
             return text
+
+    def _call_opencode_cli_run(
+        self,
+        *,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> str:
+        """Execute a one-shot query via official `opencode run` using OpenCode free Zen models."""
+        if not self.allow_remote:
+            raise PermissionError(
+                "VIOLAZIONE VINCOLO PRIVACY: OpenCode Zen Free usa endpoint remoti OpenCode. "
+                "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
+            )
+        opencode_bin = shutil.which("opencode")
+        if not opencode_bin:
+            raise RuntimeError("Binario `opencode` CLI non trovato nel PATH.")
+
+        target_model = str(model or "").strip()
+        if not target_model or target_model == "gemma4:12b" or target_model.lower().endswith(".gguf"):
+            target_model = (_fetch_opencode_free_catalog(refresh=False) or _OPENCODE_FREE_FALLBACK)[0]
+        elif "/" not in target_model:
+            target_model = f"opencode/{target_model}"
+
+        combined_prompt = (
+            f"Istruzioni di sistema:\n{system_prompt.strip()}\n\nRichiesta:\n{prompt}"
+            if system_prompt and system_prompt.strip()
+            else prompt
+        )
+        instruction = (
+            "Rispondi esclusivamente alla richiesta fornita in ingresso (stdin) basandoti solo sul contenuto "
+            "fornito, senza usare file locali o strumenti esterni."
+        )
+
+        with tempfile.TemporaryDirectory(prefix="hv_opencode_") as tmpdir:
+            cmd = [
+                opencode_bin,
+                "run",
+                "-m", target_model,
+                "--pure",
+                "--format", "json",
+                "--dir", tmpdir,
+                instruction,
+            ]
+            proc = subprocess.run(
+                cmd,
+                cwd=tmpdir,
+                input=combined_prompt,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=max(30, int(getattr(self, "timeout", 120) or 120)),
+            )
+
+        text_chunks: List[str] = []
+        event_errors: List[str] = []
+        for raw_line in (proc.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            ev_type = ev.get("type")
+            if ev_type == "text":
+                part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+                txt = part.get("text")
+                if isinstance(txt, str) and txt:
+                    text_chunks.append(txt)
+            elif ev_type == "error":
+                err_obj = ev.get("error")
+                if isinstance(err_obj, dict):
+                    msg = str(err_obj.get("message") or err_obj.get("data", {}).get("message") or err_obj.get("name") or "")
+                else:
+                    msg = str(err_obj or "")
+                if msg:
+                    event_errors.append(msg)
+
+        output_text = "".join(text_chunks).strip()
+        if proc.returncode != 0 or not output_text:
+            err_msg = (
+                "; ".join(event_errors)
+                or (proc.stderr or "").strip()
+                or (proc.stdout or "").strip()
+                or f"exit {proc.returncode}"
+            )
+            raise RuntimeError(f"Errore OpenCode CLI (`opencode run`): {err_msg[:300]}")
+
+        self.last_model_used = target_model
+        return output_text
 
     def _call_hermes_runtime_provider(
         self,

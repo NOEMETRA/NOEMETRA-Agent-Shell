@@ -337,6 +337,10 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
         ollama_cloud: {
           configured: true,
           models: ['gpt-oss:120b-cloud']
+        },
+        opencode_free: {
+          configured: true,
+          models: ['opencode/mimo-v2.6-flash-free', 'opencode/deepseek-v4.1-flash-free']
         }
       },
       remote_api: { configured: true }
@@ -561,7 +565,7 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
       expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('Unsloth Studio (unsloth/Qwen3-14B)')
     })
 
-    // Enable remote providers -> exposes ChatGPT Codex (OAuth), OpenRouter Free, and Ollama Cloud in Provider selector
+    // Enable remote providers -> exposes ChatGPT Codex (OAuth), OpenRouter Free, Ollama Cloud, and OpenCode Free in Provider selector
     const privacyToggle = view.container.querySelector('.hv-privacy-bar input[type="checkbox"]') as HTMLInputElement
     fireEvent.click(privacyToggle)
     await waitFor(() => {
@@ -569,6 +573,7 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
       expect(provValues).toContain('openai-codex')
       expect(provValues).toContain('openrouter')
       expect(provValues).toContain('ollama-cloud')
+      expect(provValues).toContain('opencode-free')
     })
 
     fireEvent.change(providerSelect, { target: { value: 'openai-codex' } })
@@ -595,10 +600,24 @@ describe('voice-document-assistant desktop plugin lifecycle', () => {
       expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('ChatGPT Codex (Quote) (gpt-5.4-mini)')
     })
 
+    // Switching to OpenCode Free exposes OpenCode free models and persists opencode-free config
+    fireEvent.change(providerSelect, { target: { value: 'opencode-free' } })
+    await waitFor(() => {
+      const optValues = Array.from(llmSelect.options).map(o => o.value)
+      expect(optValues).toContain('opencode/mimo-v2.6-flash-free')
+      expect(optValues).toContain('opencode/deepseek-v4.1-flash-free')
+      expect(calls.some(c =>
+        c.path === '/api/plugins/voice-document-assistant/playback/config' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_model === 'opencode/mimo-v2.6-flash-free' &&
+        (c.body as { llm_model?: string; llm_provider?: string })?.llm_provider === 'opencode-free'
+      )).toBe(true)
+      expect(view.container.querySelector('.hv-privacy-status')?.textContent).toContain('OpenCode Free (opencode/mimo-v2.6-flash-free)')
+    })
+
     // Selecting a 0-model offline provider keeps selector synced to active backend provider & opens drawer pre-initialized
     fireEvent.change(providerSelect, { target: { value: 'unsloth_studio' } })
     await waitFor(() => {
-      expect(providerSelect.value).toBe('openai-codex')
+      expect(providerSelect.value).toBe('opencode-free')
       const drawerRt = view.container.querySelector('.hv-custom-runtime-row select[aria-label="Runtime locale"]') as HTMLSelectElement
       const drawerUrl = view.container.querySelector('.hv-custom-runtime-row input[aria-label="Endpoint runtime locale"]') as HTMLInputElement
       expect(drawerRt?.value).toBe('unsloth_studio')
