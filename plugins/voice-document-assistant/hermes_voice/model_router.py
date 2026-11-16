@@ -401,9 +401,21 @@ def _fetch_codex_oauth_catalog(refresh: bool = False) -> List[str]:
     return list(models)
 
 
+def _resolve_opencode_binary() -> Optional[str]:
+    """Resolve the official `opencode` executable path (unwrapping npm `.cmd` on Windows when present)."""
+    raw = shutil.which("opencode")
+    if not raw:
+        return None
+    if os.name == "nt" and raw.lower().endswith((".cmd", ".bat")):
+        candidate = os.path.join(os.path.dirname(raw), "node_modules", "opencode-ai", "bin", "opencode.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    return raw
+
+
 def _is_opencode_cli_available() -> bool:
     """Return True when the official `opencode` CLI binary is available in PATH."""
-    return bool(shutil.which("opencode"))
+    return bool(_resolve_opencode_binary())
 
 
 def _fetch_opencode_free_catalog(refresh: bool = False) -> List[str]:
@@ -415,7 +427,7 @@ def _fetch_opencode_free_catalog(refresh: bool = False) -> List[str]:
         return list(cached[1])
 
     models: List[str] = []
-    opencode_bin = shutil.which("opencode")
+    opencode_bin = _resolve_opencode_binary()
     if refresh and opencode_bin:
         try:
             proc = subprocess.run(
@@ -1674,7 +1686,7 @@ class ModelRouter:
                 "VIOLAZIONE VINCOLO PRIVACY: OpenCode Zen Free usa endpoint remoti OpenCode. "
                 "L'invio di dati documentali a provider remoti è bloccato per impostazione predefinita."
             )
-        opencode_bin = shutil.which("opencode")
+        opencode_bin = _resolve_opencode_binary()
         if not opencode_bin:
             raise RuntimeError("Binario `opencode` CLI non trovato nel PATH.")
 
@@ -1694,25 +1706,62 @@ class ModelRouter:
             "fornito, senza usare file locali o strumenti esterni."
         )
 
-        with tempfile.TemporaryDirectory(prefix="hv_opencode_") as tmpdir:
+        # Isolate OpenCode data/state/config in a disposable directory and deny all tools/MCPs
+        # so document prompts neither trigger host tools nor persist in global `opencode.db`.
+        hardened_config = json.dumps({
+            "permission": {"*": "deny"},
+            "mcp": {},
+            "agent": {
+                "build": {"permission": {"*": "deny"}},
+                "plan": {"permission": {"*": "deny"}},
+            },
+        })
+        tmpdir = tempfile.mkdtemp(prefix="hv_opencode_")
+        try:
+            work_dir = os.path.join(tmpdir, "work")
+            data_dir = os.path.join(tmpdir, "data")
+            state_dir = os.path.join(tmpdir, "state")
+            config_dir = os.path.join(tmpdir, "config")
+            for subdir in (work_dir, data_dir, state_dir, config_dir):
+                os.makedirs(subdir, exist_ok=True)
+
+            child_env = os.environ.copy()
+            child_env["XDG_DATA_HOME"] = data_dir
+            child_env["XDG_STATE_HOME"] = state_dir
+            child_env["XDG_CONFIG_HOME"] = config_dir
+            child_env["OPENCODE_CONFIG_CONTENT"] = hardened_config
+
             cmd = [
                 opencode_bin,
                 "run",
                 "-m", target_model,
                 "--pure",
                 "--format", "json",
-                "--dir", tmpdir,
+                "--dir", work_dir,
                 instruction,
             ]
-            proc = subprocess.run(
-                cmd,
-                cwd=tmpdir,
-                input=combined_prompt,
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                timeout=max(30, int(getattr(self, "timeout", 120) or 120)),
-            )
+            timeout_sec = max(30, int(getattr(self, "timeout", 120) or 120))
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=work_dir,
+                    env=child_env,
+                    input=combined_prompt,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    timeout=timeout_sec,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raw_err = exc.stderr
+                if isinstance(raw_err, (bytes, bytearray)):
+                    stderr_hint = raw_err.decode("utf-8", errors="replace").strip()
+                else:
+                    stderr_hint = (raw_err or "").strip()
+                detail = stderr_hint[-250:] if stderr_hint else f"timeout dopo {timeout_sec}s"
+                raise RuntimeError(f"Timeout OpenCode CLI (`opencode run`): {detail}") from exc
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
         text_chunks: List[str] = []
         event_errors: List[str] = []

@@ -1010,6 +1010,7 @@ def test_codex_native_oauth_catalog_live_and_cache_invalidation(monkeypatch):
 def test_opencode_free_privacy_discovery_and_cli_ndjson(monkeypatch):
     """OpenCode Free uses opencode CLI discovery, blocks allow_remote=False, and parses NDJSON events."""
     import json
+    import os
     import types
     from hermes_voice import model_router as mr
 
@@ -1017,8 +1018,17 @@ def test_opencode_free_privacy_discovery_and_cli_ndjson(monkeypatch):
     monkeypatch.setattr(mr.shutil, "which", lambda name: "opencode" if name == "opencode" else None)
 
     seen_cmds = []
+    orig_run = mr.subprocess.run
+
+    def _is_opencode_cmd(cmd):
+        if not isinstance(cmd, (list, tuple)) or not cmd:
+            return False
+        exe_name = os.path.basename(str(cmd[0])).lower()
+        return exe_name in ("opencode", "opencode.cmd", "opencode.exe")
 
     def fake_run(cmd, **kwargs):
+        if not _is_opencode_cmd(cmd):
+            return orig_run(cmd, **kwargs)
         seen_cmds.append((cmd, kwargs))
         if len(cmd) >= 3 and cmd[1] == "models" and cmd[2] == "opencode":
             return types.SimpleNamespace(
@@ -1082,14 +1092,30 @@ def test_opencode_free_privacy_discovery_and_cli_ndjson(monkeypatch):
     assert "Sii conciso." in run_kwargs["input"]
     assert "Cosa dice il contratto?" in run_kwargs["input"]
 
+    # Verify per-request disposable XDG isolation + strict tool/MCP denial config
+    child_env = run_kwargs["env"]
+    work_cwd = run_kwargs["cwd"]
+    isolation_root = os.path.dirname(work_cwd)
+    assert child_env["XDG_DATA_HOME"] == os.path.join(isolation_root, "data")
+    assert child_env["XDG_STATE_HOME"] == os.path.join(isolation_root, "state")
+    assert child_env["XDG_CONFIG_HOME"] == os.path.join(isolation_root, "config")
+    hardened_cfg = json.loads(child_env["OPENCODE_CONFIG_CONTENT"])
+    assert hardened_cfg["permission"] == {"*": "deny"}
+    assert hardened_cfg["mcp"] == {}
+    assert hardened_cfg["agent"]["build"]["permission"] == {"*": "deny"}
+
     # Error event from CLI surfaces cleanly
     monkeypatch.setattr(
         mr.subprocess,
         "run",
-        lambda cmd, **kw: types.SimpleNamespace(
-            returncode=1,
-            stdout=json.dumps({"type": "error", "error": {"name": "RateLimit", "data": {"message": "Free limit reached"}}}),
-            stderr="",
+        lambda cmd, **kw: (
+            types.SimpleNamespace(
+                returncode=1,
+                stdout=json.dumps({"type": "error", "error": {"name": "RateLimit", "data": {"message": "Free limit reached"}}}),
+                stderr="",
+            )
+            if _is_opencode_cmd(cmd)
+            else orig_run(cmd, **kw)
         ),
     )
     with pytest.raises(RuntimeError, match="Free limit reached"):
