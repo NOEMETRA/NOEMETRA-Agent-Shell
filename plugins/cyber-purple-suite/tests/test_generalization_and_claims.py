@@ -441,3 +441,57 @@ def test_llm_full_analysis_override_updates_claims_chain_and_simulations():
     assert clean_blue.sigma_rule.detection_keywords == ["llm-beacon"]
     assert verdict.diagnosis.status == "OPEN_HYPOTHESIS"
     assert verdict.simulation.status == "COVERAGE_COMPLETE"
+
+
+def test_patch_verification_multi_route_surface_isolation_and_new_threat_preservation(tmp_path):
+    assistant = CyberPurpleAssistant(home_dir=tmp_path, allow_remote=False, use_llm=False)
+
+    # 1) Multi-route code artifact: omitting Route B while fixing Route A must NEVER return VERIFIED_FIXED
+    two_routes = (
+        '@app.get("/api/v1/export")\n'
+        'def export_data(tid: str): query = f"SELECT * FROM t WHERE id={tid}"\n'
+        '@app.get("/api/v1/admin")\n'
+        'def admin_search(q: str): query = f"SELECT * FROM audit WHERE q={q}"\n'
+    )
+    orig = assistant.analyze_custom(title="Two Vulnerable Routes", content=two_routes, source_kind="code")
+    only_route_a_fixed = (
+        '@app.get("/api/v1/export")\n'
+        'def export_data(tid: str): return db.execute("SELECT * FROM t WHERE id = ?", (tid,)).fetchall()\n'
+    )
+    res_omitted = assistant.verify_case_update(
+        case_id=orig.case_id,
+        mode="verify_patch",
+        content=only_route_a_fixed,
+    )
+    assert res_omitted.verdict.remediation_verification.status != "VERIFIED_FIXED"
+    assert len(res_omitted.verdict.remediation_verification.remaining_open_claim_ids) >= 1
+
+    # 2) Patch resolves /api/v1/export, omits container manifest (CLM-03), and adds a new active threat (/api/v1/debug)
+    vuln_chain = assistant.analyze_scenario("scen-03-sqli-ssrf-code-chain")
+    mixed_patch = (
+        '@app.get("/api/v1/export")\n'
+        'def export_customer_report(tenant_id: str, webhook_url: str):\n'
+        '    rows = db.execute("SELECT id, webhook_url FROM reports WHERE tenant_id = ?", (tenant_id,)).fetchall()\n'
+        '    validate_https_public_allowlist(webhook_url)\n'
+        '    return requests.get(webhook_url, timeout=3, allow_redirects=False).text\n'
+        '@app.get("/api/v1/debug")\n'
+        'def debug_exec(cmd: str):\n'
+        '    return os.system(cmd)\n'
+    )
+    res_mixed = assistant.verify_case_update(
+        case_id=vuln_chain.case_id,
+        mode="verify_patch",
+        content=mixed_patch,
+    )
+    rem = res_mixed.verdict.remediation_verification
+    assert rem.status == "PARTIALLY_MITIGATED"
+    # Omitted CLM-03 (T1611 container_priv) AND new /api/v1/debug sink must BOTH survive in saved claims
+    assert any(c.technique_id == "T1611" for c in res_mixed.red_report.claims)
+    assert any("os.system" in c.observed_fact or "/api/v1/debug" in str(c.subject_entities) for c in res_mixed.red_report.claims)
+    assert len(rem.remaining_open_claim_ids) >= 2
+    # All reported added_evidence_ids must actually exist in saved ingestion evidences and match submitted patch
+    saved_by_id = {ev.evidence_id: ev for ev in res_mixed.ingestion.evidences}
+    assert len(rem.added_evidence_ids) == 8
+    assert all(eid in saved_by_id for eid in rem.added_evidence_ids)
+    assert any("/api/v1/debug" in saved_by_id[eid].raw_content for eid in rem.added_evidence_ids)
+

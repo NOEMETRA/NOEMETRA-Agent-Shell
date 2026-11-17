@@ -53,13 +53,16 @@ def _claims_semantically_match(c1: AnalyticalClaim, c2: AnalyticalClaim) -> bool
     if h1 and h2 and h1.isdisjoint(h2):
         return False
 
+    e1 = {x.split("?", 1)[0].lower() for x in c1.subject_entities.get("endpoints", []) if x}
+    e2 = {x.split("?", 1)[0].lower() for x in c2.subject_entities.get("endpoints", []) if x}
+    if e1 and e2 and e1.isdisjoint(e2):
+        return False
+
     if not (h1 and h2):
         i1 = {x.lower() for x in c1.subject_entities.get("ips", []) if x}
         i2 = {x.lower() for x in c2.subject_entities.get("ips", []) if x}
         u1 = {x.lower() for x in c1.subject_entities.get("users", []) if x}
         u2 = {x.lower() for x in c2.subject_entities.get("users", []) if x}
-        e1 = {x.lower() for x in c1.subject_entities.get("endpoints", []) if x}
-        e2 = {x.lower() for x in c2.subject_entities.get("endpoints", []) if x}
         if i1 and i2 and i1.isdisjoint(i2) and not (u1 & u2) and not (e1 & e2):
             return False
         if u1 and u2 and u1.isdisjoint(u2) and not (e1 & e2) and not (i1 & i2):
@@ -79,37 +82,94 @@ def _extract_func_defs(ing: ArtifactIngestionResult) -> Set[str]:
     return defs
 
 
+def _map_evidence_to_surface_blocks(
+    ing: ArtifactIngestionResult,
+) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    """Partition artifact evidences into logical route/function/config/host surface blocks."""
+    ev_to_block: Dict[str, int] = {}
+    blocks: List[Dict[str, Any]] = []
+
+    def _new_block(kind: str = "generic") -> int:
+        idx = len(blocks)
+        blocks.append({
+            "kind": kind,
+            "routes": set(),
+            "funcs": set(),
+            "hosts": set(),
+            "controls": set(),
+            "sinks": set(),
+        })
+        return idx
+
+    cur_idx = _new_block()
+    has_func_in_cur = False
+
+    for ev in ing.evidences:
+        if ev.is_benign_baseline:
+            continue
+        raw = ev.raw_content.strip()
+        low = raw.lower()
+        routes = {ep.split("?", 1)[0] for ep in ev.entities.get("endpoints", []) if ep.startswith("/")}
+        func_m = re.search(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)", raw)
+        is_decorator = raw.startswith("@")
+        is_config_line = ev.source_type == "config" or low.startswith(("apiversion:", "kind:", "# deploy/", "privileged:", "allowprivilegeescalation:"))
+
+        if is_decorator and has_func_in_cur:
+            cur_idx = _new_block("code")
+            has_func_in_cur = False
+        elif func_m and has_func_in_cur:
+            cur_idx = _new_block("code")
+            has_func_in_cur = False
+        elif is_config_line and blocks[cur_idx]["kind"] != "config":
+            cur_idx = _new_block("config")
+            has_func_in_cur = False
+        elif not is_config_line and blocks[cur_idx]["kind"] == "config":
+            cur_idx = _new_block(ev.source_type)
+            has_func_in_cur = False
+        elif low.startswith(("apiversion:", "kind:")):
+            if blocks[cur_idx]["controls"] or blocks[cur_idx]["sinks"]:
+                cur_idx = _new_block("config")
+                has_func_in_cur = False
+
+        blk = blocks[cur_idx]
+        if is_config_line:
+            blk["kind"] = "config"
+        elif is_decorator or func_m or ev.source_type == "code":
+            if blk["kind"] == "generic":
+                blk["kind"] = "code"
+
+        blk["routes"].update(routes)
+        if func_m:
+            blk["funcs"].add(func_m.group(1).lower())
+            has_func_in_cur = True
+        for h in ev.entities.get("hosts", []):
+            if h:
+                blk["hosts"].add(h.lower())
+        blk["controls"].update(ev.entities.get("controls", []))
+        blk["sinks"].update(ev.entities.get("sinks", []))
+        ev_to_block[ev.evidence_id] = cur_idx
+
+    return ev_to_block, blocks
+
+
 def _is_claim_remediated_by_patch(
     orig_claim: AnalyticalClaim,
     orig_ing: ArtifactIngestionResult,
     patched_ing: ArtifactIngestionResult,
     new_active: List[AnalyticalClaim],
 ) -> bool:
-    """Confirm an original threat claim is both absent from new_active and genuinely mitigated on its original surface."""
+    """Confirm every surface block cited by an original claim is absent from new_active and mitigated on its own block."""
     if any(_claims_semantically_match(orig_claim, nc) for nc in new_active):
         return False
 
+    orig_ev_to_blk, orig_blocks = _map_evidence_to_surface_blocks(orig_ing)
+    _, patched_blocks = _map_evidence_to_surface_blocks(patched_ing)
+
     claim_evs = [ev for ev in orig_ing.evidences if ev.evidence_id in orig_claim.evidence_ids]
     claim_sinks = {s for ev in claim_evs for s in ev.entities.get("sinks", [])}
-
-    orig_routes = {
-        ep for ev in orig_ing.evidences if not ev.is_benign_baseline for ep in ev.entities.get("endpoints", []) if ep.startswith("/")
-    }
-    patched_routes = {
-        ep for ev in patched_ing.evidences for ep in ev.entities.get("endpoints", []) if ep.startswith("/")
-    }
-    orig_hosts = {h.lower() for h in orig_claim.subject_entities.get("hosts", []) if h}
-    patched_hosts = {h.lower() for ev in patched_ing.evidences for h in ev.entities.get("hosts", []) if h}
-    orig_defs = _extract_func_defs(orig_ing)
-    patched_defs = _extract_func_defs(patched_ing)
-    patched_controls = {ctrl for ev in patched_ing.evidences for ctrl in ev.entities.get("controls", [])}
-
-    if orig_hosts and not (orig_hosts & patched_hosts):
-        return False
-
-    if orig_routes and "container_priv" not in claim_sinks and orig_claim.technique_id != "T1611":
-        if not (orig_routes & patched_routes) and not (orig_defs and (orig_defs & patched_defs)):
-            return False
+    claim_blk_ids = sorted({orig_ev_to_blk[eid] for eid in orig_claim.evidence_ids if eid in orig_ev_to_blk})
+    claim_blocks = [orig_blocks[bid] for bid in claim_blk_ids]
+    claim_hosts = {h.lower() for h in orig_claim.subject_entities.get("hosts", []) if h}
 
     required_for_sink = {
         "sql_concat": "parameterized_sql",
@@ -118,18 +178,59 @@ def _is_claim_remediated_by_patch(
         "cmd_exec": "input_validation",
         "deserialization": "input_validation",
     }
-    if claim_sinks:
-        return all(required_for_sink[s] in patched_controls for s in claim_sinks if s in required_for_sink)
 
-    if orig_claim.technique_id == "T1552.005":
-        return "url_allowlist" in patched_controls
-    if orig_claim.technique_id == "T1611":
-        return "privilege_dropped" in patched_controls
-    if orig_claim.technique_id == "T1190":
-        return "parameterized_sql" in patched_controls or "input_validation" in patched_controls
+    def _block_is_mitigated(blk: Optional[Dict[str, Any]], expected_sinks: Set[str]) -> bool:
+        blk_routes = blk["routes"] if blk else set()
+        blk_funcs = blk["funcs"] if blk else set()
+        blk_hosts = (blk["hosts"] if blk else set()) | claim_hosts
+        is_container_blk = "container_priv" in expected_sinks or orig_claim.technique_id == "T1611"
 
-    has_surface = bool((orig_hosts & patched_hosts) or (orig_routes & patched_routes) or (orig_defs & patched_defs))
-    return has_surface and bool(patched_controls)
+        matched_patched: List[Dict[str, Any]] = []
+        for p_blk in patched_blocks:
+            if not (p_blk["controls"] or p_blk["sinks"] or p_blk["routes"] or p_blk["funcs"] or p_blk["hosts"]):
+                continue
+            if blk_hosts and p_blk["hosts"] and blk_hosts.isdisjoint(p_blk["hosts"]):
+                continue
+            if is_container_blk:
+                if p_blk["kind"] == "config" or "privilege_dropped" in p_blk["controls"]:
+                    matched_patched.append(p_blk)
+                continue
+            if blk_routes or blk_funcs or blk_hosts:
+                route_hit = bool(blk_routes and (blk_routes & p_blk["routes"]))
+                func_hit = bool(blk_funcs and (blk_funcs & p_blk["funcs"]))
+                host_hit = bool(blk_hosts and (blk_hosts & p_blk["hosts"]))
+                if route_hit or func_hit or host_hit:
+                    matched_patched.append(p_blk)
+            else:
+                matched_patched.append(p_blk)
+
+        if not matched_patched:
+            return False
+
+        local_controls: Set[str] = {ctrl for pb in matched_patched for ctrl in pb["controls"]}
+        if expected_sinks:
+            return all(required_for_sink[s] in local_controls for s in expected_sinks if s in required_for_sink)
+        if orig_claim.technique_id == "T1552.005":
+            return "url_allowlist" in local_controls
+        if orig_claim.technique_id == "T1611":
+            return "privilege_dropped" in local_controls
+        if orig_claim.technique_id == "T1190":
+            return "parameterized_sql" in local_controls or "input_validation" in local_controls
+        return bool(local_controls)
+
+    if claim_blocks:
+        # Verify EVERY surface block cited by the claim (never let an unrelated route satisfy an omitted block)
+        for bid in claim_blk_ids:
+            blk = orig_blocks[bid]
+            blk_evs = [ev for ev in claim_evs if orig_ev_to_blk.get(ev.evidence_id) == bid]
+            blk_sinks = {s for ev in blk_evs for s in ev.entities.get("sinks", [])}
+            # Fallback to claim_sinks if a claim matched non-sink records in the same block
+            expected_sinks = blk_sinks or (claim_sinks if len(claim_blk_ids) == 1 else set())
+            if blk_evs and not _block_is_mitigated(blk, expected_sinks):
+                return False
+        return True
+
+    return _block_is_mitigated(None, claim_sinks)
 
 
 def _naive_single_agent_verdict(artifact_text: str) -> VerdictType:
@@ -474,19 +575,79 @@ class CyberPurpleAssistant:
 
             if orig_active and len(resolved_ids) == len(orig_active) and len(new_active) == 0:
                 rem_status = "VERIFIED_FIXED"
-            elif resolved_ids:
-                rem_status = "PARTIALLY_MITIGATED"
+                updated = candidate
+                added_ids = [ev.evidence_id for ev in candidate.ingestion.evidences]
+                remaining_ids = []
             else:
-                rem_status = "STILL_VULNERABLE"
+                rem_status = "PARTIALLY_MITIGATED" if resolved_ids else "STILL_VULNERABLE"
+                unmatched_unresolved = [
+                    orig_c
+                    for orig_c in unresolved_orig
+                    if not any(_claims_semantically_match(orig_c, nc) for nc in new_active)
+                ]
 
-            if unresolved_orig and len(new_active) == 0:
-                # Submitted snippet omitted or failed to cover all original vulnerable surfaces:
-                # preserve original forensic ingestion records alongside unresolved claims.
-                remaining_ids = [c.claim_id for c in unresolved_orig]
-                sup_ids = [c.claim_id for c in unresolved_orig if c.status == "supported"]
-                open_ids = [c.claim_id for c in unresolved_orig if c.status == "open"]
-                diag_status = "CONFIRMED_THREAT" if sup_ids else "OPEN_HYPOTHESIS"
-                preserved_diag = orig_report.verdict.diagnosis.model_copy(
+                orig_evs = list(orig_report.ingestion.evidences)
+                base_seq = len(orig_evs)
+                cand_eid_map: Dict[str, str] = {}
+                appended_evs = []
+                for offset, cev in enumerate(candidate.ingestion.evidences, start=1):
+                    new_eid = f"EV-{base_seq + offset:04d}"
+                    cand_eid_map[cev.evidence_id] = new_eid
+                    appended_evs.append(
+                        cev.model_copy(update={"evidence_id": new_eid, "line_or_seq": base_seq + offset})
+                    )
+
+                merged_ingestion = orig_report.ingestion.model_copy(
+                    update={
+                        "total_records": len(orig_evs) + len(appended_evs),
+                        "evidences": [*orig_evs, *appended_evs],
+                    }
+                )
+                added_ids = [cev.evidence_id for cev in appended_evs]
+
+                shifted_new_active: List[AnalyticalClaim] = []
+                used_cids = {c.claim_id for c in unmatched_unresolved}
+                next_idx = 1
+                for nc in new_active:
+                    cid = nc.claim_id
+                    while not cid or cid in used_cids:
+                        cid = f"CLM-{next_idx:02d}"
+                        next_idx += 1
+                    used_cids.add(cid)
+                    shifted_new_active.append(
+                        nc.model_copy(
+                            update={
+                                "claim_id": cid,
+                                "evidence_ids": [cand_eid_map.get(eid, eid) for eid in nc.evidence_ids],
+                            }
+                        )
+                    )
+
+                combined_claims = [*shifted_new_active, *unmatched_unresolved]
+                remaining_ids = [c.claim_id for c in combined_claims]
+                sup_ids = [c.claim_id for c in combined_claims if c.status == "supported"]
+                open_ids = [c.claim_id for c in combined_claims if c.status == "open"]
+
+                base_verdict_source = candidate if new_active else orig_report
+                has_code = (
+                    orig_report.ingestion.source_kind in ("code", "config")
+                    or candidate.ingestion.source_kind in ("code", "config")
+                )
+                if sup_ids:
+                    eff_verdict = (
+                        VerdictType.EXPLOITABLE_CHAIN
+                        if (has_code and len(sup_ids) >= 2)
+                        else VerdictType.CONFIRMED_ATTACK
+                    )
+                    diag_status = "CONFIRMED_THREAT"
+                elif open_ids:
+                    eff_verdict = VerdictType.INSUFFICIENT_EVIDENCE
+                    diag_status = "OPEN_HYPOTHESIS"
+                else:
+                    eff_verdict = base_verdict_source.verdict.verdict
+                    diag_status = "OPEN_HYPOTHESIS"
+
+                merged_diag = base_verdict_source.verdict.diagnosis.model_copy(
                     update={
                         "status": diag_status,
                         "supported_claims_count": len(sup_ids),
@@ -494,26 +655,37 @@ class CyberPurpleAssistant:
                         "supported_claim_ids": sup_ids,
                         "open_claim_ids": open_ids,
                         "summary": (
-                            f"{len(unresolved_orig)} original threat claim(s) remain unverified or missing from submitted patch."
+                            f"{len(combined_claims)} unresolved/new threat claim(s) remain active after patch check."
                         ),
                     }
                 )
-                updated = orig_report.model_copy(
+                merged_red = base_verdict_source.red_report.model_copy(
                     update={
-                        "red_report": orig_report.red_report.model_copy(update={"claims": unresolved_orig}),
-                        "verdict": orig_report.verdict.model_copy(update={"diagnosis": preserved_diag}),
+                        "claims": combined_claims,
+                        "cited_evidence_ids": list(
+                            dict.fromkeys([eid for c in combined_claims for eid in c.evidence_ids])
+                        ),
                     }
                 )
-            else:
-                updated = candidate
-                remaining_ids = [c.claim_id for c in new_active] or [c.claim_id for c in unresolved_orig]
+                updated = base_verdict_source.model_copy(
+                    update={
+                        "ingestion": merged_ingestion,
+                        "red_report": merged_red,
+                        "verdict": base_verdict_source.verdict.model_copy(
+                            update={
+                                "verdict": eff_verdict,
+                                "diagnosis": merged_diag,
+                            }
+                        ),
+                    }
+                )
 
             after_v = updated.verdict.verdict
             rem_summary = RemediationVerificationSummary(
                 status=rem_status,  # type: ignore[arg-type]
                 verified_at=datetime.now(timezone.utc).isoformat(),
                 verification_source="verify_patch",
-                added_evidence_ids=[ev.evidence_id for ev in candidate.ingestion.evidences],
+                added_evidence_ids=added_ids,
                 resolved_claim_ids=resolved_ids,
                 remaining_open_claim_ids=remaining_ids,
                 before_verdict=orig_report.verdict.verdict,
