@@ -174,13 +174,12 @@ def _is_contradiction_entity_coherent(
                 if val:
                     t_ents[k].add(val.lower())
 
-    shared_ip = bool(c_ents["ips"] and t_ents["ips"] and (c_ents["ips"] & t_ents["ips"]))
-    shared_user = bool(c_ents["users"] and t_ents["users"] and (c_ents["users"] & t_ents["users"]))
-
-    # Strict cross-host rejection: evidence from Host A cannot refute/weaken a claim on distinct Host B
+    # Strict cross-host rejection: evidence from Host A cannot refute/weaken a claim on distinct Host B,
+    # even if both hosts happen to use the same service account or IP address.
     if c_ents["hosts"] and t_ents["hosts"] and c_ents["hosts"].isdisjoint(t_ents["hosts"]):
-        if not (shared_ip or shared_user):
-            return False
+        return False
+
+    shared_user = bool(c_ents["users"] and t_ents["users"] and (c_ents["users"] & t_ents["users"]))
 
     # Reject refutations/weakenings between disjoint IPs or disjoint user accounts when hosts do not bridge them
     if contra.impact_on_hypothesis in ("refutes", "weakens") and not (c_ents["hosts"] & t_ents["hosts"]):

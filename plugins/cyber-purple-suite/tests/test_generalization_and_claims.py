@@ -193,6 +193,51 @@ def test_generalization_mixed_legitimate_and_malicious_hosts_and_cross_host_cont
     assert clean_red.claims[0].status == "supported"
     assert verdict.verdict == VerdictType.CONFIRMED_ATTACK
 
+    # 3) Distinct hosts that SHARE the same service user account must STILL reject cross-host refutation
+    ing_shared = observer.ingest_text(
+        '2026-11-17T12:10:00Z host=web-prod-04 user=svc_shared proc=vssadmin.exe cmd="vssadmin delete shadows /all /quiet" signature_verified=false\n'
+        '2026-11-17T12:10:05Z host=srv-backup-01 user=svc_shared proc=borgbackup signature_verified=true auth=ChangeControl zone=AUTHORIZED_BACKUP_VLAN\n',
+        title="Shared User Cross-Host Check",
+        source_kind="log",
+    )
+    red_shared = RedOperationPlan(
+        primary_hypothesis="Shadow wipe on web-prod-04",
+        confidence=0.88,
+        claims=[
+            AnalyticalClaim(
+                claim_id="CLM-01",
+                step_index=0,
+                tactic="Impact",
+                technique_id="T1490",
+                observed_fact="[EV-0001] web-prod-04 unsigned vssadmin delete shadows by svc_shared",
+                evidence_ids=["EV-0001"],
+                subject_entities={"hosts": ["web-prod-04"], "users": ["svc_shared"]},
+                proposed_interpretation="Unauthorized ransomware shadow wipe on web-prod-04",
+                missing_conditions=[],
+                confirming_or_refuting_proof="Verify binary signature on web-prod-04.",
+                status="supported",
+            )
+        ],
+        cited_evidence_ids=["EV-0001"],
+    )
+    blue_shared = BlueInvestigatorAgent().analyze(ing_shared, red_shared)[0].model_copy(update={
+        "contradictions": [
+            ContradictionItem(
+                claim_challenged="Shadow wipe on web-prod-04",
+                target_claim_id="CLM-01",
+                target_evidence_ids=["EV-0001"],
+                contradicting_evidence_ids=["EV-0002"],
+                explanation="Signed backup for svc_shared observed on srv-backup-01.",
+                impact_on_hypothesis="refutes",
+            )
+        ]
+    })
+    clean_red_s, clean_blue_s, verdict_s = PurpleVerifier().verify(ing_shared, red_shared, blue_shared)
+    assert clean_blue_s.contradictions[0].entity_coherent is False
+    assert len(verdict_s.incoherent_contradictions_rejected) == 1
+    assert clean_red_s.claims[0].status == "supported"
+    assert verdict_s.verdict == VerdictType.CONFIRMED_ATTACK
+
 
 def test_separation_of_diagnosis_simulation_and_remediation_verification_loop(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
@@ -268,6 +313,60 @@ def test_separation_of_diagnosis_simulation_and_remediation_verification_loop(tm
     assert rem["status"] == "VERIFIED_FIXED"
     assert res_fixed.json()["verdict"]["diagnosis"]["status"] == "NO_THREAT_EVIDENCE"
     assert rem["after_verdict"] == "INSUFFICIENT_EVIDENCE"
+
+    # Phase C: Unrelated or incomplete patch submissions must NOT declare VERIFIED_FIXED
+    fresh_vuln = assistant.analyze_scenario("scen-03-sqli-ssrf-code-chain")
+    assert len(fresh_vuln.red_report.claims) == 3
+
+    unrelated_check = assistant.verify_case_update(
+        case_id=fresh_vuln.case_id,
+        mode="verify_patch",
+        content="GET /health status=200",
+    )
+    assert unrelated_check.verdict.remediation_verification.status == "STILL_VULNERABLE"
+    assert unrelated_check.verdict.remediation_verification.resolved_claim_ids == []
+    assert len(unrelated_check.verdict.remediation_verification.remaining_open_claim_ids) == 3
+    assert unrelated_check.verdict.verdict == VerdictType.EXPLOITABLE_CHAIN
+
+    incomplete_patch = (
+        '@app.get("/api/v1/export")\n'
+        'def export_customer_report(tenant_id: str, webhook_url: str):\n'
+        '    rows = db.execute("SELECT id, webhook_url FROM reports WHERE tenant_id = ?", (tenant_id,)).fetchall()\n'
+        '    validate_https_public_allowlist(webhook_url)\n'
+        '    meta = requests.get(webhook_url, timeout=3, allow_redirects=False).text\n'
+    )
+    incomplete_check = assistant.verify_case_update(
+        case_id=fresh_vuln.case_id,
+        mode="verify_patch",
+        content=incomplete_patch,
+    )
+    assert incomplete_check.verdict.remediation_verification.status == "PARTIALLY_MITIGATED"
+    assert "CLM-03" in incomplete_check.verdict.remediation_verification.remaining_open_claim_ids
+    assert incomplete_check.verdict.verdict != VerdictType.FALSE_POSITIVE_BENIGN
+
+    # Phase D: Semantic claim identity survives ordinal CLM-xx shifts when append_evidence adds earlier tracks
+    shift_open = assistant.analyze_custom(
+        title="Claim Shift Check",
+        content='2026-11-17T10:00:00Z host=app-shift-01 proc=worker qtype=TXT query="ping.example.net"',
+        source_kind="log",
+    )
+    assert shift_open.red_report.claims[0].claim_id == "CLM-01"
+    assert shift_open.red_report.claims[0].status == "open"
+    shifted = assistant.verify_case_update(
+        case_id=shift_open.case_id,
+        mode="append_evidence",
+        content=(
+            '@app.get("/api/v1/export")\n'
+            'def export_shift(t, url): return requests.get(url).text + f"SELECT * FROM t WHERE id={t}"'
+        ),
+    )
+    # Track 1 shifts the original Exfiltration/DNS TXT claim from CLM-01 -> CLM-03; it is still open!
+    assert shifted.verdict.remediation_verification.resolved_claim_ids == []
+    assert any(
+        c.tactic == "Exfiltration" and c.claim_id != "CLM-01" and c.claim_id in shifted.verdict.remediation_verification.remaining_open_claim_ids
+        for c in shifted.red_report.claims
+    )
+
     reset_cyber_assistants()
 
 
