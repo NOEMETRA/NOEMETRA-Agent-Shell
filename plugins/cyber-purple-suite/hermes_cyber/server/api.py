@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
@@ -59,6 +59,12 @@ class ReplayTuneRequest(BaseModel):
     case_id: str
     detection_keywords: List[str]
     exclude_values: List[str] = []
+
+
+class CaseVerifyRequest(BaseModel):
+    case_id: str
+    content: str
+    mode: Literal["append_evidence", "verify_patch"] = "verify_patch"
 
 
 class ArenaConfigRequest(BaseModel):
@@ -135,6 +141,25 @@ async def rerun_purple_replay(req: ReplayTuneRequest, request: Request):
         return replay.model_dump(mode="json")
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/verify")
+async def verify_cyber_case_update(req: CaseVerifyRequest, request: Request):
+    assistant = _req_assistant(request)
+    try:
+        report = await asyncio.to_thread(
+            assistant.verify_case_update,
+            case_id=req.case_id,
+            content=req.content,
+            mode=req.mode,
+        )
+        return report.model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @router.post("/benchmark")

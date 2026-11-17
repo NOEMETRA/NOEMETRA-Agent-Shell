@@ -47,6 +47,28 @@ class MitreStep(BaseModel):
     description: str
     evidence_ids: List[str] = Field(default_factory=list)
     reachability_proof: str = ""
+    claim_id: str = ""
+    observed_fact: str = ""
+    proposed_interpretation: str = ""
+    missing_conditions: List[str] = Field(default_factory=list)
+    confirming_or_refuting_proof: str = ""
+    status: Literal["supported", "open", "refuted"] = "open"
+
+
+class AnalyticalClaim(BaseModel):
+    """Structured claim separating verbatim observed facts from hypotheses and missing proof."""
+
+    claim_id: str
+    step_index: int = 0
+    tactic: str = ""
+    technique_id: str = ""
+    observed_fact: str
+    evidence_ids: List[str] = Field(default_factory=list)
+    subject_entities: Dict[str, List[str]] = Field(default_factory=dict)
+    proposed_interpretation: str
+    missing_conditions: List[str] = Field(default_factory=list)
+    confirming_or_refuting_proof: str
+    status: Literal["supported", "open", "refuted"] = "open"
 
 
 class RedProbe(BaseModel):
@@ -69,6 +91,7 @@ class SimulatedAttackEvent(BaseModel):
     log_line: str
     fields: Dict[str, Any] = Field(default_factory=dict)
     mitre_technique_id: str = ""
+    claim_id: str = ""
 
 
 class RedOperationPlan(BaseModel):
@@ -77,6 +100,7 @@ class RedOperationPlan(BaseModel):
     primary_hypothesis: str
     confidence: float = Field(ge=0.0, le=1.0)
     kill_chain: List[MitreStep] = Field(default_factory=list)
+    claims: List[AnalyticalClaim] = Field(default_factory=list)
     blind_spots: List[str] = Field(default_factory=list)
     probes: List[RedProbe] = Field(default_factory=list)
     simulated_events: List[SimulatedAttackEvent] = Field(default_factory=list)
@@ -88,9 +112,12 @@ class ContradictionItem(BaseModel):
     """Adversarial finding challenging or contextualizing the primary threat hypothesis."""
 
     claim_challenged: str
+    target_claim_id: Optional[str] = None
+    target_evidence_ids: List[str] = Field(default_factory=list)
     contradicting_evidence_ids: List[str] = Field(default_factory=list)
     explanation: str
     impact_on_hypothesis: Literal["refutes", "weakens", "contextualizes"] = "weakens"
+    entity_coherent: bool = True
 
 
 class SigmaRuleSpec(BaseModel):
@@ -158,6 +185,45 @@ class PurpleReplayReport(BaseModel):
     defense_gaps: List[str] = Field(default_factory=list)
 
 
+class DiagnosisSummary(BaseModel):
+    """Explicit separation of clinical/forensic diagnosis from simulation and patch verification."""
+
+    status: Literal["CONFIRMED_THREAT", "REFUTED_FALSE_POSITIVE", "OPEN_HYPOTHESIS", "NO_THREAT_EVIDENCE"] = "OPEN_HYPOTHESIS"
+    supported_claims_count: int = 0
+    open_claims_count: int = 0
+    refuted_claims_count: int = 0
+    supported_claim_ids: List[str] = Field(default_factory=list)
+    open_claim_ids: List[str] = Field(default_factory=list)
+    refuted_claim_ids: List[str] = Field(default_factory=list)
+    missing_conditions_summary: List[str] = Field(default_factory=list)
+    next_required_proofs: List[str] = Field(default_factory=list)
+    summary: str = ""
+
+
+class SimulationSummary(BaseModel):
+    """Detection simulation stage outcome evaluating rules against synthetic attacks and baselines."""
+
+    status: Literal["COVERAGE_COMPLETE", "COVERAGE_PARTIAL", "FALSE_POSITIVE_RISK", "NOT_APPLICABLE"] = "NOT_APPLICABLE"
+    detection_coverage: float = 0.0
+    evasion_caught_rate: float = 0.0
+    false_positive_rate: float = 0.0
+    summary: str = ""
+
+
+class RemediationVerificationSummary(BaseModel):
+    """Post-remediation or incremental evidence update verification state."""
+
+    status: Literal["UNVERIFIED", "VERIFIED_FIXED", "PARTIALLY_MITIGATED", "STILL_VULNERABLE", "EVIDENCE_UPDATED"] = "UNVERIFIED"
+    verified_at: Optional[str] = None
+    verification_source: str = ""
+    added_evidence_ids: List[str] = Field(default_factory=list)
+    resolved_claim_ids: List[str] = Field(default_factory=list)
+    remaining_open_claim_ids: List[str] = Field(default_factory=list)
+    before_verdict: Optional[VerdictType] = None
+    after_verdict: Optional[VerdictType] = None
+    summary: str = "Pending post-remediation check or additional evidence submission."
+
+
 class PurpleVerdict(BaseModel):
     """Final deterministic arbitration combining citation verification, contradictions, and replay."""
 
@@ -168,9 +234,13 @@ class PurpleVerdict(BaseModel):
     hypothesis_b_support: float = Field(ge=0.0, le=1.0)
     verified_citations: List[str] = Field(default_factory=list)
     hallucinated_citations_removed: List[str] = Field(default_factory=list)
+    incoherent_contradictions_rejected: List[str] = Field(default_factory=list)
     discriminating_test: str
     rationale: str
     replay: PurpleReplayReport
+    diagnosis: DiagnosisSummary = Field(default_factory=DiagnosisSummary)
+    simulation: SimulationSummary = Field(default_factory=SimulationSummary)
+    remediation_verification: RemediationVerificationSummary = Field(default_factory=RemediationVerificationSummary)
 
 
 class CyberAnalysisReport(BaseModel):

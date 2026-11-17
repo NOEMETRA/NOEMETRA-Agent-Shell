@@ -61,6 +61,20 @@ def cyber_get_status(args: Any = None, **kwargs) -> str:
         return json.dumps({"error": str(exc)})
 
 
+def cyber_verify_case(args: Any = None, **kwargs) -> str:
+    """Aggiunge nuove evidenze a un caso aperto o verifica una versione corretta/patchata dell'artefatto."""
+    case_id = str(_extract_arg(args, kwargs, "case_id", "") or "").strip()
+    content = str(_extract_arg(args, kwargs, "content", "") or "")
+    mode = str(_extract_arg(args, kwargs, "mode", "verify_patch") or "verify_patch")
+    if not case_id or not content.strip():
+        return json.dumps({"error": "Parametri 'case_id' e 'content' obbligatori."})
+    try:
+        report = _get_cyber_assistant().verify_case_update(case_id=case_id, content=content, mode=mode)  # type: ignore[arg-type]
+        return json.dumps(report.model_dump(mode="json"), indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
 TOOLS = [
     {
         "name": "cyber_analyze_scenario",
@@ -114,6 +128,24 @@ TOOLS = [
             "name": "cyber_get_status",
             "description": "Ottiene stato della suite Cyber Purple.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "name": "cyber_verify_case",
+        "description": "Aggiorna un caso cyber aperto con nuove evidenze ('append_evidence') o verifica la versione corretta ('verify_patch').",
+        "handler": cyber_verify_case,
+        "schema": {
+            "name": "cyber_verify_case",
+            "description": "Chiude il ciclo investigativo allegando nuove evidenze o verificando una patch su un caso esistente.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "case_id": {"type": "string", "description": "ID del caso cyber esistente"},
+                    "content": {"type": "string", "description": "Nuove righe di log o artefatto patchato"},
+                    "mode": {"type": "string", "description": "verify_patch | append_evidence"},
+                },
+                "required": ["case_id", "content"],
+            },
         },
     },
 ]

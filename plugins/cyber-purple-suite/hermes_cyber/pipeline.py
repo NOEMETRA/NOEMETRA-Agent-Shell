@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from hermes_cyber.blue_agent import BlueInvestigatorAgent, _build_sigma_yaml
 from hermes_cyber.models import (
@@ -14,6 +14,7 @@ from hermes_cyber.models import (
     BenchmarkComparisonReport,
     CyberAnalysisReport,
     PurpleReplayReport,
+    RemediationVerificationSummary,
     ScenarioDescriptor,
     VerdictType,
 )
@@ -30,7 +31,7 @@ from hermes_cyber.router_bridge import (
     validate_path_profile_ownership,
 )
 from hermes_cyber.scenarios import _SCENARIOS, get_scenario, list_scenario_descriptors
-from hermes_cyber.verifier import PurpleVerifier, run_purple_replay
+from hermes_cyber.verifier import PurpleVerifier, build_simulation_summary, run_purple_replay
 
 logger = logging.getLogger(__name__)
 
@@ -185,10 +186,13 @@ class CyberPurpleAssistant:
         title: str,
         source_kind: str,
         scenario_id: Optional[str] = None,
+        preserve_case_id: Optional[str] = None,
     ) -> CyberAnalysisReport:
         with bind_cyber_profile_scope(home_dir=self.home_dir, profile=self.profile):
             self._check_profile_storage_live()
             ingestion = self.observer.ingest_text(content, title=title, source_kind=source_kind)
+            if preserve_case_id:
+                ingestion = ingestion.model_copy(update={"case_id": preserve_case_id})
             r_router = self.red_router if self.use_llm else None
             b_router = self.blue_router if self.use_llm else None
 
@@ -248,12 +252,15 @@ class CyberPurpleAssistant:
         exclude_values: Optional[List[str]] = None,
     ) -> PurpleReplayReport:
         report = self.get_case(case_id)
+        refuted_ids = {c.claim_id for c in report.red_report.claims if c.status == "refuted"}
+        has_supported = any(c.status == "supported" for c in report.red_report.claims)
         updated_replay = run_purple_replay(
             report.ingestion,
             report.red_report,
             report.blue_report,
             custom_keywords=detection_keywords,
             custom_excludes=exclude_values,
+            skip_claim_ids=refuted_ids if (has_supported and refuted_ids) else None,
         )
         updated_blue = report.blue_report
         if detection_keywords is not None or exclude_values is not None:
@@ -265,10 +272,106 @@ class CyberPurpleAssistant:
             tuned_sigma.yaml_text = _build_sigma_yaml(tuned_sigma)
             updated_blue = report.blue_report.model_copy(update={"sigma_rule": tuned_sigma})
 
-        updated_verdict = report.verdict.model_copy(update={"replay": updated_replay})
+        updated_verdict = report.verdict.model_copy(
+            update={
+                "replay": updated_replay,
+                "simulation": build_simulation_summary(updated_replay),
+            }
+        )
         self._cases[case_id] = report.model_copy(update={"blue_report": updated_blue, "verdict": updated_verdict})
         self._save_cases()
         return updated_replay
+
+    def verify_case_update(
+        self,
+        *,
+        case_id: str,
+        content: str,
+        mode: Literal["append_evidence", "verify_patch"] = "verify_patch",
+    ) -> CyberAnalysisReport:
+        """Close open investigations with additional evidence or verify remediated/patched artifacts."""
+        if mode not in ("append_evidence", "verify_patch"):
+            raise ValueError("Il parametro 'mode' deve essere 'append_evidence' o 'verify_patch'.")
+        clean_addition = str(content or "").strip()
+        if not clean_addition:
+            raise ValueError("Il contenuto di verifica/evidenza non può essere vuoto.")
+
+        orig_report = self.get_case(case_id)
+        if mode == "append_evidence":
+            orig_raw = "\n".join(ev.raw_content for ev in orig_report.ingestion.evidences)
+            orig_ids = {ev.evidence_id for ev in orig_report.ingestion.evidences}
+            updated = self._analyze_ingested(
+                f"{orig_raw}\n{clean_addition}",
+                title=orig_report.title,
+                source_kind=orig_report.ingestion.source_kind,
+                scenario_id=orig_report.scenario_id,
+                preserve_case_id=case_id,
+            )
+            added_eids = [ev.evidence_id for ev in updated.ingestion.evidences if ev.evidence_id not in orig_ids]
+            orig_open = [c.claim_id for c in orig_report.red_report.claims if c.status == "open"]
+            new_open = [c.claim_id for c in updated.red_report.claims if c.status == "open"]
+            resolved = [cid for cid in orig_open if cid not in new_open]
+            rem_summary = RemediationVerificationSummary(
+                status="EVIDENCE_UPDATED",
+                verified_at=datetime.now(timezone.utc).isoformat(),
+                verification_source="append_evidence",
+                added_evidence_ids=added_eids,
+                resolved_claim_ids=resolved,
+                remaining_open_claim_ids=new_open,
+                before_verdict=orig_report.verdict.verdict,
+                after_verdict=updated.verdict.verdict,
+                summary=(
+                    f"Appended {len(added_eids)} evidence record(s); verdict {orig_report.verdict.verdict.value} -> "
+                    f"{updated.verdict.verdict.value}."
+                ),
+            )
+        else:
+            updated = self._analyze_ingested(
+                clean_addition,
+                title=f"{orig_report.title} (Post-Remediation)",
+                source_kind=orig_report.ingestion.source_kind,
+                scenario_id=orig_report.scenario_id,
+                preserve_case_id=case_id,
+            )
+            orig_active = [c for c in orig_report.red_report.claims if c.status in ("supported", "open")]
+            new_active = [c for c in updated.red_report.claims if c.status in ("supported", "open")]
+            if len(new_active) == 0:
+                rem_status = "VERIFIED_FIXED"
+            elif (
+                len(new_active) < len(orig_active)
+                or len(updated.verdict.diagnosis.supported_claim_ids) < len(orig_report.verdict.diagnosis.supported_claim_ids)
+            ):
+                rem_status = "PARTIALLY_MITIGATED"
+            else:
+                rem_status = "STILL_VULNERABLE"
+
+            resolved_ids = (
+                [c.claim_id for c in orig_active]
+                if len(new_active) == 0
+                else [c.claim_id for c in orig_active if c.claim_id not in {nc.claim_id for nc in new_active}]
+            )
+            rem_summary = RemediationVerificationSummary(
+                status=rem_status,  # type: ignore[arg-type]
+                verified_at=datetime.now(timezone.utc).isoformat(),
+                verification_source="verify_patch",
+                added_evidence_ids=[ev.evidence_id for ev in updated.ingestion.evidences],
+                resolved_claim_ids=resolved_ids,
+                remaining_open_claim_ids=[c.claim_id for c in new_active],
+                before_verdict=orig_report.verdict.verdict,
+                after_verdict=updated.verdict.verdict,
+                summary=(
+                    f"Post-remediation check: {rem_status} ({len(orig_active)} active claims before -> "
+                    f"{len(new_active)} after; verdict {orig_report.verdict.verdict.value} -> {updated.verdict.verdict.value})."
+                ),
+            )
+
+        final_report = updated.model_copy(
+            update={"verdict": updated.verdict.model_copy(update={"remediation_verification": rem_summary})}
+        )
+        self._cases[case_id] = final_report
+        self._active_case_id = case_id
+        self._save_cases()
+        return final_report
 
     def run_benchmark(self) -> BenchmarkComparisonReport:
         """Compare Single-Agent linear triage vs Multi-Agent Purple across all 6 dialectical scenarios."""

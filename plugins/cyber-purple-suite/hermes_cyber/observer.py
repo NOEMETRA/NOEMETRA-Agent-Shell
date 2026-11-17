@@ -34,10 +34,13 @@ _TIMESTAMP_RE = re.compile(
     r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?|"
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\b"
 )
+_HOST_RE = re.compile(
+    r"(?i)\b(?:host|cmdb_host|server|node|pod)[=:\s]+([A-Za-z0-9_.-]{2,64})\b|\b((?:srv|db|ws|web|app)-[A-Za-z0-9-]+)\b"
+)
 _USER_RE = re.compile(r"(?i)\b(?:user|account|svc|adm|actor|login|uid)[=:\s]+([A-Za-z0-9_.@-]{2,40})\b|\b((?:svc|adm)_[A-Za-z0-9_-]+)\b")
 _PROC_RE = re.compile(
-    r"(?i)\b(?:proc|process|cmd|exe|bin)[=:\s]+([A-Za-z0-9_./\\-]{2,64})|"
-    r"\b(vssadmin(?:\.exe)?|powershell(?:\.exe)?|bash|sh|curl|wget|certutil|wmic|psexec|systemd|sshd|python3?|mysqld|robocopy|restic)\b"
+    r'(?i)\b(?:proc|parent_proc|child_of|process|cmd|exe|bin|agent)[=:\s]+"?([A-Za-z0-9_./\\-]{2,64})"?|'
+    r"\b(vssadmin(?:\.exe)?|powershell(?:\.exe)?|pwsh|bash|sh|dash|curl|wget|certutil|wmic|psexec|systemd|sshd|python3?|mysqld|robocopy|restic|borgbackup|borg|veeam|wbadmin(?:\.exe)?)\b"
 )
 _ENDPOINT_RE = re.compile(r"(?:https?://[^\s\"'<>]+|/(?:api|v[12]|admin|export|webhook|health|login|latest)[^\s\"'<>]*)")
 _SINK_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
@@ -49,8 +52,21 @@ _SINK_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
 )
 _THREAT_KEYWORDS_RE = re.compile(
     r"(?i)\b(?:failed|unauthorized|denied|invalid|exfil|c2|beacon|malware|ransomware|encrypt|vssadmin|"
-    r"shadow|injection|sqli|ssrf|169\.254\.169\.254|privileged:\s*true|eval\(|os\.system|sh\s+-c|txt\s+query|"
+    r"shadow|injection|sqli|ssrf|169\.254\.169\.254|privileged:\s*true|eval\(|os\.system|sh\s+-c|txt\s+query|qtype=txt|"
     r"token_leak|bypass|wmi|smb|logsourceunavailable|truncated)\b"
+)
+_CONTROL_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    ("signed_binary", re.compile(r"(?i)(?:signature_verified\s*=\s*true|sha256_trusted\s*=\s*true|\bsigner\s*=)")),
+    ("approved_change", re.compile(r"(?i)(?:\bchangecontrol\b|approved_job\s*=|maintenance_window\s*=\s*true)")),
+    ("authorized_vlan", re.compile(r"(?i)(?:authorized_backup_vlan|ransomware_note\s*=\s*false|vss_deleted\s*=\s*false)")),
+    ("secret_rotation", re.compile(r"(?i)(?:passwordpolicychange|secret\s+rotated|stale\s+secret)")),
+    ("internal_poller", re.compile(r"(?i)(?:external_ingress\s*=\s*false|unique_usernames\s*=\s*1|success_after_fail\s*=\s*false|interval\s*=\s*5\.0s)")),
+    ("telemetry_gap", re.compile(r"(?i)(?:logsourceunavailable|\btruncated\b|\bmissing_fields\b|status\s*=\s*ambiguous)")),
+    ("parameterized_sql", re.compile(r"(?i)\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^;\n]*(?:\?|%s)\s*['\"][^;\n]*,\s*\([^)]+\)")),
+    ("url_allowlist", re.compile(r"(?i)(?:validate_https[a-z0-9_]*|is_safe_url|ALLOWED_HOSTS|(?<!without\s)(?<!no\s)\ballowlist\s*\()")),
+    ("redirect_disabled", re.compile(r"(?i)\ballow_redirects\s*=\s*false\b")),
+    ("input_validation", re.compile(r"(?i)(?:shell\s*=\s*false|shlex\.quote|hmac_verified)")),
+    ("privilege_dropped", re.compile(r"(?i)(?:privileged\s*:\s*false|allowPrivilegeEscalation\s*:\s*false|drop\s*:\s*\[?\s*['\"]ALL['\"])")),
 )
 
 
@@ -139,6 +155,12 @@ def _extract_entities(raw: str, source_type: str) -> Tuple[Optional[str], Dict[s
     timestamp = ts_m.group(1) if ts_m else None
 
     ips = sorted(set(_IPV4_RE.findall(raw)))
+    hosts: List[str] = []
+    for m in _HOST_RE.finditer(raw):
+        h = m.group(1) or m.group(2)
+        if h and h not in hosts:
+            hosts.append(h)
+
     users: List[str] = []
     for m in _USER_RE.finditer(raw):
         u = m.group(1) or m.group(2)
@@ -156,9 +178,25 @@ def _extract_entities(raw: str, source_type: str) -> Tuple[Optional[str], Dict[s
         if ep not in endpoints:
             endpoints.append(ep)
 
+    low_raw = raw.lower()
+    is_comment_line = raw.lstrip().startswith("#")
+
+    controls: List[str] = []
+    for ctrl_name, cpat in _CONTROL_PATTERNS:
+        if is_comment_line and ctrl_name in ("parameterized_sql", "url_allowlist", "input_validation"):
+            continue
+        if cpat.search(raw):
+            controls.append(ctrl_name)
+
     sinks: List[str] = []
     sink_literals: List[str] = []
     for sink_name, pat in _SINK_PATTERNS:
+        if (
+            sink_name == "cmd_exec"
+            and "shell=false" in low_raw
+            and not re.search(r"(?i)\b(?:os\.system|eval|exec|shell\s*=\s*true|sh\s+-c)\b", raw)
+        ):
+            continue
         matches = [m.group(0).strip()[:64] for m in pat.finditer(raw) if m.group(0).strip()]
         if matches:
             sinks.append(sink_name)
@@ -174,11 +212,13 @@ def _extract_entities(raw: str, source_type: str) -> Tuple[Optional[str], Dict[s
 
     return timestamp, {
         "ips": ips,
+        "hosts": hosts,
         "users": users,
         "processes": processes,
         "endpoints": endpoints,
         "sinks": sinks,
         "sink_literals": sink_literals,
+        "controls": controls,
         "indicators": indicators,
     }
 
@@ -218,8 +258,10 @@ class CyberObserver:
 
         evidences: List[EvidenceRecord] = []
         unique_ips: set[str] = set()
+        unique_hosts: set[str] = set()
         unique_users: set[str] = set()
         sinks_found: set[str] = set()
+        controls_found: set[str] = set()
         seq = 0
 
         for line_no, raw_line in enumerate(raw_text.splitlines(), start=1):
@@ -248,11 +290,17 @@ class CyberObserver:
             ts_parsed, entities = _extract_entities(normalized_raw, rec_type)
             timestamp = ts_from_json or ts_parsed
             unique_ips.update(entities["ips"])
+            unique_hosts.update(entities["hosts"])
             unique_users.update(entities["users"])
             sinks_found.update(entities["sinks"])
+            controls_found.update(entities["controls"])
 
             # Tag code/config records individually if mixed artifact contains both
-            if any(pat.search(stripped) for _, pat in _SINK_PATTERNS[:4]) or stripped.startswith(("def ", "import ", "from ", "@app.")):
+            if (
+                any(pat.search(stripped) for _, pat in _SINK_PATTERNS[:4])
+                or any(c in entities["controls"] for c in ("parameterized_sql", "url_allowlist", "input_validation"))
+                or stripped.startswith(("def ", "import ", "from ", "@app."))
+            ):
                 rec_type = "code"
             elif any(k in stripped.lower() for k in ("privileged:", "allowprivilegeescalation", "chmod ", "cap_sys_admin")):
                 rec_type = "config"
@@ -271,6 +319,12 @@ class CyberObserver:
                 )
             )
 
+        # Propagate nearby block-level code allowlist controls onto ssrf_fetch records within the same artifact block
+        if "url_allowlist" in controls_found:
+            for ev in evidences:
+                if "ssrf_fetch" in ev.entities.get("sinks", []) and "url_allowlist" not in ev.entities["controls"]:
+                    ev.entities["controls"].append("url_allowlist")
+
         return ArtifactIngestionResult(
             case_id=case_id,
             title=title,
@@ -280,8 +334,10 @@ class CyberObserver:
             evidences=evidences,
             summary_stats={
                 "unique_ips": len(unique_ips),
+                "unique_hosts": len(unique_hosts),
                 "unique_users": len(unique_users),
                 "code_sinks_count": len(sinks_found),
+                "controls_detected": sorted(controls_found),
                 "benign_baseline_records": sum(1 for e in evidences if e.is_benign_baseline),
             },
         )
