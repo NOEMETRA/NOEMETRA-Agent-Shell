@@ -721,10 +721,11 @@ class CyberPurpleAssistant:
                 added_ids = [cev.evidence_id for cev in appended_evs]
 
                 cand_cid_map: Dict[str, str] = {}
-                shifted_new_active: List[AnalyticalClaim] = []
+                shifted_cand_claims: List[AnalyticalClaim] = []
                 used_cids = {c.claim_id for c in unmatched_unresolved}
                 next_idx = 1
-                for nc in new_active:
+                cand_claims_to_keep = list(candidate.red_report.claims) if new_active else []
+                for nc in cand_claims_to_keep:
                     old_cid = nc.claim_id
                     cid = old_cid
                     while not cid or cid in used_cids:
@@ -733,7 +734,7 @@ class CyberPurpleAssistant:
                     used_cids.add(cid)
                     if old_cid:
                         cand_cid_map[old_cid] = cid
-                    shifted_new_active.append(
+                    shifted_cand_claims.append(
                         nc.model_copy(
                             update={
                                 "claim_id": cid,
@@ -742,10 +743,12 @@ class CyberPurpleAssistant:
                         )
                     )
 
-                combined_claims = [*shifted_new_active, *unmatched_unresolved]
-                remaining_ids = [c.claim_id for c in combined_claims]
+                combined_claims = [*shifted_cand_claims, *unmatched_unresolved]
+                all_combined_cids = {c.claim_id for c in combined_claims}
+                remaining_ids = [c.claim_id for c in combined_claims if c.status in ("supported", "open")]
                 sup_ids = [c.claim_id for c in combined_claims if c.status == "supported"]
                 open_ids = [c.claim_id for c in combined_claims if c.status == "open"]
+                refuted_ids = [c.claim_id for c in combined_claims if c.status == "refuted"]
 
                 base_verdict_source = candidate if new_active else orig_report
                 has_code = (
@@ -774,14 +777,16 @@ class CyberPurpleAssistant:
                 remapped_steps = []
                 if new_active:
                     for step in candidate.red_report.kill_chain:
-                        remapped_steps.append(
-                            step.model_copy(
-                                update={
-                                    "claim_id": cand_cid_map.get(step.claim_id, step.claim_id),
-                                    "evidence_ids": [cand_eid_map.get(eid, eid) for eid in step.evidence_ids],
-                                }
+                        mapped_cid = cand_cid_map.get(step.claim_id, step.claim_id)
+                        if mapped_cid in all_combined_cids:
+                            remapped_steps.append(
+                                step.model_copy(
+                                    update={
+                                        "claim_id": mapped_cid,
+                                        "evidence_ids": [cand_eid_map.get(eid, eid) for eid in step.evidence_ids],
+                                    }
+                                )
                             )
-                        )
                 for step in orig_report.red_report.kill_chain:
                     if step.claim_id in retained_orig_cids:
                         rc = retained_orig_by_cid[step.claim_id]
@@ -827,14 +832,17 @@ class CyberPurpleAssistant:
                 remapped_contras = []
                 if new_active:
                     for contra in candidate.blue_report.contradictions:
+                        mapped_tcid = (
+                            cand_cid_map.get(contra.target_claim_id, contra.target_claim_id)
+                            if contra.target_claim_id
+                            else None
+                        )
+                        if contra.target_claim_id and mapped_tcid not in all_combined_cids:
+                            mapped_tcid = None
                         remapped_contras.append(
                             contra.model_copy(
                                 update={
-                                    "target_claim_id": (
-                                        cand_cid_map.get(contra.target_claim_id, contra.target_claim_id)
-                                        if contra.target_claim_id
-                                        else None
-                                    ),
+                                    "target_claim_id": mapped_tcid,
                                     "target_evidence_ids": [cand_eid_map.get(e, e) for e in contra.target_evidence_ids],
                                     "contradicting_evidence_ids": [
                                         cand_eid_map.get(e, e) for e in contra.contradicting_evidence_ids
@@ -864,7 +872,7 @@ class CyberPurpleAssistant:
                     }
                 )
 
-                refuted_cids = {c.claim_id for c in combined_claims if c.status == "refuted"}
+                refuted_cids = set(refuted_ids)
                 merged_replay = run_purple_replay(
                     merged_ingestion,
                     merged_red,
@@ -879,10 +887,12 @@ class CyberPurpleAssistant:
                         "status": diag_status,
                         "supported_claims_count": len(sup_ids),
                         "open_claims_count": len(open_ids),
+                        "refuted_claims_count": len(refuted_ids),
                         "supported_claim_ids": sup_ids,
                         "open_claim_ids": open_ids,
+                        "refuted_claim_ids": refuted_ids,
                         "summary": (
-                            f"{len(combined_claims)} unresolved/new threat claim(s) remain active after patch check."
+                            f"{len(remaining_ids)} unresolved/new active threat claim(s) remain after patch check."
                         ),
                     }
                 )
