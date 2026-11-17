@@ -21,7 +21,7 @@ from hermes_cyber.router_bridge import ModelRouter
 from hermes_cyber.scenarios import SCENARIO_MAP
 from hermes_cyber.server.standalone import app
 from hermes_cyber.server.state import reset_cyber_assistants
-from hermes_cyber.verifier import PurpleVerifier
+from hermes_cyber.verifier import PurpleVerifier, classify_supported_verdict
 
 
 def test_explicit_observed_vs_hypothesized_claims_and_single_indicator_abstention(tmp_path):
@@ -446,7 +446,8 @@ def test_llm_full_analysis_override_updates_claims_chain_and_simulations():
 def test_patch_verification_multi_route_surface_isolation_and_new_threat_preservation(tmp_path):
     assistant = CyberPurpleAssistant(home_dir=tmp_path, allow_remote=False, use_llm=False)
 
-    # 1) Multi-route code artifact: omitting Route B while fixing Route A must NEVER return VERIFIED_FIXED
+    # 1) Multi-route code artifact: partial-overlap patch keeping Route A unfixed while omitting Route B
+    #    must preserve Route B (/api/v1/admin) in saved claims, and fixing Route A alone must NEVER return VERIFIED_FIXED.
     two_routes = (
         '@app.get("/api/v1/export")\n'
         'def export_data(tid: str): query = f"SELECT * FROM t WHERE id={tid}"\n'
@@ -454,6 +455,21 @@ def test_patch_verification_multi_route_surface_isolation_and_new_threat_preserv
         'def admin_search(q: str): query = f"SELECT * FROM audit WHERE q={q}"\n'
     )
     orig = assistant.analyze_custom(title="Two Vulnerable Routes", content=two_routes, source_kind="code")
+    route_a_still_vuln_route_b_omitted = (
+        '@app.get("/api/v1/export")\n'
+        'def export_data(tid: str): query = f"SELECT * FROM t WHERE id={tid}"\n'
+    )
+    res_partial_overlap = assistant.verify_case_update(
+        case_id=orig.case_id,
+        mode="verify_patch",
+        content=route_a_still_vuln_route_b_omitted,
+    )
+    assert res_partial_overlap.verdict.remediation_verification.status == "STILL_VULNERABLE"
+    assert any(
+        "/api/v1/admin" in c.subject_entities.get("endpoints", []) or "EV-0004" in c.evidence_ids
+        for c in res_partial_overlap.red_report.claims
+    )
+
     only_route_a_fixed = (
         '@app.get("/api/v1/export")\n'
         'def export_data(tid: str): return db.execute("SELECT * FROM t WHERE id = ?", (tid,)).fetchall()\n'
@@ -485,13 +501,40 @@ def test_patch_verification_multi_route_surface_isolation_and_new_threat_preserv
     )
     rem = res_mixed.verdict.remediation_verification
     assert rem.status == "PARTIALLY_MITIGATED"
-    # Omitted CLM-03 (T1611 container_priv) AND new /api/v1/debug sink must BOTH survive in saved claims
     assert any(c.technique_id == "T1611" for c in res_mixed.red_report.claims)
     assert any("os.system" in c.observed_fact or "/api/v1/debug" in str(c.subject_entities) for c in res_mixed.red_report.claims)
     assert len(rem.remaining_open_claim_ids) >= 2
-    # All reported added_evidence_ids must actually exist in saved ingestion evidences and match submitted patch
+
     saved_by_id = {ev.evidence_id: ev for ev in res_mixed.ingestion.evidences}
+    claim_ids = {c.claim_id for c in res_mixed.red_report.claims}
     assert len(rem.added_evidence_ids) == 8
     assert all(eid in saved_by_id for eid in rem.added_evidence_ids)
     assert any("/api/v1/debug" in saved_by_id[eid].raw_content for eid in rem.added_evidence_ids)
+
+    # All Blue/Red/Verdict references must point to the remapped patch EV-xxxx records and live claim IDs
+    debug_eid = next(ev.evidence_id for ev in res_mixed.ingestion.evidences if "os.system" in ev.raw_content)
+    assert debug_eid in rem.added_evidence_ids
+    assert debug_eid in res_mixed.blue_report.cited_evidence_ids
+    assert debug_eid in res_mixed.verdict.verified_citations
+    assert any(debug_eid in step.evidence_ids for step in res_mixed.red_report.kill_chain)
+    for contra in res_mixed.blue_report.contradictions:
+        assert all(eid in saved_by_id for eid in contra.contradicting_evidence_ids)
+        if contra.target_claim_id:
+            assert contra.target_claim_id in claim_ids
+    for sim in res_mixed.red_report.simulated_events:
+        if sim.claim_id:
+            assert sim.claim_id in claim_ids
+
+    # 3) Shared verifier threshold must NOT inflate 2 supported claims citing only 1 single evidence record to EXPLOITABLE_CHAIN
+    assert classify_supported_verdict("code", 2, 1) == VerdictType.CONFIRMED_ATTACK
+    assert classify_supported_verdict("code", 2, 2) == VerdictType.EXPLOITABLE_CHAIN
+
+    one_line_chain = assistant.analyze_custom(
+        title="Single Line Multi-Sink",
+        content='def one(x, u): return requests.get(u).text + f"SELECT * FROM t WHERE id={x}"',
+        source_kind="code",
+    )
+    # Patch keeping both sinks on a single line (1 EV record) + verifying Verifier verdict threshold
+    assert one_line_chain.verdict.verdict == VerdictType.CONFIRMED_ATTACK
+
 

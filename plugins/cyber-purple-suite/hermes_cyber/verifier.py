@@ -224,6 +224,18 @@ def _resolve_target_claims(
     return matched
 
 
+def classify_supported_verdict(
+    source_kind: str,
+    supported_claims_count: int,
+    independent_evidence_count: int,
+) -> VerdictType:
+    """Apply the uniform verifier threshold before escalating CONFIRMED_ATTACK to EXPLOITABLE_CHAIN."""
+    has_code_or_config = source_kind in ("code", "config")
+    if has_code_or_config and supported_claims_count >= 2 and independent_evidence_count >= 2:
+        return VerdictType.EXPLOITABLE_CHAIN
+    return VerdictType.CONFIRMED_ATTACK
+
+
 def build_simulation_summary(replay: PurpleReplayReport) -> SimulationSummary:
     if replay.attack_events_total == 0 and replay.benign_events_tested == 0:
         return SimulationSummary(
@@ -402,18 +414,18 @@ class PurpleVerifier:
             diag_status = "NO_THREAT_EVIDENCE"
             diag_summary = "Zero active threat claims constructed from submitted evidence."
         elif supported_claims:
-            if has_code_or_config and len(supported_claims) >= 2 and independent_ev_count >= 2:
-                verdict = VerdictType.EXPLOITABLE_CHAIN
+            supported_ev_count = len({eid for c in supported_claims for eid in c.evidence_ids})
+            verdict = classify_supported_verdict(ingestion.source_kind, len(supported_claims), supported_ev_count)
+            if verdict == VerdictType.EXPLOITABLE_CHAIN:
                 winning = clean_red.primary_hypothesis
                 confidence = round(min(0.96, sup_a), 3)
                 probe_cmd = clean_red.probes[0].payload_or_command if clean_red.probes else "Execute safe-audit reachability probe"
                 disc_test = f"Run controlled safe-audit probe (`{probe_cmd}`) and submit patched code to verify fix."
                 rationale = (
-                    f"{len(supported_claims)} supported attack step(s) across {independent_ev_count} verified record(s); "
+                    f"{len(supported_claims)} supported attack step(s) across {supported_ev_count} verified record(s); "
                     f"Purple Replay detection coverage is {int(replay.detection_coverage * 100)}%."
                 )
             else:
-                verdict = VerdictType.CONFIRMED_ATTACK
                 winning = clean_red.primary_hypothesis
                 confidence = round(min(0.95, sup_a), 3)
                 probe_cmd = clean_red.probes[0].payload_or_command if clean_red.probes else "Audit process lineage & egress"
