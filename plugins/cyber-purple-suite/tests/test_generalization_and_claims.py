@@ -643,6 +643,47 @@ def test_routine_dns_noise_filtering_and_claim_priority_triage(tmp_path):
     assert dns_claims[0].status == "open"
     assert "app-node-15" in dns_claims[0].subject_entities.get("hosts", [])
 
+    # 2d) Single-record corroboration, fail-closed undated events, and syslog New Year rollover correlation
+    single_rec_policy = (
+        '2026-11-18T09:00:20Z host=db-core-02 proc=python3 qtype=TXT '
+        'query="dump.attacker.example" entropy=4.9 dns_txt_authorized=false'
+    )
+    rep_single_rec = assistant.analyze_custom(
+        title="Single Record Policy Breach",
+        content=single_rec_policy,
+        source_kind="log",
+    )
+    assert rep_single_rec.verdict.diagnosis.status == "CONFIRMED_THREAT"
+    assert rep_single_rec.red_report.claims[0].status == "supported"
+
+    undated_stage_same_host = "\n".join([
+        '2026-11-18T09:00:00Z host=app-node-15 qtype=TXT query="lookup.app.example.net"',
+        'host=app-node-15 event=token_leak user=svc_app',
+    ])
+    rep_undated = assistant.analyze_custom(
+        title="Undated Stage Fail Closed",
+        content=undated_stage_same_host,
+        source_kind="log",
+    )
+    undated_dns = [c for c in rep_undated.red_report.claims if c.technique_id == "T1048.003"]
+    assert len(undated_dns) == 1
+    assert undated_dns[0].status == "open"
+
+    syslog_new_year = "\n".join([
+        'Dec 31 23:58:00 host=db-core-02 ip=10.10.4.22 event=token_leak user=svc_etl',
+        'Dec 31 23:59:00 host=db-core-02 proc=powershell.exe cmd="powershell -enc SQBFAFgA" child_of=mysqld',
+        'Jan  1 00:02:00 dns_src=10.10.4.22 qtype=TXT query="chunk.attacker.example" entropy=4.9',
+    ])
+    rep_new_year = assistant.analyze_custom(
+        title="Syslog New Year Rollover Correlation",
+        content=syslog_new_year,
+        source_kind="log",
+    )
+    assert rep_new_year.verdict.diagnosis.status == "CONFIRMED_THREAT"
+    ny_dns = [c for c in rep_new_year.red_report.claims if c.technique_id == "T1048.003"]
+    assert len(ny_dns) == 1
+    assert ny_dns[0].status == "supported"
+
     # 3) Unknown isolated DNS TXT lacking volume, process lineage, and correlation stays open with priority="low"
     unknown_isolated = '2026-11-18T09:01:00Z host=app-node-15 qtype=TXT query="probe.unusual-domain.example.net"'
     rep_unknown = assistant.analyze_custom(title="Unknown Isolated DNS TXT", content=unknown_isolated, source_kind="log")

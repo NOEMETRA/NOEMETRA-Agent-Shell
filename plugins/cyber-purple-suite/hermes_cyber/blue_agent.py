@@ -571,11 +571,7 @@ def _synthesize_deterministic_blue_report(
             policy_evs
             and (
                 not dns_only_evs
-                or any(
-                    is_record_correlated_with_any(pev, dns_only_evs, evs)
-                    or (not pev.entities.get("hosts") and not pev.entities.get("ips"))
-                    for pev in policy_evs
-                )
+                or any(is_record_correlated_with_any(pev, dns_only_evs, evs) for pev in policy_evs)
             )
         )
         corroborated_dns = (

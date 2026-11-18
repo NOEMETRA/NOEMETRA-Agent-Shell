@@ -348,7 +348,6 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         ]
         has_dns_policy_breach = any(
             is_record_correlated_with_any(p, dns_recs, threat_evs)
-            or (not p.entities.get("hosts") and not p.entities.get("ips"))
             for p in policy_recs
         ) if dns_recs else False
 
