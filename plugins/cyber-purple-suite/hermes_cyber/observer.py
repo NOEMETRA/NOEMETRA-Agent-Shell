@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cyber.models import ArtifactIngestionResult, EvidenceRecord
@@ -294,6 +295,68 @@ def is_routine_dns_txt_record(ev: EvidenceRecord) -> bool:
         if norm_proc and norm_proc not in _ROUTINE_DNS_DAEMONS:
             return False
     return True
+
+
+def _parse_record_timestamp(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    s = ts.strip()
+    try:
+        dt = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s)
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    try:
+        normalized = " ".join(s.split())
+        return datetime.strptime(normalized, "%b %d %H:%M:%S").replace(year=2000, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def is_record_correlated_with_any(
+    record: EvidenceRecord,
+    candidates: List[EvidenceRecord],
+    all_records: Optional[List[EvidenceRecord]] = None,
+    window_seconds: int = 900,
+) -> bool:
+    """Return True if `record` shares host/IP/user identity and time window with any candidate record."""
+    if not candidates:
+        return False
+
+    bridge_pool = all_records if all_records is not None else [record, *candidates]
+    ip_to_hosts: Dict[str, set[str]] = {}
+    for ev in bridge_pool:
+        hs = {h.lower() for h in ev.entities.get("hosts", []) if h}
+        if hs:
+            for ip in ev.entities.get("ips", []):
+                if ip:
+                    ip_to_hosts.setdefault(ip.lower(), set()).update(hs)
+
+    def _expanded_entities(ev: EvidenceRecord) -> Tuple[set[str], set[str], set[str]]:
+        hosts = {h.lower() for h in ev.entities.get("hosts", []) if h}
+        ips = {ip.lower() for ip in ev.entities.get("ips", []) if ip}
+        users = {u.lower() for u in ev.entities.get("users", []) if u}
+        for ip in ips:
+            hosts.update(ip_to_hosts.get(ip, set()))
+        return hosts, ips, users
+
+    r_hosts, r_ips, r_users = _expanded_entities(record)
+    r_ts = _parse_record_timestamp(record.timestamp)
+
+    for cand in candidates:
+        if cand.evidence_id == record.evidence_id:
+            continue
+        c_hosts, c_ips, c_users = _expanded_entities(cand)
+        if r_hosts and c_hosts and r_hosts.isdisjoint(c_hosts):
+            continue
+        if not ((r_hosts & c_hosts) or (r_ips & c_ips) or (r_users & c_users)):
+            continue
+        c_ts = _parse_record_timestamp(cand.timestamp)
+        if r_ts is not None and c_ts is not None:
+            if abs((r_ts - c_ts).total_seconds()) > window_seconds:
+                continue
+        return True
+    return False
 
 
 class CyberObserver:

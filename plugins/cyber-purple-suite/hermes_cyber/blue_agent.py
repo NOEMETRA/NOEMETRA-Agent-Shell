@@ -17,7 +17,7 @@ from hermes_cyber.models import (
     SigmaRuleSpec,
     YaraRuleSpec,
 )
-from hermes_cyber.observer import PrivacyScrubber, is_routine_dns_txt_record
+from hermes_cyber.observer import PrivacyScrubber, is_record_correlated_with_any, is_routine_dns_txt_record
 from hermes_cyber.router_bridge import ModelRouter, invoke_router_json
 
 
@@ -536,24 +536,58 @@ def _synthesize_deterministic_blue_report(
             model_used="deterministic",
         )
 
-    # Case E: DNS TXT / Token Leak (corroborated intrusion vs isolated open query; skips routine TXT only absent active stages)
-    has_active_dns_stage = _has_any(all_raw, ("token_leak", "powershell", "pwsh", "child_of="))
+    # Case E: DNS TXT / Token Leak (corroborated intrusion vs isolated open query; skips routine TXT unless entity+window correlated)
+    active_stage_recs = [
+        ev for ev in evs
+        if not ev.is_benign_baseline and _has_any(ev.raw_content, ("token_leak", "powershell", "pwsh", "child_of="))
+    ]
     dns_or_tok_evs = [
         ev for ev in evs
         if not ev.is_benign_baseline
-        and (has_active_dns_stage or not is_routine_dns_txt_record(ev))
+        and (
+            not is_routine_dns_txt_record(ev)
+            or is_record_correlated_with_any(ev, active_stage_recs, evs)
+        )
         and _has_any(ev.raw_content, ("qtype=txt", "c2-sync", "txt query", "token_leak"))
     ]
     if dns_or_tok_evs:
-        ents = _collect_entities_from_evs(dns_or_tok_evs)
+        dns_only_evs = [ev for ev in dns_or_tok_evs if _has_any(ev.raw_content, ("qtype=txt", "c2-sync", "txt query"))]
+        tok_only_evs = [ev for ev in dns_or_tok_evs if _has_any(ev.raw_content, ("token_leak",))]
+        ents = _collect_entities_from_evs(dns_only_evs or dns_or_tok_evs)
         host_lbl = (ents["hosts"] or ["db-core-02"])[0]
         ip_lbl = (ents["ips"] or ["10.10.4.22"])[0]
-        corroborated_dns = any(
-            c.tactic == "Exfiltration" and c.status == "supported" for c in red_plan.claims
-        ) or _has_any(all_raw, ("c2-sync", "token_leak", "dns_txt_authorized=false"))
+        correlated_tok = bool(
+            tok_only_evs
+            and (
+                not dns_only_evs
+                or any(is_record_correlated_with_any(tev, dns_only_evs, evs) for tev in tok_only_evs)
+            )
+        )
+        policy_evs = [
+            ev for ev in evs
+            if not ev.is_benign_baseline and "dns_txt_authorized=false" in ev.raw_content.lower()
+        ]
+        correlated_policy = bool(
+            policy_evs
+            and (
+                not dns_only_evs
+                or any(
+                    is_record_correlated_with_any(pev, dns_only_evs, evs)
+                    or (not pev.entities.get("hosts") and not pev.entities.get("ips"))
+                    for pev in policy_evs
+                )
+            )
+        )
+        corroborated_dns = (
+            any(c.tactic == "Exfiltration" and c.status == "supported" for c in red_plan.claims)
+            or any("c2-sync" in ev.raw_content.lower() for ev in dns_only_evs)
+            or correlated_tok
+            or correlated_policy
+        )
 
         c1 = _cite([ev.evidence_id for ev in evs if not ev.is_benign_baseline and _has_any(ev.raw_content, ("503", "alert=\"http flood"))])
-        c2 = _cite([ev.evidence_id for ev in dns_or_tok_evs])
+        target_pool = (dns_only_evs or dns_or_tok_evs) if not corroborated_dns else dns_or_tok_evs
+        c2 = _cite([ev.evidence_id for ev in target_pool])
         target_cid, target_eids = _find_matching_claim(red_plan, ev_by_id, c2, preferred_tactics=("Exfiltration", "Credential Access"))
 
         if corroborated_dns:

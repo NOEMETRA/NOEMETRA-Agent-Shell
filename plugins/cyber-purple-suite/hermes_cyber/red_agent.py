@@ -13,7 +13,7 @@ from hermes_cyber.models import (
     RedProbe,
     SimulatedAttackEvent,
 )
-from hermes_cyber.observer import PrivacyScrubber, is_routine_dns_txt_record
+from hermes_cyber.observer import PrivacyScrubber, is_record_correlated_with_any, is_routine_dns_txt_record
 from hermes_cyber.router_bridge import ModelRouter, invoke_router_json
 
 
@@ -299,7 +299,8 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         hypotheses.append("Exploitable Multi-Hop Chain: SQL Injection feeding Cloud Metadata SSRF in a Privileged Pod.")
         confidences.append(0.92)
 
-    # Track 2: DNS TXT Tunneling / Token Leak + Encoded Execution (skips routine TXT records only absent active stages)
+    # Track 2: DNS TXT Tunneling / Token Leak + Encoded Execution
+    # Bypass routine DNS TXT filtering only when correlated by entity & time window with active execution/token stages.
     dns_exec_evs = [
         e.evidence_id
         for e in threat_evs
@@ -310,36 +311,62 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         for e in threat_evs
         if e.evidence_id not in covered_eids and _has_any(e.raw_content, ("token_leak",))
     ]
-    has_active_dns_stage = bool(dns_exec_evs or token_evs)
+    active_stage_recs = [ev_by_id[eid] for eid in [*dns_exec_evs, *token_evs] if eid in ev_by_id]
     dns_evs = [
         e.evidence_id
         for e in threat_evs
         if e.evidence_id not in covered_eids
         and _has_any(e.raw_content, ("qtype=txt", "c2-sync", "txt query"))
-        and (has_active_dns_stage or not is_routine_dns_txt_record(e))
+        and (
+            not is_routine_dns_txt_record(e)
+            or is_record_correlated_with_any(e, active_stage_recs, threat_evs)
+        )
     ]
     if dns_evs or token_evs:
         dns_subj = _collect_subject_entities(ev_by_id, [*token_evs, *dns_exec_evs, *dns_evs])
-        host_lbl = (dns_subj["hosts"] or ["db-core-02"])[0]
-        src_ip = (dns_subj["ips"] or ["10.10.4.22"])[0]
-        proc_lbl = (dns_subj["processes"] or ["powershell.exe"])[0]
+        dns_only_subj = _collect_subject_entities(ev_by_id, dns_evs) if dns_evs else dns_subj
+        tok_subj = _collect_subject_entities(ev_by_id, token_evs) if token_evs else dns_subj
+        exec_subj = _collect_subject_entities(ev_by_id, dns_exec_evs) if dns_exec_evs else dns_subj
+        host_lbl = (dns_only_subj["hosts"] or dns_subj["hosts"] or ["db-core-02"])[0]
+        tok_host_lbl = (tok_subj["hosts"] or [host_lbl])[0]
+        exec_host_lbl = (exec_subj["hosts"] or [host_lbl])[0]
+        src_ip = (dns_only_subj["ips"] or dns_subj["ips"] or ["10.10.4.22"])[0]
+        proc_lbl = (exec_subj["processes"] or dns_subj["processes"] or ["powershell.exe"])[0]
+
+        dns_recs = [ev_by_id[eid] for eid in dns_evs if eid in ev_by_id]
+        corr_exec_evs = [
+            eid for eid in dns_exec_evs
+            if is_record_correlated_with_any(ev_by_id[eid], dns_recs, threat_evs)
+        ] if dns_recs else []
+        corr_token_evs = [
+            eid for eid in token_evs
+            if is_record_correlated_with_any(ev_by_id[eid], dns_recs, threat_evs)
+        ] if dns_recs else []
+        policy_recs = [
+            e for e in threat_evs
+            if _has_any(e.raw_content, ("dns_txt_authorized=false", "maintenance_window=false"))
+        ]
+        has_dns_policy_breach = any(
+            is_record_correlated_with_any(p, dns_recs, threat_evs)
+            or (not p.entities.get("hosts") and not p.entities.get("ips"))
+            for p in policy_recs
+        ) if dns_recs else False
 
         has_dns_process = any(
             ev_by_id[eid].entities.get("processes") or "child_of=" in ev_by_id[eid].raw_content.lower()
             for eid in dns_evs
-        ) or bool(dns_exec_evs)
+        ) or bool(corr_exec_evs)
         has_dns_vol_entropy = (
             any(_has_any(ev_by_id[eid].raw_content, ("entropy=", "bytes=", "rate=", "c2-sync")) for eid in dns_evs)
             or len(dns_evs) >= 2
         )
-        has_dns_policy_breach = _has_any(all_raw, ("dns_txt_authorized=false", "maintenance_window=false"))
 
         dns_missing: List[str] = []
         if not has_dns_vol_entropy:
             dns_missing.append("Query volume, frequency, and TXT payload entropy/content are unknown.")
         if not has_dns_process:
             dns_missing.append("Originating process lineage is not identified.")
-        if not (token_evs or dns_exec_evs or has_dns_policy_breach):
+        if not (corr_token_evs or corr_exec_evs or has_dns_policy_breach):
             dns_missing.append("No correlation with credential access, execution, or policy violation in the same time window.")
 
         if token_evs:
@@ -347,8 +374,8 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
                 tactic="Credential Access",
                 technique_id="T1528",
                 technique_name="Steal Application Access Token",
-                observed_fact=_format_observed_fact(ev_by_id, token_evs, f"Credential/token leak telemetry recorded on `{host_lbl}`:"),
-                proposed_interpretation=f"Leaked bearer credential on `{host_lbl}` grants authenticated pivot capability on database/ETL tier.",
+                observed_fact=_format_observed_fact(ev_by_id, token_evs, f"Credential/token leak telemetry recorded on `{tok_host_lbl}`:"),
+                proposed_interpretation=f"Leaked bearer credential on `{tok_host_lbl}` grants authenticated pivot capability on database/ETL tier.",
                 evidence_ids=token_evs,
                 reachability_proof="Raw token exposure event observed on internal service host prior to execution.",
                 missing_conditions=[],
@@ -359,12 +386,12 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
                 tactic="Execution",
                 technique_id="T1059.001",
                 technique_name="Command and Scripting Interpreter (Encoded PowerShell)",
-                observed_fact=_format_observed_fact(ev_by_id, dns_exec_evs, f"Encoded command execution observed on `{host_lbl}`:"),
-                proposed_interpretation=f"Worker process spawned `{proc_lbl}` obfuscating staging collector on `{host_lbl}`.",
+                observed_fact=_format_observed_fact(ev_by_id, dns_exec_evs, f"Encoded command execution observed on `{exec_host_lbl}`:"),
+                proposed_interpretation=f"Worker process spawned `{proc_lbl}` obfuscating staging collector on `{exec_host_lbl}`.",
                 evidence_ids=dns_exec_evs,
-                reachability_proof=f"Process lineage execution event observed on `{host_lbl}`.",
+                reachability_proof=f"Process lineage execution event observed on `{exec_host_lbl}`.",
                 missing_conditions=[],
-                confirming_or_refuting_proof=f"Decode encoded script argument and verify parent-child process tree on `{host_lbl}`.",
+                confirming_or_refuting_proof=f"Decode encoded script argument and verify parent-child process tree on `{exec_host_lbl}`.",
             )
         if dns_evs:
             _add_step_and_claim(

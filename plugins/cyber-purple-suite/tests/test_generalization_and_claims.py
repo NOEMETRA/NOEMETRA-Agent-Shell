@@ -613,6 +613,36 @@ def test_routine_dns_noise_filtering_and_claim_priority_triage(tmp_path):
     assert rep_prefixed_acme.verdict.diagnosis.status == "OPEN_HYPOTHESIS"
     assert len(rep_prefixed_acme.red_report.claims) >= 1
 
+    # 2c) Unrelated active execution/token_leak on another host or distant timestamp must NOT drag a routine TXT
+    #     lookup into a DNS exfiltration finding, nor promote a separate host's isolated TXT lookup to supported
+    mixed_unrelated_routine = "\n".join([
+        '2026-11-18T09:00:00Z host=mail-gw-01 proc=postfix qtype=TXT query="_dmarc.corp.example.com" txt="v=DMARC1; p=reject"',
+        '2026-11-18T14:00:00Z host=ws-dev-99 ip=10.20.9.9 event=token_leak user=svc_dev',
+        '2026-11-18T14:00:05Z host=ws-dev-99 proc=powershell.exe cmd="powershell -enc QQBiAEM=" child_of=python3',
+    ])
+    rep_uncorr_routine = assistant.analyze_custom(
+        title="Routine DMARC + Unrelated Host Token Leak",
+        content=mixed_unrelated_routine,
+        source_kind="log",
+    )
+    assert not any(c.technique_id == "T1048.003" for c in rep_uncorr_routine.red_report.claims)
+    assert all("mail-gw-01" not in c.subject_entities.get("hosts", []) for c in rep_uncorr_routine.red_report.claims)
+
+    mixed_unrelated_open_txt = "\n".join([
+        '2026-11-18T09:00:00Z host=app-node-15 qtype=TXT query="lookup.app.example.net"',
+        '2026-11-18T14:00:00Z host=ws-dev-99 ip=10.20.9.9 event=token_leak user=svc_dev',
+        '2026-11-18T14:00:05Z host=ws-dev-99 proc=powershell.exe cmd="powershell -enc QQBiAEM=" child_of=python3',
+    ])
+    rep_uncorr_open = assistant.analyze_custom(
+        title="Isolated Unknown TXT + Unrelated Host Stage",
+        content=mixed_unrelated_open_txt,
+        source_kind="log",
+    )
+    dns_claims = [c for c in rep_uncorr_open.red_report.claims if c.technique_id == "T1048.003"]
+    assert len(dns_claims) == 1
+    assert dns_claims[0].status == "open"
+    assert "app-node-15" in dns_claims[0].subject_entities.get("hosts", [])
+
     # 3) Unknown isolated DNS TXT lacking volume, process lineage, and correlation stays open with priority="low"
     unknown_isolated = '2026-11-18T09:01:00Z host=app-node-15 qtype=TXT query="probe.unusual-domain.example.net"'
     rep_unknown = assistant.analyze_custom(title="Unknown Isolated DNS TXT", content=unknown_isolated, source_kind="log")
