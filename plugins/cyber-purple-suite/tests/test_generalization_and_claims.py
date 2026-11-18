@@ -597,6 +597,22 @@ def test_routine_dns_noise_filtering_and_claim_priority_triage(tmp_path):
     assert rep_spoofed.verdict.diagnosis.status == "CONFIRMED_THREAT"
     assert len(rep_spoofed.red_report.claims) >= 1
 
+    # 2b) Suspicious DNS TXT masquerading under routine names (_dmarc / _acme-challenge) with high entropy, volume,
+    #     non-daemon process, or encoded prefix MUST NOT be suppressed as routine noise
+    masqueraded_dmarc = (
+        '2026-11-18T09:00:25Z host=db-01 proc=python qtype=TXT '
+        'query="_dmarc.attacker.example" entropy=4.9 bytes=9000 rate=500'
+    )
+    rep_masq_dmarc = assistant.analyze_custom(title="DMARC Masqueraded Tunneling", content=masqueraded_dmarc, source_kind="log")
+    assert rep_masq_dmarc.verdict.diagnosis.status != "NO_THREAT_EVIDENCE"
+    assert len(rep_masq_dmarc.red_report.claims) >= 1
+    assert rep_masq_dmarc.red_report.claims[0].priority == "high"
+
+    prefixed_acme = '2026-11-18T09:00:30Z host=db-01 qtype=TXT query="JBSWY3DPEBLW64TMMQ._acme-challenge.attacker.example"'
+    rep_prefixed_acme = assistant.analyze_custom(title="Encoded Prefix Under ACME Name", content=prefixed_acme, source_kind="log")
+    assert rep_prefixed_acme.verdict.diagnosis.status == "OPEN_HYPOTHESIS"
+    assert len(rep_prefixed_acme.red_report.claims) >= 1
+
     # 3) Unknown isolated DNS TXT lacking volume, process lineage, and correlation stays open with priority="low"
     unknown_isolated = '2026-11-18T09:01:00Z host=app-node-15 qtype=TXT query="probe.unusual-domain.example.net"'
     rep_unknown = assistant.analyze_custom(title="Unknown Isolated DNS TXT", content=unknown_isolated, source_kind="log")

@@ -241,16 +241,59 @@ def _detect_source_kind(content: str, hint: str) -> str:
 
 
 _HOSTILE_DNS_CONTEXT_RE = re.compile(
-    r"(?i)(?:c2-sync|exfil|token_leak|dns_txt_authorized\s*=\s*false|-enc\b|-encodedcommand\b|powershell|pwsh\b)"
+    r"(?i)(?:c2-sync|exfil|token_leak|dns_txt_authorized\s*=\s*false|maintenance_window\s*=\s*false|"
+    r"-enc\b|-encodedcommand\b|powershell|pwsh\b|child_of\s*=|\balert\s*=)"
 )
+_DNS_ENTROPY_RE = re.compile(r"(?i)\bentropy\s*=\s*([0-9]+(?:\.[0-9]+)?)")
+_DNS_BYTES_RE = re.compile(r"(?i)\bbytes(?:_out)?\s*=\s*([0-9]+)")
+_DNS_RATE_RE = re.compile(r"(?i)\b(?:rate|qps)\s*=\s*([0-9]+(?:\.[0-9]+)?)")
+_PREFIXED_ROUTINE_SUBDOMAIN_RE = re.compile(r"(?i)[A-Za-z0-9_-]+\.(?:_dmarc|_acme-challenge)\.")
+_LONG_DKIM_SELECTOR_RE = re.compile(r"(?i)[A-Za-z0-9_-]{24,}\._domainkey\.")
+_ROUTINE_DNS_DAEMONS = frozenset({
+    "postfix",
+    "sendmail",
+    "exim",
+    "dovecot",
+    "opendkim",
+    "opendmarc",
+    "rspamd",
+    "certbot",
+    "acme.sh",
+    "named",
+    "unbound",
+    "systemd-resolved",
+    "coredns",
+    "dnsmasq",
+    "bind",
+})
 
 
 def is_routine_dns_txt_record(ev: EvidenceRecord) -> bool:
-    """Return True for standard benign DNS TXT records (SPF/DMARC/DKIM/ACME) absent hostile context."""
+    """Return True only for low-anomaly standard DNS TXT records (SPF/DMARC/DKIM/ACME)."""
     controls = ev.entities.get("controls", [])
     if "routine_dns_txt" not in controls:
         return False
-    return not bool(_HOSTILE_DNS_CONTEXT_RE.search(ev.raw_content))
+    raw = ev.raw_content
+    if _HOSTILE_DNS_CONTEXT_RE.search(raw):
+        return False
+    if _PREFIXED_ROUTINE_SUBDOMAIN_RE.search(raw) or _LONG_DKIM_SELECTOR_RE.search(raw):
+        return False
+    for m in _DNS_ENTROPY_RE.finditer(raw):
+        if float(m.group(1)) >= 3.5:
+            return False
+    for m in _DNS_BYTES_RE.finditer(raw):
+        if int(m.group(1)) >= 400:
+            return False
+    for m in _DNS_RATE_RE.finditer(raw):
+        if float(m.group(1)) >= 10.0:
+            return False
+    for proc in ev.entities.get("processes", []):
+        norm_proc = proc.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        if norm_proc.endswith(".exe"):
+            norm_proc = norm_proc[:-4]
+        if norm_proc and norm_proc not in _ROUTINE_DNS_DAEMONS:
+            return False
+    return True
 
 
 class CyberObserver:

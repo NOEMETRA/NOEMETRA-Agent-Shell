@@ -536,11 +536,12 @@ def _synthesize_deterministic_blue_report(
             model_used="deterministic",
         )
 
-    # Case E: DNS TXT / Token Leak (corroborated intrusion vs isolated open query; skips routine SPF/DMARC/DKIM/ACME TXT)
+    # Case E: DNS TXT / Token Leak (corroborated intrusion vs isolated open query; skips routine TXT only absent active stages)
+    has_active_dns_stage = _has_any(all_raw, ("token_leak", "powershell", "pwsh", "child_of="))
     dns_or_tok_evs = [
         ev for ev in evs
         if not ev.is_benign_baseline
-        and not is_routine_dns_txt_record(ev)
+        and (has_active_dns_stage or not is_routine_dns_txt_record(ev))
         and _has_any(ev.raw_content, ("qtype=txt", "c2-sync", "txt query", "token_leak"))
     ]
     if dns_or_tok_evs:

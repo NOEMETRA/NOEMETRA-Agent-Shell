@@ -299,14 +299,7 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         hypotheses.append("Exploitable Multi-Hop Chain: SQL Injection feeding Cloud Metadata SSRF in a Privileged Pod.")
         confidences.append(0.92)
 
-    # Track 2: DNS TXT Tunneling / Token Leak + Encoded Execution (excludes standard routine TXT records like SPF/DMARC/DKIM/ACME)
-    dns_evs = [
-        e.evidence_id
-        for e in threat_evs
-        if e.evidence_id not in covered_eids
-        and _has_any(e.raw_content, ("qtype=txt", "c2-sync", "txt query"))
-        and not is_routine_dns_txt_record(e)
-    ]
+    # Track 2: DNS TXT Tunneling / Token Leak + Encoded Execution (skips routine TXT records only absent active stages)
     dns_exec_evs = [
         e.evidence_id
         for e in threat_evs
@@ -316,6 +309,14 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         e.evidence_id
         for e in threat_evs
         if e.evidence_id not in covered_eids and _has_any(e.raw_content, ("token_leak",))
+    ]
+    has_active_dns_stage = bool(dns_exec_evs or token_evs)
+    dns_evs = [
+        e.evidence_id
+        for e in threat_evs
+        if e.evidence_id not in covered_eids
+        and _has_any(e.raw_content, ("qtype=txt", "c2-sync", "txt query"))
+        and (has_active_dns_stage or not is_routine_dns_txt_record(e))
     ]
     if dns_evs or token_evs:
         dns_subj = _collect_subject_entities(ev_by_id, [*token_evs, *dns_exec_evs, *dns_evs])
