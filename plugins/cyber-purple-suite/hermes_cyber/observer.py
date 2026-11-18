@@ -46,7 +46,7 @@ _ENDPOINT_RE = re.compile(r"(?:https?://[^\s\"'<>]+|/(?:api|v[12]|admin|export|w
 _SINK_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("sql_concat", re.compile(r"(?i)(?:SELECT|INSERT|UPDATE|DELETE)\b[^;\n]*(?:\+|\{\s*\w+|%\s*\(|f['\"])")),
     ("ssrf_fetch", re.compile(r"(?i)\b(?:requests\.(?:get|post|request)|urllib\.request\.urlopen|fetch|curl_exec)\s*\(")),
-    ("cmd_exec", re.compile(r"(?i)\b(?:os\.system|subprocess\.(?:run|Popen|call)|eval|exec|shell=True|sh\s+-c)\b")),
+    ("cmd_exec", re.compile(r"(?i)(?:\b(?:os\.system|subprocess\.(?:run|Popen|call)|shell=True|sh\s+-c)\b|\b(?:eval|exec)\s*\()")),
     ("deserialization", re.compile(r"(?i)\b(?:pickle\.loads|yaml\.load\(|ObjectInputStream|__reduce__|unserialize)\b")),
     ("container_priv", re.compile(r"(?i)\b(?:privileged\s*:\s*true|hostPID\s*:\s*true|0\.0\.0\.0/0|chmod\s+777|CAP_SYS_ADMIN)\b")),
 )
@@ -67,6 +67,7 @@ _CONTROL_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("redirect_disabled", re.compile(r"(?i)\ballow_redirects\s*=\s*false\b")),
     ("input_validation", re.compile(r"(?i)(?:shell\s*=\s*false|shlex\.quote|hmac_verified)")),
     ("privilege_dropped", re.compile(r"(?i)(?:privileged\s*:\s*false|allowPrivilegeEscalation\s*:\s*false|drop\s*:\s*\[?\s*['\"]ALL['\"])")),
+    ("routine_dns_txt", re.compile(r"(?i)(?:\bv=spf1\b|\bv=DKIM1\b|\bv=DMARC1\b|_dmarc\.|_domainkey\.|_acme-challenge\.|google-site-verification=|ms=ms\d+|apple-domain-verification=|spf\.protection\.outlook\.com|_spf\.google\.com)")),
 )
 
 
@@ -194,7 +195,7 @@ def _extract_entities(raw: str, source_type: str) -> Tuple[Optional[str], Dict[s
         if (
             sink_name == "cmd_exec"
             and "shell=false" in low_raw
-            and not re.search(r"(?i)\b(?:os\.system|eval|exec|shell\s*=\s*true|sh\s+-c)\b", raw)
+            and not re.search(r"(?i)(?:\b(?:os\.system|shell\s*=\s*true|sh\s+-c)\b|\b(?:eval|exec)\s*\()", raw)
         ):
             continue
         matches = [m.group(0).strip()[:64] for m in pat.finditer(raw) if m.group(0).strip()]
@@ -237,6 +238,19 @@ def _detect_source_kind(content: str, hint: str) -> str:
     if any("HTTP/1." in ln or "HTTP/2" in ln or "GET /" in ln or "POST /" in ln for ln in lines):
         return "http"
     return "log"
+
+
+_HOSTILE_DNS_CONTEXT_RE = re.compile(
+    r"(?i)(?:c2-sync|exfil|token_leak|dns_txt_authorized\s*=\s*false|-enc\b|-encodedcommand\b|powershell|pwsh\b)"
+)
+
+
+def is_routine_dns_txt_record(ev: EvidenceRecord) -> bool:
+    """Return True for standard benign DNS TXT records (SPF/DMARC/DKIM/ACME) absent hostile context."""
+    controls = ev.entities.get("controls", [])
+    if "routine_dns_txt" not in controls:
+        return False
+    return not bool(_HOSTILE_DNS_CONTEXT_RE.search(ev.raw_content))
 
 
 class CyberObserver:
@@ -295,8 +309,10 @@ class CyberObserver:
             sinks_found.update(entities["sinks"])
             controls_found.update(entities["controls"])
 
-            # Tag code/config records individually if mixed artifact contains both
-            if (
+            # Tag individual records accurately in mixed artifacts
+            if re.search(r"\b(?:GET|POST|PUT|DELETE)\s+/", stripped) and not stripped.startswith(("#", "def ", "import ", "from ", "@")):
+                rec_type = "http"
+            elif (
                 any(pat.search(stripped) for _, pat in _SINK_PATTERNS[:4])
                 or any(c in entities["controls"] for c in ("parameterized_sql", "url_allowlist", "input_validation"))
                 or stripped.startswith(("def ", "import ", "from ", "@app."))
@@ -304,8 +320,6 @@ class CyberObserver:
                 rec_type = "code"
             elif any(k in stripped.lower() for k in ("privileged:", "allowprivilegeescalation", "chmod ", "cap_sys_admin")):
                 rec_type = "config"
-            elif re.search(r"\b(?:GET|POST|PUT|DELETE)\s+/", stripped):
-                rec_type = "http"
 
             evidences.append(
                 EvidenceRecord(

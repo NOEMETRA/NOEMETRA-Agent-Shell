@@ -207,6 +207,31 @@ const CSS = `
   word-break: break-word;
   margin: 6px 0 0;
 }
+.cp-stage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+.cp-claim-card {
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(15, 23, 42, 0.62);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.cp-claim-card.supported { border-left: 3px solid #f43f5e; }
+.cp-claim-card.open { border-left: 3px solid #f59e0b; }
+.cp-claim-card.refuted { border-left: 3px solid #10b981; }
+.cp-note-box {
+  font-size: 11.5px;
+  padding: 6px 9px;
+  border-radius: 7px;
+  background: rgba(245, 158, 11, 0.11);
+  border: 1px solid rgba(245, 158, 11, 0.32);
+  color: #fde68a;
+  margin-top: 6px;
+}
 @media (max-width: 960px) {
   .cp-main { grid-template-columns: 1fr; }
   .cp-col-left { border-right: none; border-bottom: 1px solid rgba(148, 163, 184, 0.14); max-height: 280px; }
@@ -217,6 +242,45 @@ function verdictBadgeClass(verdict) {
   if (verdict === 'CONFIRMED_ATTACK' || verdict === 'EXPLOITABLE_CHAIN') return 'cp-badge cp-b-red'
   if (verdict === 'FALSE_POSITIVE_BENIGN') return 'cp-badge cp-b-green'
   return 'cp-badge cp-b-amber'
+}
+
+function claimStatusInfo(status) {
+  if (status === 'supported') return { cls: 'cp-badge cp-b-red', label: 'SUPPORTATA' }
+  if (status === 'refuted') return { cls: 'cp-badge cp-b-green', label: 'CONFUTATA' }
+  return { cls: 'cp-badge cp-b-amber', label: 'IPOTESI APERTA' }
+}
+
+function claimPriorityInfo(priority) {
+  if (priority === 'critical') return { cls: 'cp-badge cp-b-red', label: 'PRIORITA CRITICA' }
+  if (priority === 'high') return { cls: 'cp-badge cp-b-amber', label: 'PRIORITA ALTA' }
+  if (priority === 'low') return { cls: 'cp-badge cp-b-purple', label: 'PRIORITA BASSA' }
+  return { cls: 'cp-badge cp-b-blue', label: 'PRIORITA MEDIA' }
+}
+
+function stageBadgeClass(stage, status) {
+  if (stage === 'diagnosis') {
+    if (status === 'CONFIRMED_THREAT') return 'cp-badge cp-b-red'
+    if (status === 'REFUTED_FALSE_POSITIVE') return 'cp-badge cp-b-green'
+    if (status === 'NO_THREAT_EVIDENCE') return 'cp-badge cp-b-blue'
+    return 'cp-badge cp-b-amber'
+  }
+  if (stage === 'simulation') {
+    if (status === 'COVERAGE_COMPLETE') return 'cp-badge cp-b-green'
+    if (status === 'FALSE_POSITIVE_RISK') return 'cp-badge cp-b-red'
+    if (status === 'COVERAGE_PARTIAL') return 'cp-badge cp-b-amber'
+    return 'cp-badge cp-b-purple'
+  }
+  if (status === 'VERIFIED_FIXED') return 'cp-badge cp-b-green'
+  if (status === 'STILL_VULNERABLE') return 'cp-badge cp-b-red'
+  if (status === 'PARTIALLY_MITIGATED' || status === 'EVIDENCE_UPDATED') return 'cp-badge cp-b-amber'
+  return 'cp-badge cp-b-purple'
+}
+
+function defaultVerifyModeForCase(rep) {
+  const mode = rep?.verdict?.diagnosis?.analysis_mode
+  const kind = rep?.ingestion?.source_kind
+  if (mode === 'artifact_review' || kind === 'code' || kind === 'config') return 'verify_patch'
+  return 'append_evidence'
 }
 
 function buildProviderGroups(modelsInfo, allowRemote) {
@@ -335,6 +399,8 @@ function CyberPurplePage({ ctx }) {
   const [customKind, setCustomKind] = useState('auto')
   const [replayKeywordsInput, setReplayKeywordsInput] = useState('')
   const [replayExcludesInput, setReplayExcludesInput] = useState('')
+  const [verifyMode, setVerifyMode] = useState('append_evidence')
+  const [verifyContent, setVerifyContent] = useState('')
   const [busy, setBusy] = useState(false)
   const [loadError, setLoadError] = useState('')
 
@@ -354,6 +420,7 @@ function CyberPurplePage({ ctx }) {
     if (st?.active_case) {
       setActiveCase(st.active_case)
       syncReplayInputsFromCase(st.active_case)
+      setVerifyMode(defaultVerifyModeForCase(st.active_case))
     }
     if (st?.last_benchmark) setBenchmarkReport(st.last_benchmark)
   }
@@ -412,6 +479,7 @@ function CyberPurplePage({ ctx }) {
       })
       setActiveCase(report)
       syncReplayInputsFromCase(report)
+      setVerifyMode(defaultVerifyModeForCase(report))
       setActiveTab('clash')
       setHighlightedEvId('')
       host.notify({ kind: 'info', message: `Verdetto Purple Team: ${report?.verdict?.verdict}` })
@@ -432,10 +500,38 @@ function CyberPurplePage({ ctx }) {
       })
       setActiveCase(report)
       syncReplayInputsFromCase(report)
+      setVerifyMode(defaultVerifyModeForCase(report))
       setActiveTab('clash')
       setHighlightedEvId('')
     } catch (err) {
       host.notifyError(err, 'Errore analisi artefatto custom')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleVerifyCaseUpdate = async () => {
+    if (!activeCase?.case_id || !verifyContent.trim() || busy) return
+    setBusy(true)
+    try {
+      const report = await ctx.rest('/verify', {
+        method: 'POST',
+        body: {
+          case_id: activeCase.case_id,
+          mode: verifyMode,
+          content: verifyContent
+        }
+      })
+      setActiveCase(report)
+      syncReplayInputsFromCase(report)
+      setVerifyContent('')
+      setHighlightedEvId('')
+      host.notify({
+        kind: 'info',
+        message: `Caso aggiornato (${report?.verdict?.remediation_verification?.status || report?.verdict?.verdict})`
+      })
+    } catch (err) {
+      host.notifyError(err, 'Errore verifica / aggiornamento caso')
     } finally {
       setBusy(false)
     }
@@ -489,8 +585,12 @@ function CyberPurplePage({ ctx }) {
   }, eid))
 
   const verdict = activeCase?.verdict
+  const diagnosis = verdict?.diagnosis
+  const simulation = verdict?.simulation
+  const remediation = verdict?.remediation_verification
   const red = activeCase?.red_report
   const blue = activeCase?.blue_report
+  const claims = Array.isArray(red?.claims) ? red.claims : []
   const evidences = activeCase?.ingestion?.evidences || []
 
   return jsxs('div', {
@@ -838,7 +938,8 @@ function CyberPurplePage({ ctx }) {
                                 jsx('span', { className: 'cp-badge cp-b-purple', children: `Confidence: ${Math.round(verdict.confidence_score * 100)}%` }),
                                 jsx('span', { className: 'cp-badge cp-b-blue', children: `Replay Coverage: ${Math.round((verdict.replay?.detection_coverage || 0) * 100)}%` }),
                                 jsx('span', { className: 'cp-badge cp-b-green', children: `Support A=${verdict.hypothesis_a_support} vs B=${verdict.hypothesis_b_support}` }),
-                                activeCase.privacy_scrubbed ? jsx('span', { className: 'cp-badge cp-b-amber', children: 'Privacy Scrubbed' }) : null
+                                activeCase.privacy_scrubbed ? jsx('span', { className: 'cp-badge cp-b-amber', children: 'Privacy Scrubbed' }) : null,
+                                verdict.incoherent_contradictions_rejected?.length > 0 ? jsx('span', { className: 'cp-badge cp-b-amber', children: `Contraddizioni incoerenti scartate: ${verdict.incoherent_contradictions_rejected.length}` }) : null
                               ]
                             }),
                             jsx('div', { style: { fontWeight: 700, fontSize: '14px', marginBottom: '4px' }, children: verdict.winning_hypothesis }),
@@ -849,6 +950,158 @@ function CyberPurplePage({ ctx }) {
                                 jsx('strong', { children: 'Test Discriminante: ' }),
                                 jsx('code', { children: verdict.discriminating_test })
                               ]
+                            })
+                          ]
+                        }),
+                        jsxs('div', {
+                          className: 'cp-stage-grid',
+                          children: [
+                            jsxs('div', {
+                              className: 'cp-card',
+                              children: [
+                                jsxs('div', {
+                                  style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px', marginBottom: '6px', flexWrap: 'wrap' },
+                                  children: [
+                                    jsx('strong', { style: { fontSize: '12.5px' }, children: '1. Diagnosi' }),
+                                    jsx('span', { className: stageBadgeClass('diagnosis', diagnosis?.status), children: diagnosis?.status || 'N/A' })
+                                  ]
+                                }),
+                                diagnosis?.analysis_mode_label ? jsx('div', {
+                                  style: { marginBottom: '4px' },
+                                  children: jsx('span', { className: 'cp-badge cp-b-blue', children: diagnosis.analysis_mode_label })
+                                }) : null,
+                                jsx('div', {
+                                  style: { fontSize: '11.5px', color: 'var(--muted-foreground, #cbd5e1)', marginBottom: '4px' },
+                                  children: `Affermazioni: Supportate ${diagnosis?.supported_claims_count ?? 0} · Aperte ${diagnosis?.open_claims_count ?? 0} · Confutate ${diagnosis?.refuted_claims_count ?? 0}`
+                                }),
+                                diagnosis?.high_priority_open_claim_ids?.length > 0 ? jsx('div', {
+                                  style: { fontSize: '11.5px', color: '#fcd34d', marginBottom: '4px' },
+                                  children: `Dubbi prioritari aperti: ${diagnosis.high_priority_open_claim_ids.join(', ')}`
+                                }) : null,
+                                jsx('div', { style: { fontSize: '11.5px', color: 'var(--muted-foreground, #94a3b8)' }, children: diagnosis?.epistemic_scope || diagnosis?.summary || '' })
+                              ]
+                            }),
+                            jsxs('div', {
+                              className: 'cp-card',
+                              children: [
+                                jsxs('div', {
+                                  style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px', marginBottom: '6px', flexWrap: 'wrap' },
+                                  children: [
+                                    jsx('strong', { style: { fontSize: '12.5px' }, children: '2. Simulazione Rilevazione' }),
+                                    jsx('span', { className: stageBadgeClass('simulation', simulation?.status), children: simulation?.status || 'NOT_APPLICABLE' })
+                                  ]
+                                }),
+                                jsx('div', {
+                                  style: { fontSize: '11.5px', color: 'var(--muted-foreground, #cbd5e1)', marginBottom: '4px' },
+                                  children: `Coverage: ${Math.round((simulation?.detection_coverage ?? verdict?.replay?.detection_coverage ?? 0) * 100)}% | Evasion: ${Math.round((simulation?.evasion_caught_rate ?? verdict?.replay?.evasion_caught_rate ?? 0) * 100)}% | FPR Baseline: ${Math.round((simulation?.false_positive_rate ?? verdict?.replay?.false_positive_rate ?? 0) * 100)}%`
+                                }),
+                                jsx('div', { style: { fontSize: '11.5px', color: 'var(--muted-foreground, #94a3b8)' }, children: simulation?.summary || '' })
+                              ]
+                            }),
+                            jsxs('div', {
+                              className: 'cp-card',
+                              children: [
+                                jsxs('div', {
+                                  style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px', marginBottom: '6px', flexWrap: 'wrap' },
+                                  children: [
+                                    jsx('strong', { style: { fontSize: '12.5px' }, children: '3. Verifica della Correzione' }),
+                                    jsx('span', { className: stageBadgeClass('remediation', remediation?.status), children: remediation?.status || 'UNVERIFIED' })
+                                  ]
+                                }),
+                                remediation?.verification_level && remediation.verification_level !== 'not_run' ? jsx('div', {
+                                  style: { marginBottom: '4px' },
+                                  children: jsx('span', {
+                                    className: 'cp-badge cp-b-purple',
+                                    children: remediation.verification_level === 'static_artifact_comparison' ? 'Controllo Statico Artefatto' : 'Rivalutazione Evidenze Incrementali'
+                                  })
+                                }) : null,
+                                remediation?.before_verdict && remediation?.after_verdict ? jsx('div', {
+                                  style: { fontSize: '11.5px', color: 'var(--muted-foreground, #cbd5e1)', marginBottom: '4px' },
+                                  children: `Verdetto: ${remediation.before_verdict} -> ${remediation.after_verdict}`
+                                }) : null,
+                                jsx('div', { style: { fontSize: '11.5px', color: 'var(--muted-foreground, #94a3b8)' }, children: remediation?.summary || '' }),
+                                remediation?.operational_caveat ? jsx('div', { className: 'cp-note-box', children: remediation.operational_caveat }) : null
+                              ]
+                            })
+                          ]
+                        }),
+                        jsxs('div', {
+                          className: 'cp-card cp-card-purple',
+                          children: [
+                            jsx('div', { style: { fontWeight: 700, fontSize: '13px', marginBottom: '8px' }, children: `Affermazioni Investigative — Osservato vs Ipotizzato (${claims.length})` }),
+                            claims.length === 0
+                              ? jsx('div', { style: { fontSize: '12px', color: 'var(--muted-foreground, #94a3b8)' }, children: 'Nessuna affermazione di minaccia aperta o supportata generata per questo artefatto.' })
+                              : claims.map((clm) => {
+                                const stInfo = claimStatusInfo(clm.status)
+                                const prInfo = claimPriorityInfo(clm.priority)
+                                const missingList = Array.isArray(clm.missing_conditions) ? clm.missing_conditions : []
+                                return jsxs('div', {
+                                  className: `cp-claim-card ${clm.status || 'open'}`,
+                                  children: [
+                                    jsxs('div', {
+                                      style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '6px' },
+                                      children: [
+                                        jsx('strong', { children: clm.claim_id }),
+                                        jsx('span', { className: stInfo.cls, children: stInfo.label }),
+                                        jsx('span', { className: prInfo.cls, children: prInfo.label }),
+                                        clm.technique_id ? jsx('span', { className: 'cp-badge cp-b-blue', children: `${clm.tactic || 'MITRE'} (${clm.technique_id})` }) : null,
+                                        jsxs('span', { children: renderCitePills(clm.evidence_ids) })
+                                      ]
+                                    }),
+                                    jsxs('div', { style: { marginBottom: '3px' }, children: [jsx('strong', { children: 'Osservato: ' }), jsx('span', { children: clm.observed_fact })] }),
+                                    jsxs('div', { style: { marginBottom: '3px', color: 'var(--muted-foreground, #cbd5e1)' }, children: [jsx('strong', { children: 'Ipotesi: ' }), jsx('span', { children: clm.proposed_interpretation })] }),
+                                    jsxs('div', {
+                                      style: { marginBottom: '3px', color: missingList.length ? '#fcd34d' : '#6ee7b7' },
+                                      children: [
+                                        jsx('strong', { children: 'Condizioni mancanti: ' }),
+                                        jsx('span', { children: missingList.length ? missingList.join(' | ') : 'Nessuna (precondizioni soddisfatte nei record citati)' })
+                                      ]
+                                    }),
+                                    jsxs('div', {
+                                      style: { color: '#d8b4fe' },
+                                      children: [jsx('strong', { children: 'Prossima prova: ' }), jsx('span', { children: clm.confirming_or_refuting_proof })]
+                                    }),
+                                    clm.priority_rationale ? jsx('div', { style: { fontSize: '11px', color: 'var(--muted-foreground, #94a3b8)', marginTop: '3px' }, children: `Triage: ${clm.priority_rationale}` }) : null
+                                  ]
+                                }, clm.claim_id)
+                              })
+                          ]
+                        }),
+                        jsxs('div', {
+                          className: 'cp-card',
+                          children: [
+                            jsx('div', { style: { fontWeight: 700, fontSize: '12.5px', marginBottom: '6px' }, children: 'Continua Indagine / Verifica Versione Corretta' }),
+                            jsxs('div', {
+                              style: { display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '8px' },
+                              children: [
+                                jsxs('select', {
+                                  className: 'cp-select',
+                                  'aria-label': 'Modalita aggiornamento caso',
+                                  value: verifyMode,
+                                  onChange: (e) => setVerifyMode(e.target.value),
+                                  children: [
+                                    jsx('option', { value: 'append_evidence', children: 'Aggiungi Nuove Evidenze / Log (append_evidence)' }),
+                                    jsx('option', { value: 'verify_patch', children: 'Verifica Artefatto / Codice Corretto (verify_patch)' })
+                                  ]
+                                }),
+                                jsx('button', {
+                                  type: 'button',
+                                  className: 'cp-btn cp-btn-primary',
+                                  disabled: busy || !verifyContent.trim(),
+                                  onClick: handleVerifyCaseUpdate,
+                                  children: verifyMode === 'verify_patch' ? 'Verifica Artefatto Corretto' : 'Rivaluta con Nuove Evidenze'
+                                })
+                              ]
+                            }),
+                            jsx('textarea', {
+                              className: 'cp-textarea',
+                              rows: 3,
+                              style: { width: '100%' },
+                              value: verifyContent,
+                              onChange: (e) => setVerifyContent(e.target.value),
+                              placeholder: verifyMode === 'verify_patch'
+                                ? 'Incolla il codice/configurazione aggiornato per verificare quali superfici risultano mitigate...'
+                                : 'Incolla ulteriori righe di log, eventi processo, VPN/Kerberos o metriche DNS TXT per chiudere le ipotesi aperte...'
                             })
                           ]
                         }),
@@ -886,6 +1139,9 @@ function CyberPurplePage({ ctx }) {
                                   style: { marginBottom: '8px', fontSize: '12px' },
                                   children: [
                                     jsx('span', { className: 'cp-badge cp-b-blue', children: c.impact_on_hypothesis }),
+                                    ' ',
+                                    c.target_claim_id ? jsx('span', { className: 'cp-badge cp-b-purple', children: c.target_claim_id }) : null,
+                                    c.entity_coherent === false ? jsx('span', { className: 'cp-badge cp-b-amber', children: 'Rifiutata (Entita incoerenti)' }) : null,
                                     ' ',
                                     jsx('span', { children: c.explanation }),
                                     jsxs('div', { style: { marginTop: '3px' }, children: renderCitePills(c.contradicting_evidence_ids) })

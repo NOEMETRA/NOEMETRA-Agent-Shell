@@ -69,6 +69,8 @@ class AnalyticalClaim(BaseModel):
     missing_conditions: List[str] = Field(default_factory=list)
     confirming_or_refuting_proof: str
     status: Literal["supported", "open", "refuted"] = "open"
+    priority: Literal["critical", "high", "medium", "low"] = "medium"
+    priority_rationale: str = ""
 
 
 class RedProbe(BaseModel):
@@ -189,12 +191,17 @@ class DiagnosisSummary(BaseModel):
     """Explicit separation of clinical/forensic diagnosis from simulation and patch verification."""
 
     status: Literal["CONFIRMED_THREAT", "REFUTED_FALSE_POSITIVE", "OPEN_HYPOTHESIS", "NO_THREAT_EVIDENCE"] = "OPEN_HYPOTHESIS"
+    analysis_mode: Literal["event_investigation", "artifact_review", "hybrid_investigation"] = "event_investigation"
+    analysis_mode_label: str = "Indagine su Eventi (Log / Telemetria)"
+    epistemic_scope: str = ""
     supported_claims_count: int = 0
     open_claims_count: int = 0
     refuted_claims_count: int = 0
     supported_claim_ids: List[str] = Field(default_factory=list)
     open_claim_ids: List[str] = Field(default_factory=list)
     refuted_claim_ids: List[str] = Field(default_factory=list)
+    high_priority_open_claim_ids: List[str] = Field(default_factory=list)
+    priority_breakdown: Dict[str, int] = Field(default_factory=dict)
     missing_conditions_summary: List[str] = Field(default_factory=list)
     next_required_proofs: List[str] = Field(default_factory=list)
     summary: str = ""
@@ -214,6 +221,7 @@ class RemediationVerificationSummary(BaseModel):
     """Post-remediation or incremental evidence update verification state."""
 
     status: Literal["UNVERIFIED", "VERIFIED_FIXED", "PARTIALLY_MITIGATED", "STILL_VULNERABLE", "EVIDENCE_UPDATED"] = "UNVERIFIED"
+    verification_level: Literal["not_run", "static_artifact_comparison", "incremental_evidence_reanalysis"] = "not_run"
     verified_at: Optional[str] = None
     verification_source: str = ""
     added_evidence_ids: List[str] = Field(default_factory=list)
@@ -221,6 +229,7 @@ class RemediationVerificationSummary(BaseModel):
     remaining_open_claim_ids: List[str] = Field(default_factory=list)
     before_verdict: Optional[VerdictType] = None
     after_verdict: Optional[VerdictType] = None
+    operational_caveat: str = ""
     summary: str = "Pending post-remediation check or additional evidence submission."
 
 

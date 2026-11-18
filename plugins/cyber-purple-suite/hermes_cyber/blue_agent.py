@@ -17,7 +17,7 @@ from hermes_cyber.models import (
     SigmaRuleSpec,
     YaraRuleSpec,
 )
-from hermes_cyber.observer import PrivacyScrubber
+from hermes_cyber.observer import PrivacyScrubber, is_routine_dns_txt_record
 from hermes_cyber.router_bridge import ModelRouter, invoke_router_json
 
 
@@ -536,10 +536,12 @@ def _synthesize_deterministic_blue_report(
             model_used="deterministic",
         )
 
-    # Case E: DNS TXT / Token Leak (corroborated intrusion vs isolated open query)
+    # Case E: DNS TXT / Token Leak (corroborated intrusion vs isolated open query; skips routine SPF/DMARC/DKIM/ACME TXT)
     dns_or_tok_evs = [
         ev for ev in evs
-        if not ev.is_benign_baseline and _has_any(ev.raw_content, ("qtype=txt", "c2-sync", "txt query", "token_leak"))
+        if not ev.is_benign_baseline
+        and not is_routine_dns_txt_record(ev)
+        and _has_any(ev.raw_content, ("qtype=txt", "c2-sync", "txt query", "token_leak"))
     ]
     if dns_or_tok_evs:
         ents = _collect_entities_from_evs(dns_or_tok_evs)

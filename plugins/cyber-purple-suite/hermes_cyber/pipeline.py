@@ -38,7 +38,9 @@ from hermes_cyber.verifier import (
     PurpleVerifier,
     build_simulation_summary,
     classify_supported_verdict,
+    determine_analysis_mode,
     run_purple_replay,
+    summarize_claim_priorities,
 )
 
 logger = logging.getLogger(__name__)
@@ -657,6 +659,7 @@ class CyberPurpleAssistant:
 
             rem_summary = RemediationVerificationSummary(
                 status="EVIDENCE_UPDATED",
+                verification_level="incremental_evidence_reanalysis",
                 verified_at=datetime.now(timezone.utc).isoformat(),
                 verification_source="append_evidence",
                 added_evidence_ids=added_eids,
@@ -664,6 +667,10 @@ class CyberPurpleAssistant:
                 remaining_open_claim_ids=still_open,
                 before_verdict=orig_report.verdict.verdict,
                 after_verdict=updated.verdict.verdict,
+                operational_caveat=(
+                    "Rivalutazione basata sulle nuove evidenze aggiunte al caso; "
+                    "lo stato riflette la coerenza dei record citati rispetto alle condizioni mancanti."
+                ),
                 summary=(
                     f"Appended {len(added_eids)} evidence record(s); resolved={len(resolved)} claim(s), "
                     f"open={len(still_open)}; verdict {orig_report.verdict.verdict.value} -> {updated.verdict.verdict.value}."
@@ -882,15 +889,25 @@ class CyberPurpleAssistant:
                 merged_sim_summary = build_simulation_summary(merged_replay)
                 merged_verified = list(dict.fromkeys([*merged_red.cited_evidence_ids, *merged_blue.cited_evidence_ids]))
 
+                m_mode, m_label, m_scope = determine_analysis_mode(merged_ingestion)
+                m_breakdown, m_high_open, m_proofs, m_sorted_open = summarize_claim_priorities(combined_claims)
+                m_missing = list(dict.fromkeys([m for c in m_sorted_open for m in c.missing_conditions]))
                 merged_diag = base_verdict_source.verdict.diagnosis.model_copy(
                     update={
                         "status": diag_status,
+                        "analysis_mode": m_mode,
+                        "analysis_mode_label": m_label,
+                        "epistemic_scope": m_scope,
                         "supported_claims_count": len(sup_ids),
                         "open_claims_count": len(open_ids),
                         "refuted_claims_count": len(refuted_ids),
                         "supported_claim_ids": sup_ids,
                         "open_claim_ids": open_ids,
                         "refuted_claim_ids": refuted_ids,
+                        "high_priority_open_claim_ids": m_high_open,
+                        "priority_breakdown": m_breakdown,
+                        "missing_conditions_summary": m_missing,
+                        "next_required_proofs": m_proofs or base_verdict_source.verdict.diagnosis.next_required_proofs,
                         "summary": (
                             f"{len(remaining_ids)} unresolved/new active threat claim(s) remain after patch check."
                         ),
@@ -916,6 +933,7 @@ class CyberPurpleAssistant:
             after_v = updated.verdict.verdict
             rem_summary = RemediationVerificationSummary(
                 status=rem_status,  # type: ignore[arg-type]
+                verification_level="static_artifact_comparison",
                 verified_at=datetime.now(timezone.utc).isoformat(),
                 verification_source="verify_patch",
                 added_evidence_ids=added_ids,
@@ -923,6 +941,10 @@ class CyberPurpleAssistant:
                 remaining_open_claim_ids=remaining_ids,
                 before_verdict=orig_report.verdict.verdict,
                 after_verdict=after_v,
+                operational_caveat=(
+                    "Il controllo statico del nuovo artefatto verifica la presenza dei controlli difensivi attesi sulle superfici esposte; "
+                    "la conferma operativa richiede una verifica sul comportamento effettivo a runtime (es. probe safe-audit o telemetria post-deploy)."
+                ),
                 summary=(
                     f"Post-remediation check: {rem_status} ({len(resolved_ids)}/{len(orig_active)} original claims verified fixed; "
                     f"verdict {orig_report.verdict.verdict.value} -> {after_v.value})."

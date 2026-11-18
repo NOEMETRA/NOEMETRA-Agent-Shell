@@ -572,4 +572,119 @@ def test_patch_verification_multi_route_surface_isolation_and_new_threat_preserv
                 assert claims_by_id[contra.target_claim_id].technique_id != "T1611"
 
 
+def test_routine_dns_noise_filtering_and_claim_priority_triage(tmp_path):
+    assistant = CyberPurpleAssistant(home_dir=tmp_path, allow_remote=False, use_llm=False)
+
+    # 1) Manifestly routine DNS TXT queries (SPF, DMARC, DKIM, ACME) must NOT open an investigation
+    routine_txt_logs = "\n".join([
+        '2026-11-18T09:00:00Z host=mail-gw-01 proc=postfix qtype=TXT query="_dmarc.corp.example.com" txt="v=DMARC1; p=reject"',
+        '2026-11-18T09:00:05Z host=mail-gw-01 proc=postfix qtype=TXT query="corp.example.com" txt="v=spf1 include:_spf.google.com ~all"',
+        '2026-11-18T09:00:10Z host=edge-ingress-02 proc=certbot qtype=TXT query="_acme-challenge.app.example.com"',
+        '2026-11-18T09:00:15Z host=mail-gw-01 qtype=TXT query="selector1._domainkey.example.com"',
+    ])
+    rep_routine = assistant.analyze_custom(title="Routine DNS TXT Traffic", content=routine_txt_logs, source_kind="log")
+    assert rep_routine.verdict.diagnosis.status == "NO_THREAT_EVIDENCE"
+    assert rep_routine.verdict.verdict == VerdictType.INSUFFICIENT_EVIDENCE
+    assert rep_routine.red_report.claims == []
+    assert rep_routine.blue_report.contradictions == []
+
+    # 2) Routine TXT prefix combined with explicit hostile context (c2-sync / token_leak) MUST still be analyzed
+    spoofed_txt = (
+        '2026-11-18T09:00:20Z host=db-core-02 proc=powershell.exe qtype=TXT '
+        'query="_dmarc.c2-sync.example.net" entropy=4.9 dns_txt_authorized=false'
+    )
+    rep_spoofed = assistant.analyze_custom(title="Spoofed Routine DNS TXT", content=spoofed_txt, source_kind="log")
+    assert rep_spoofed.verdict.diagnosis.status == "CONFIRMED_THREAT"
+    assert len(rep_spoofed.red_report.claims) >= 1
+
+    # 3) Unknown isolated DNS TXT lacking volume, process lineage, and correlation stays open with priority="low"
+    unknown_isolated = '2026-11-18T09:01:00Z host=app-node-15 qtype=TXT query="probe.unusual-domain.example.net"'
+    rep_unknown = assistant.analyze_custom(title="Unknown Isolated DNS TXT", content=unknown_isolated, source_kind="log")
+    assert rep_unknown.verdict.diagnosis.status == "OPEN_HYPOTHESIS"
+    assert rep_unknown.red_report.claims[0].status == "open"
+    assert rep_unknown.red_report.claims[0].priority == "low"
+    assert rep_unknown.verdict.diagnosis.priority_breakdown.get("low", 0) >= 1
+
+    # 4) Open investigation with a single discriminating condition missing (WMI lateral movement) must have priority="high"
+    rep_wmi = assistant.analyze_scenario("scen-05-ambiguous-lateral-movement")
+    assert rep_wmi.verdict.diagnosis.status == "OPEN_HYPOTHESIS"
+    assert rep_wmi.verdict.diagnosis.analysis_mode == "event_investigation"
+    assert rep_wmi.red_report.claims[0].priority == "high"
+    assert rep_wmi.red_report.claims[0].claim_id in rep_wmi.verdict.diagnosis.high_priority_open_claim_ids
+
+
+def test_analysis_mode_epistemic_scope_and_verification_levels(tmp_path):
+    assistant = CyberPurpleAssistant(home_dir=tmp_path, allow_remote=False, use_llm=False)
+
+    # Pure static code artifact review
+    vuln_code = "\n".join([
+        '@app.get("/api/v1/export")',
+        'def export_customer_report(tenant_id: str, webhook_url: str):',
+        '    query = f"SELECT id FROM reports WHERE tenant_id = \'{tenant_id}\'"',
+        '    meta = requests.get(webhook_url, timeout=3).text',
+        '    return meta',
+    ])
+    code_rep = assistant.analyze_custom(title="Pure Code Review", content=vuln_code, source_kind="code")
+    assert code_rep.verdict.diagnosis.analysis_mode == "artifact_review"
+    assert "statica" in code_rep.verdict.diagnosis.analysis_mode_label.lower()
+
+    # Hybrid code + HTTP trace scenario
+    hybrid_rep = assistant.analyze_scenario("scen-03-sqli-ssrf-code-chain")
+    assert hybrid_rep.verdict.diagnosis.analysis_mode == "hybrid_investigation"
+
+    # verify_patch qualifies outcome as static_artifact_comparison with runtime caveat
+    fixed_code = "\n".join([
+        '@app.get("/api/v1/export")',
+        'def export_customer_report(tenant_id: str, webhook_url: str):',
+        '    rows = db.execute("SELECT id FROM reports WHERE tenant_id = ?", (tenant_id,)).fetchall()',
+        '    validate_https_public_allowlist(webhook_url)',
+        '    return requests.get(webhook_url, timeout=3, allow_redirects=False).text',
+    ])
+    patched_rep = assistant.verify_case_update(case_id=code_rep.case_id, mode="verify_patch", content=fixed_code)
+    assert patched_rep.verdict.remediation_verification.status == "VERIFIED_FIXED"
+    assert patched_rep.verdict.remediation_verification.verification_level == "static_artifact_comparison"
+    assert "runtime" in patched_rep.verdict.remediation_verification.operational_caveat.lower()
+
+    # append_evidence qualifies outcome as incremental_evidence_reanalysis
+    iso_wmi = assistant.analyze_scenario("scen-05-ambiguous-lateral-movement")
+    appended_rep = assistant.verify_case_update(
+        case_id=iso_wmi.case_id,
+        mode="append_evidence",
+        content='2026-11-16T17:40:25Z host=db-prod-01 user=adm_rossi TicketEncryption=RC4 LogonType=3',
+    )
+    assert appended_rep.verdict.remediation_verification.status == "EVIDENCE_UPDATED"
+    assert appended_rep.verdict.remediation_verification.verification_level == "incremental_evidence_reanalysis"
+    assert appended_rep.verdict.remediation_verification.operational_caveat
+
+
+def test_desktop_and_web_ui_expose_claims_three_stages_and_verify_controls():
+    from pathlib import Path
+
+    suite_root = Path(__file__).resolve().parents[1]
+    repo_root = suite_root.parents[1]
+    desktop_plugin_src = suite_root / "desktop" / "plugin.js"
+    app_plugin_src = repo_root / "apps" / "desktop" / "src" / "plugins" / "cyber-purple-suite" / "plugin.js"
+    web_index_src = suite_root / "hermes_cyber" / "server" / "static" / "index.html"
+
+    desktop_text = desktop_plugin_src.read_text(encoding="utf-8")
+    app_text = app_plugin_src.read_text(encoding="utf-8")
+    web_text = web_index_src.read_text(encoding="utf-8")
+
+    assert desktop_text == app_text, "Desktop plugin copy in apps/desktop must stay in sync with plugins/cyber-purple-suite/desktop/plugin.js"
+
+    for ui_name, text in (("desktop/plugin.js", desktop_text), ("static/index.html", web_text)):
+        for marker in (
+            "diagnosis",
+            "simulation",
+            "remediation_verification",
+            "analysis_mode_label",
+            "operational_caveat",
+            "append_evidence",
+            "verify_patch",
+            "'/verify'",
+            "confirming_or_refuting_proof",
+            "missing_conditions",
+            "observed_fact",
+        ):
+            assert marker in text, f"Expected UI marker {marker!r} missing from {ui_name}"
 

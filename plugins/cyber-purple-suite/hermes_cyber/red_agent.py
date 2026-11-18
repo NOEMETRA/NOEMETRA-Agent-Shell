@@ -13,13 +13,44 @@ from hermes_cyber.models import (
     RedProbe,
     SimulatedAttackEvent,
 )
-from hermes_cyber.observer import PrivacyScrubber
+from hermes_cyber.observer import PrivacyScrubber, is_routine_dns_txt_record
 from hermes_cyber.router_bridge import ModelRouter, invoke_router_json
 
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     low = text.lower()
     return any(n in low for n in needles)
+
+
+def _infer_claim_priority(
+    missing_conditions: List[str],
+    tactic: str = "",
+    technique_id: str = "",
+) -> Tuple[str, str]:
+    """Classify investigative priority of a claim based on completeness and tactical severity."""
+    if not missing_conditions:
+        is_critical = (
+            tactic in ("Exfiltration", "Impact", "Privilege Escalation", "Initial Access")
+            or technique_id in ("T1190", "T1552.005", "T1611", "T1048.003", "T1490", "T1059.004")
+        )
+        return (
+            "critical" if is_critical else "high",
+            "Tutte le condizioni di raggiungibilità o esecuzione risultano presenti nei record citati; richiesta verifica o contenimento immediato.",
+        )
+    if len(missing_conditions) == 1:
+        return (
+            "high",
+            "Una singola prova discriminante separa l'ipotesi di compromissione/esposizione da un'attività ordinaria.",
+        )
+    if len(missing_conditions) == 2:
+        return (
+            "medium",
+            "Indicatore parziale con più precondizioni non verificate; raccogliere telemetria di processo o volume prima di escalare.",
+        )
+    return (
+        "low",
+        "Indicatore singolo isolato privo di volume, processo originante e correlazione; bassa priorità finché non emergono anomalie.",
+    )
 
 
 def _format_evidence_bundle(ingestion: ArtifactIngestionResult) -> str:
@@ -119,9 +150,14 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         reachability_proof: str,
         missing_conditions: Optional[List[str]] = None,
         confirming_or_refuting_proof: str = "",
+        priority: Optional[str] = None,
+        priority_rationale: Optional[str] = None,
     ) -> None:
         missing = [m for m in (missing_conditions or []) if m]
         status = "open" if missing else "supported"
+        inferred_prio, inferred_rationale = _infer_claim_priority(missing, tactic, technique_id)
+        final_prio = priority if priority in ("critical", "high", "medium", "low") else inferred_prio
+        final_rationale = priority_rationale or inferred_rationale
         step_idx = len(kill_chain)
         claim_id = f"CLM-{step_idx + 1:02d}"
         subj = _collect_subject_entities(ev_by_id, evidence_ids)
@@ -153,6 +189,8 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
             missing_conditions=missing,
             confirming_or_refuting_proof=confirming_or_refuting_proof,
             status=status,  # type: ignore[arg-type]
+            priority=final_prio,  # type: ignore[arg-type]
+            priority_rationale=final_rationale,
         ))
 
     def _add_sim(
@@ -261,11 +299,13 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         hypotheses.append("Exploitable Multi-Hop Chain: SQL Injection feeding Cloud Metadata SSRF in a Privileged Pod.")
         confidences.append(0.92)
 
-    # Track 2: DNS TXT Tunneling / Token Leak + Encoded Execution (strictly distinguishes complete chain vs single TXT query)
+    # Track 2: DNS TXT Tunneling / Token Leak + Encoded Execution (excludes standard routine TXT records like SPF/DMARC/DKIM/ACME)
     dns_evs = [
         e.evidence_id
         for e in threat_evs
-        if e.evidence_id not in covered_eids and _has_any(e.raw_content, ("qtype=txt", "c2-sync", "txt query"))
+        if e.evidence_id not in covered_eids
+        and _has_any(e.raw_content, ("qtype=txt", "c2-sync", "txt query"))
+        and not is_routine_dns_txt_record(e)
     ]
     dns_exec_evs = [
         e.evidence_id
@@ -346,6 +386,9 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
             if claims and not dns_exec_evs:
                 claims[-1].missing_conditions.append("Post-exposure lateral movement or data egress from leaked credential is not yet observed.")
                 claims[-1].status = "open"
+                p_val, p_rat = _infer_claim_priority(claims[-1].missing_conditions, claims[-1].tactic, claims[-1].technique_id)
+                claims[-1].priority = p_val  # type: ignore[assignment]
+                claims[-1].priority_rationale = p_rat
                 kill_chain[-1].missing_conditions = list(claims[-1].missing_conditions)
                 kill_chain[-1].status = "open"
 
@@ -625,7 +668,7 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         hypotheses.append(f"Suspected Privileged Lateral Movement via WMI/SMB telemetry (`{user_lbl}` -> `{host_lbl}`).")
         confidences.append(0.62)
 
-    # Track 4b: Fallback unmitigated code/config sinks or isolated threat indicators (skips comments/telemetry gaps)
+    # Track 4b: Fallback unmitigated code/config sinks or isolated threat indicators (skips comments, routine TXT, & telemetry gaps)
     claimed_hosts = {h for c in claims for h in c.subject_entities.get("hosts", [])}
     uncovered_sinks = [
         e
@@ -633,6 +676,7 @@ def _synthesize_deterministic_red_plan(ingestion: ArtifactIngestionResult) -> Re
         if e.evidence_id not in covered_eids
         and not e.raw_content.lstrip().startswith("#")
         and "telemetry_gap" not in e.entities.get("controls", [])
+        and not is_routine_dns_txt_record(e)
         and (
             _is_unmitigated_sink_record(e)
             or (not claims and bool(e.entities.get("indicators")))
@@ -779,6 +823,10 @@ class RedOperatorAgent:
                     confirming_or_refuting_proof=proof,
                     status=status,  # type: ignore[arg-type]
                 ))
+                inferred_prio, inferred_rat = _infer_claim_priority(missing, new_steps[-1].tactic, new_steps[-1].technique_id)
+                raw_prio = str(item.get("priority") or "").lower().strip()
+                final_prio = raw_prio if raw_prio in ("critical", "high", "medium", "low") else inferred_prio
+                final_rat = str(item.get("priority_rationale") or "").strip() or inferred_rat
                 new_claims.append(AnalyticalClaim(
                     claim_id=cid,
                     step_index=idx,
@@ -791,6 +839,8 @@ class RedOperatorAgent:
                     missing_conditions=missing,
                     confirming_or_refuting_proof=proof,
                     status=status,  # type: ignore[arg-type]
+                    priority=final_prio,  # type: ignore[arg-type]
+                    priority_rationale=final_rat,
                 ))
             final_chain = new_steps
             final_claims = new_claims

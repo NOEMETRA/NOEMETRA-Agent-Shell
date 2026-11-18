@@ -236,6 +236,52 @@ def classify_supported_verdict(
     return VerdictType.CONFIRMED_ATTACK
 
 
+_PRIO_RANK: Dict[str, int] = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def determine_analysis_mode(
+    ingestion: ArtifactIngestionResult,
+) -> Tuple[str, str, str]:
+    """Classify the investigation workflow as event-driven, static artifact review, or hybrid."""
+    non_base = [ev for ev in ingestion.evidences if not ev.is_benign_baseline] or list(ingestion.evidences)
+    src_types = {ev.source_type for ev in non_base} if non_base else {ingestion.source_kind}
+    has_static = bool(src_types & {"code", "config"})
+    has_runtime = bool(src_types & {"log", "http"})
+    if has_static and has_runtime:
+        return (
+            "hybrid_investigation",
+            "Indagine Ibrida (Eventi Runtime + Codice/Config)",
+            "Correlazione ibrida tra codice/configurazione e tracce runtime: verifica sia la superficie statica sia l'evidenza osservata.",
+        )
+    if has_static or ingestion.source_kind in ("code", "config"):
+        return (
+            "artifact_review",
+            "Revisione Statica di Codice e Configurazioni",
+            "Revisione statica di codice/configurazione: individua superfici esposte e controlli assenti; richiede verifica runtime post-modifica.",
+        )
+    return (
+        "event_investigation",
+        "Indagine su Eventi (Log / Tracce HTTP)",
+        "Valutazione forense su eventi e tracce HTTP: stabilisce cosa è accaduto nei record disponibili e quali prove mancano.",
+    )
+
+
+def summarize_claim_priorities(
+    claims: List[AnalyticalClaim],
+) -> Tuple[Dict[str, int], List[str], List[str], List[AnalyticalClaim]]:
+    """Compute priority counts, high-priority open claim IDs, and prioritized open proofs."""
+    breakdown: Dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for c in claims:
+        key = c.priority if c.priority in breakdown else "medium"
+        breakdown[key] += 1
+
+    open_claims = [c for c in claims if c.status == "open"]
+    sorted_open = sorted(open_claims, key=lambda c: (_PRIO_RANK.get(c.priority, 2), c.step_index))
+    high_open_ids = [c.claim_id for c in sorted_open if c.priority in ("critical", "high")]
+    ordered_proofs = list(dict.fromkeys([c.confirming_or_refuting_proof for c in sorted_open if c.confirming_or_refuting_proof]))
+    return breakdown, high_open_ids, ordered_proofs, sorted_open
+
+
 def build_simulation_summary(replay: PurpleReplayReport) -> SimulationSummary:
     if replay.attack_events_total == 0 and replay.benign_events_tested == 0:
         return SimulationSummary(
@@ -351,12 +397,32 @@ class PurpleVerifier:
         final_claims: List[AnalyticalClaim] = []
         for clm in cleaned_claims:
             if clm.claim_id in refuted_claim_ids:
-                c_status = "refuted"
+                final_claims.append(
+                    clm.model_copy(
+                        update={
+                            "status": "refuted",
+                            "priority": "low",
+                            "priority_rationale": "Affermazione confutata da controlli difensivi coerenti per entità.",
+                        }
+                    )
+                )
             elif (not clm.evidence_ids) or bool(clm.missing_conditions) or (clm.claim_id in weakened_claim_ids):
-                c_status = "open"
+                prio = clm.priority
+                prat = clm.priority_rationale
+                if clm.claim_id in weakened_claim_ids and prio == "critical":
+                    prio = "medium"
+                    prat = "Ipotesi indebolita da evidenza difensiva o gap di telemetria; necessaria prova discriminante."
+                final_claims.append(
+                    clm.model_copy(
+                        update={
+                            "status": "open",
+                            "priority": prio,
+                            "priority_rationale": prat,
+                        }
+                    )
+                )
             else:
-                c_status = "supported"
-            final_claims.append(clm.model_copy(update={"status": c_status}))
+                final_claims.append(clm.model_copy(update={"status": "supported"}))
 
         claim_by_id = {c.claim_id: c for c in final_claims}
         final_steps = []
@@ -400,8 +466,9 @@ class PurpleVerifier:
         sup_a = round(min(0.97, max(0.05, clean_red.confidence - 0.25 * (coherent_refutes if not supported_claims else 0) - 0.15 * coherent_weakens)), 3)
         sup_b = round(min(0.97, max(0.05, clean_blue.confidence + 0.10 * coherent_refutes)), 3)
 
-        missing_summary = list(dict.fromkeys([m for c in open_claims for m in c.missing_conditions]))
-        next_proofs = list(dict.fromkeys([c.confirming_or_refuting_proof for c in open_claims if c.confirming_or_refuting_proof]))
+        analysis_mode, analysis_mode_label, epistemic_scope = determine_analysis_mode(ingestion)
+        priority_breakdown, high_open_ids, next_proofs, sorted_open_claims = summarize_claim_priorities(final_claims)
+        missing_summary = list(dict.fromkeys([m for c in sorted_open_claims for m in c.missing_conditions]))
 
         if len(final_claims) == 0:
             verdict = VerdictType.INSUFFICIENT_EVIDENCE
@@ -475,12 +542,17 @@ class PurpleVerifier:
 
         diagnosis_summary = DiagnosisSummary(
             status=diag_status,  # type: ignore[arg-type]
+            analysis_mode=analysis_mode,  # type: ignore[arg-type]
+            analysis_mode_label=analysis_mode_label,
+            epistemic_scope=epistemic_scope,
             supported_claims_count=len(supported_claims),
             open_claims_count=len(open_claims),
             refuted_claims_count=len(refuted_claims),
             supported_claim_ids=[c.claim_id for c in supported_claims],
             open_claim_ids=[c.claim_id for c in open_claims],
             refuted_claim_ids=[c.claim_id for c in refuted_claims],
+            high_priority_open_claim_ids=high_open_ids,
+            priority_breakdown=priority_breakdown,
             missing_conditions_summary=missing_summary,
             next_required_proofs=next_proofs or [disc_test],
             summary=diag_summary,
