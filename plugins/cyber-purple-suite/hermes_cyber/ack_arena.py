@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import inspect
+import io
 import json
 import os
 import queue
@@ -16,11 +17,12 @@ import sysconfig
 import tempfile
 import threading
 import uuid
-import yaml  # type: ignore[import-untyped]
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
+
+from ruamel.yaml import YAML
 
 from hermes_cyber.models import (
     AckCertificationReport,
@@ -1872,6 +1874,12 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
                 return False
         return None
 
+    def _norm_cap(raw: Any) -> str:
+        s = str(raw or "").strip().upper()
+        if not s:
+            return ""
+        return s if s.startswith("CAP_") else f"CAP_{s}"
+
     def _collect_dicts_and_containers(root_doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         dicts: List[Dict[str, Any]] = []
         containers: List[Dict[str, Any]] = []
@@ -1946,8 +1954,8 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
                 if sc.get("privileged") is True:
                     all_hardened = False
                 caps = sc.get("capabilities")
-                drops = [str(x).upper() for x in (caps.get("drop") or [])] if isinstance(caps, dict) else []
-                adds = [str(x).upper() for x in (caps.get("add") or [])] if isinstance(caps, dict) else []
+                drops = [str(x).strip().upper() for x in (caps.get("drop") or [])] if isinstance(caps, dict) else []
+                adds = [_norm_cap(x) for x in (caps.get("add") or [])] if isinstance(caps, dict) else []
                 for cap_name in adds:
                     if cap_name in unsafe_caps and cap_name not in found_caps:
                         found_caps.append(cap_name)
@@ -1978,6 +1986,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
         protect_sys: Any = False
         drop_all = False
         found_caps = []
+        added_unsafe_caps: List[str] = []
         has_security_ctx = False
         for d in dicts:
             for k, v in d.items():
@@ -2005,26 +2014,29 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
                     has_security_ctx = True
                 elif kl == "capabilities":
                     if isinstance(v, dict):
-                        if "ALL" in [str(x).upper() for x in (v.get("drop") or [])]:
+                        if "ALL" in [str(x).strip().upper() for x in (v.get("drop") or [])]:
                             drop_all = True
                         for item in (v.get("add") or []):
-                            up_item = str(item).upper()
-                            if up_item in unsafe_caps and up_item not in found_caps:
-                                found_caps.append(up_item)
+                            up_item = _norm_cap(item)
+                            if up_item in unsafe_caps:
+                                if up_item not in found_caps:
+                                    found_caps.append(up_item)
+                                if up_item not in added_unsafe_caps:
+                                    added_unsafe_caps.append(up_item)
                     elif isinstance(v, list):
                         for item in v:
-                            up_item = str(item).upper()
+                            up_item = _norm_cap(item)
                             if up_item in unsafe_caps and up_item not in found_caps:
                                 found_caps.append(up_item)
                 elif kl in ("ambient_caps", "ambientcapabilities") and isinstance(v, list):
                     for item in v:
-                        up_item = str(item).upper()
+                        up_item = _norm_cap(item)
                         if up_item in unsafe_caps and up_item not in found_caps:
                             found_caps.append(up_item)
-                elif kl == "drop" and isinstance(v, list) and "ALL" in [str(x).upper() for x in v]:
+                elif kl == "drop" and isinstance(v, list) and "ALL" in [str(x).strip().upper() for x in v]:
                     drop_all = True
 
-        caps_out = [] if drop_all else found_caps
+        caps_out = added_unsafe_caps if drop_all else found_caps
         if has_security_ctx and not sock_explicit_true and not sock_explicit_false:
             sock_restricted = True
         else:
@@ -2142,7 +2154,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
             sock_restricted=sock_restricted,
         )
 
-    # 3) Kubernetes / container YAML manifest parsed cleanly with PyYAML
+    # 3) Kubernetes / container YAML manifest parsed cleanly with ruamel.yaml
     for raw_ln in stripped.splitlines():
         ln = raw_ln.strip()
         if not ln or ln.startswith("#") or ln in ("---", "..."):
@@ -2150,7 +2162,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
         if re.match(r"^\[[A-Za-z0-9_.-]+\]$", ln):
             return _result("k8s_yaml", False)
     try:
-        yaml_doc = yaml.safe_load(stripped)
+        yaml_doc = YAML(typ="safe", pure=True).load(stripped)
     except Exception:
         return _result("k8s_yaml", False)
     if not isinstance(yaml_doc, dict):
@@ -2165,15 +2177,23 @@ def _harden_manifest_text(manifest_text: str, defense_mode: str) -> str:
     if not parsed_meta["format_valid"]:
         raise ValueError(f"Cannot patch invalid {fmt} manifest")
 
+    def _dump_yaml(data: Any) -> str:
+        y = YAML(typ="safe", pure=True)
+        y.default_flow_style = False
+        y.sort_base_mapping_type_on_output = False
+        buf = io.StringIO()
+        y.dump(data, buf)
+        return buf.getvalue()
+
     if fmt in ("json", "k8s_yaml"):
-        doc = json.loads(manifest_text) if fmt == "json" else yaml.safe_load(manifest_text)
+        doc = json.loads(manifest_text) if fmt == "json" else YAML(typ="safe", pure=True).load(manifest_text)
         if not isinstance(doc, dict):
             raise ValueError(f"Expected mapping root in {fmt} manifest")
 
         if defense_mode == "naive_block_all":
             key = "serviceEnabled" if fmt == "k8s_yaml" or "serviceEnabled" in doc else "service_enabled"
             doc[key] = False
-            return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else yaml.safe_dump(doc, sort_keys=False)
+            return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else _dump_yaml(doc)
 
         containers: List[Dict[str, Any]] = []
         bfs_queue: List[Any] = [doc]
@@ -2263,7 +2283,7 @@ def _harden_manifest_text(manifest_text: str, defense_mode: str) -> str:
                     "capabilities": {"drop": ["ALL"]},
                 }
 
-        return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else yaml.safe_dump(doc, sort_keys=False)
+        return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else _dump_yaml(doc)
 
     # Line-preserving systemd INI patcher (preserves all comments, blank lines, and repeated directives like ExecStartPre=)
     raw_lines = manifest_text.splitlines()
@@ -2321,7 +2341,8 @@ def _harden_manifest_text(manifest_text: str, defense_mode: str) -> str:
 
         if cur_sec == "Service":
             if defense_mode != "naive_block_all" and kl in ("execstart", "execstartpre", "execstartpost"):
-                out_lines.append(f"{key_clean}={re.sub(r'(?i)chmod\s+(?:0?777|a\+w)', 'chmod 0750', val_part.strip())}")
+                sanitized_val = re.sub(r"(?i)chmod\s+(?:0?777|a\+w)", "chmod 0750", val_part.strip())
+                out_lines.append(f"{key_clean}={sanitized_val}")
                 continue
             if kl in ("serviceenabled", "service_enabled"):
                 target_val = "false" if defense_mode == "naive_block_all" else "true"
@@ -2366,7 +2387,7 @@ def _validate_hardened_manifest_syntax(manifest_text: str, expected_format: str,
         if expected_format == "systemd_ini":
             return True
         if expected_format == "k8s_yaml":
-            doc = yaml.safe_load(manifest_text)
+            doc = YAML(typ="safe", pure=True).load(manifest_text)
             if not isinstance(doc, dict):
                 return False
             if enforce_hardened and not parsed["all_containers_hardened"]:
@@ -2380,9 +2401,10 @@ def _validate_hardened_manifest_syntax(manifest_text: str, expected_format: str,
 def _build_m3_host_runtime_sim() -> str:
     parser_src = inspect.getsource(_parse_target_host_config)
     return (
-        "import json, os, re, yaml\n"
+        "import io, json, os, re\n"
         "from pathlib import Path\n"
-        "from typing import Any, Dict, List, Optional, Tuple\n\n"
+        "from typing import Any, Dict, List, Optional, Tuple\n"
+        "from ruamel.yaml import YAML\n\n"
         f"{parser_src}\n\n"
         '''\
 def check_action(vector: str) -> str:
@@ -2595,9 +2617,10 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
     rel_blue, _ = chamber.write_blue_artifact(
         "apply_hardening_m3.py",
         (
-            "import json, os, re, yaml\n"
+            "import io, json, os, re\n"
             "from pathlib import Path\n"
-            "from typing import Any, Dict, List, Optional, Tuple\n\n"
+            "from typing import Any, Dict, List, Optional, Tuple\n"
+            "from ruamel.yaml import YAML\n\n"
             f"{parse_fn_src}\n\n"
             f"{harden_fn_src}\n\n"
             "up = Path(os.environ['ACK_UPPERDIR'])\n"

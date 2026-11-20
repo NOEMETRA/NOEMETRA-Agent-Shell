@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
 from fastapi.testclient import TestClient
+from ruamel.yaml import YAML
 
 from cyber_hermes_plugin.cyber_plugin import TOOLS, cyber_run_ack_mission
 from hermes_cyber.ack_arena import AdversarialCyberKernel, DetonationChamber, _harden_manifest_text
@@ -262,8 +262,28 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
         "socket_acl_restricted": False,
     }, indent=2)
 
+    vuln_unprefixed_cap_yaml = "\n".join([
+        "apiVersion: v1",
+        "kind: Pod",
+        "metadata:",
+        "  name: cap-readd-pod",
+        "spec:",
+        "  containers:",
+        "    - name: worker",
+        "      image: python:3.12-slim",
+        "      securityContext:",
+        "        privileged: false",
+        "        allowPrivilegeEscalation: false",
+        "        readOnlyRootFilesystem: true",
+        "        capabilities:",
+        "          drop:",
+        "            - ALL",
+        "          add:",
+        "            - SYS_ADMIN",
+    ])
+
     hardened_yaml_out = _harden_manifest_text(vuln_yaml_manifest, "structural")
-    parsed_yaml_out = yaml.safe_load(hardened_yaml_out)
+    parsed_yaml_out = YAML(typ="safe", pure=True).load(hardened_yaml_out)
     assert "securityContext" not in parsed_yaml_out
     for c_doc in parsed_yaml_out["spec"]["containers"]:
         assert c_doc["securityContext"]["allowPrivilegeEscalation"] is False
@@ -277,7 +297,7 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
     assert "Environment=APP_ENV=prod" in hardened_ini_out
     assert "Environment=LOG_LEVEL=info" in hardened_ini_out
 
-    for manifest in (vuln_yaml_manifest, vuln_ini_manifest, vuln_json_manifest):
+    for manifest in (vuln_yaml_manifest, vuln_unprefixed_cap_yaml, vuln_ini_manifest, vuln_json_manifest):
         rep_vuln_clone = kernel.run_mission(
             "ack-m3-attack-path-hardening",
             mutation_rounds=3,
