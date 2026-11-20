@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import configparser
 import ctypes
 import hashlib
 import inspect
+import io
 import json
 import os
 import queue
@@ -136,6 +138,7 @@ from pathlib import Path
 _POLICY = json.loads(os.environ.pop("ACK_CONFINE_POLICY", "{}"))
 _ACTOR = str(_POLICY["actor"])
 _UPPERDIR = Path(_POLICY["upperdir"]).resolve()
+_RED_WRITABLE_UPPER_SUBDIR = (_UPPERDIR / "uploads").resolve()
 _CANARY_VAULT = Path(_POLICY["canary_vault"]).resolve()
 _ACTOR_ARTIFACTS = Path(_POLICY["actor_artifacts"]).resolve()
 _BLUE_EXTRA_READ = Path(_POLICY["blue_extra_read"]).resolve() if _POLICY.get("blue_extra_read") else None
@@ -186,6 +189,14 @@ def _resolve_fs_path(raw):
     return p.resolve(strict=False)
 
 
+def _is_write_allowed(resolved):
+    if resolved is None or resolved.is_relative_to(_CANARY_VAULT):
+        return False
+    if _ACTOR == "RED":
+        return resolved.is_relative_to(_ACTOR_ARTIFACTS) or resolved.is_relative_to(_RED_WRITABLE_UPPER_SUBDIR)
+    return resolved.is_relative_to(_UPPERDIR) or resolved.is_relative_to(_ACTOR_ARTIFACTS)
+
+
 def _audit_hook(event, args):
     if not _STATE["active"]:
         return
@@ -208,17 +219,15 @@ def _audit_hook(event, args):
 
     if event == "os.symlink" and len(args) >= 2:
         dst = _resolve_fs_path(args[1])
-        if dst is not None and (not dst.is_relative_to(_UPPERDIR) or dst.is_relative_to(_CANARY_VAULT)):
-            raise PermissionError(f"Symlink creation outside allowed upperdir rejected: {dst}")
+        if dst is not None and not _is_write_allowed(dst):
+            raise PermissionError(f"Symlink creation outside allowed path rejected for {_ACTOR}: {dst}")
         return
 
     if event in ("os.remove", "os.unlink", "os.rmdir", "os.rename", "os.replace", "os.mkdir"):
         for p_arg in args[:2]:
             p = _resolve_fs_path(p_arg)
-            if p is not None and not (p.is_relative_to(_UPPERDIR) or p.is_relative_to(_ACTOR_ARTIFACTS)):
-                raise PermissionError(f"Mutation outside sandbox denied: {p}")
-            if p is not None and p.is_relative_to(_CANARY_VAULT):
-                raise PermissionError(f"Modification of canary vault denied: {p}")
+            if p is not None and not _is_write_allowed(p):
+                raise PermissionError(f"{_ACTOR} actor cannot modify target modules or protected path: {p}")
         return
 
     if event == "open" and len(args) >= 3:
@@ -232,11 +241,9 @@ def _audit_hook(event, args):
             is_write = bool(int(flags or 0) & _WRITE_FLAGS)
 
         if is_write:
-            if resolved.is_relative_to(_CANARY_VAULT):
-                raise PermissionError(f"Write to canary_vault denied: {resolved}")
-            if resolved.is_relative_to(_UPPERDIR) or resolved.is_relative_to(_ACTOR_ARTIFACTS):
-                return
-            raise PermissionError(f"Write outside sandbox denied by ACK DetonationChamber: {resolved}")
+            if not _is_write_allowed(resolved):
+                raise PermissionError(f"{_ACTOR} write denied (protected target/host path): {resolved}")
+            return
 
         # Read access checks: strict process boundary so only TARGET server process can ever read canary_vault
         if any(resolved.is_relative_to(r) for r in _PY_ROOTS):
@@ -406,6 +413,7 @@ class DetonationChamber:
         )
         self._seed_canary_in_upperdir()
         self._lowerdir_hashes: Dict[str, str] = {}
+        self._trusted_upper_hashes: Dict[str, str] = {}
 
     def _seed_canary_in_upperdir(self) -> None:
         self.canary_vault.mkdir(parents=True, exist_ok=True)
@@ -441,6 +449,7 @@ class DetonationChamber:
         shutil.rmtree(self.upperdir, ignore_errors=True)
         shutil.copytree(self.lowerdir, self.upperdir, symlinks=True)
         self._seed_canary_in_upperdir()
+        self._trusted_upper_hashes = self.snapshot_tree(self.upperdir)
 
     def write_red_artifact(self, filename: str, content: bytes | str) -> Tuple[str, Path]:
         rel = f"artifacts/red/{filename}"
@@ -582,9 +591,18 @@ class DetonationChamber:
         timeout_sec: int = 15,
     ) -> Iterator[int]:
         """Run a target module in an isolated TARGET subprocess bound to loopback 127.0.0.1."""
-        mod_path = (self.upperdir / target_module).resolve()
+        raw_mod_path = self.upperdir / target_module
+        if raw_mod_path.is_symlink():
+            raise PermissionError(f"Target module cannot be a symlink: {target_module}")
+        mod_path = raw_mod_path.resolve()
         if not mod_path.is_relative_to(self.upperdir) or not mod_path.exists():
             raise FileNotFoundError(f"Modulo target non trovato in upperdir: {target_module}")
+        expected_hash = self._trusted_upper_hashes.get(target_module)
+        actual_hash = _sha256_bytes(mod_path.read_bytes())
+        if not expected_hash or actual_hash != expected_hash:
+            raise PermissionError(
+                f"Target module integrity check failed for {target_module}: untrusted modification detected"
+            )
 
         policy = {
             "actor": "TARGET",
@@ -708,6 +726,8 @@ class DetonationChamber:
                 ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(h_job))  # type: ignore[attr-defined]
 
         after_upper = self.snapshot_tree(self.upperdir)
+        if contract.actor == "BLUE" and contract.primitive == "APPLY_DIFF" and rc == 0:
+            self._trusted_upper_hashes = after_upper
         created = sorted(k for k in after_upper if k not in before_upper)
         deleted = sorted(k for k in before_upper if k not in after_upper)
         modified = sorted(k for k in after_upper if k in before_upper and after_upper[k] != before_upper[k])
@@ -1782,114 +1802,548 @@ res = json.loads(resp.read().decode("utf-8"))
 # ---------------------------------------------------------------------------
 
 _M3_DEFAULT_SYNTHETIC_MANIFEST = """\
+[Unit]
+Description=NOEMETRA Target Privileged Helper Service
+
 [Service]
-service_enabled=true
+ServiceEnabled=true
 NoNewPrivileges=false
 ProtectSystem=false
-SocketMode=0666
-helper_writable=true
+HelperWritable=true
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-securityContext:
-  privileged: true
-  allowPrivilegeEscalation: true
-  capabilities: [CAP_SYS_ADMIN, CAP_DAC_READ_SEARCH]
+[Socket]
+SocketMode=0666
 """
 
 
 def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
-    """Deterministically parse submitted YAML/systemd/JSON host or container manifest into hardening state."""
-    low = manifest_text.lower()
-    service_enabled = not bool(re.search(r"(?:service_enabled|serviceenabled)[\"']?\s*[:=]\s*[\"']?false", low))
-    helper_writable = bool(
-        re.search(r"(?:helper_writable[\"']?\s*[:=]\s*[\"']?true|chmod\s+0?777|chmod\s+a\+w)", low)
-    )
-    priv = bool(
-        re.search(r"(?:privileged|privileged_container|allowprivilegeescalation)[\"']?\s*[:=]\s*[\"']?true", low)
-    )
-    nnp_true = bool(
-        re.search(r"(?:nonewprivileges[\"']?\s*[:=]\s*[\"']?true|allowprivilegeescalation[\"']?\s*[:=]\s*[\"']?false)", low)
-    )
-    nnp_false = bool(
-        re.search(r"(?:nonewprivileges[\"']?\s*[:=]\s*[\"']?false|allowprivilegeescalation[\"']?\s*[:=]\s*[\"']?true)", low)
-    )
+    """Parse JSON, systemd INI, or Kubernetes YAML host manifests with strict format validation."""
+    stripped = (manifest_text or "").strip()
+    unsafe_caps = ("CAP_SYS_ADMIN", "CAP_DAC_READ_SEARCH", "CAP_NET_ADMIN")
+
+    def _result(
+        fmt: str,
+        valid: bool,
+        *,
+        service_enabled: bool = True,
+        helper_writable: bool = False,
+        privileged_container: bool = False,
+        no_new_priv: bool = False,
+        protect_sys: Any = False,
+        ambient_caps: Optional[List[str]] = None,
+        sock_restricted: bool = False,
+    ) -> Dict[str, Any]:
+        return {
+            "format": fmt,
+            "format_valid": valid,
+            "service_enabled": service_enabled,
+            "helper_writable": helper_writable,
+            "privileged_container": privileged_container,
+            "NoNewPrivileges": no_new_priv,
+            "ProtectSystem": protect_sys,
+            "ambient_caps": list(ambient_caps or []),
+            "socket_acl_restricted": sock_restricted,
+        }
+
+    if not stripped:
+        return _result("invalid", False)
+
+    # 1) JSON manifest
+    if stripped.startswith("{"):
+        try:
+            doc = json.loads(stripped)
+        except Exception:
+            return _result("json", False)
+        if not isinstance(doc, dict):
+            return _result("json", False)
+
+        dicts: List[Dict[str, Any]] = []
+        bfs_queue: List[Any] = [doc]
+        while bfs_queue:
+            cur = bfs_queue.pop(0)
+            if isinstance(cur, dict):
+                dicts.append(cur)
+                bfs_queue.extend(cur.values())
+            elif isinstance(cur, list):
+                bfs_queue.extend(cur)
+
+        def _bool_val(val: Any) -> Optional[bool]:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                s = val.strip().lower()
+                if s in ("true", "yes", "1"):
+                    return True
+                if s in ("false", "no", "0"):
+                    return False
+            return None
+
+        service_enabled = True
+        helper_writable = False
+        priv = False
+        nnp_true = False
+        nnp_false = False
+        protect_sys: Any = False
+        drop_all = False
+        found_caps: List[str] = []
+        sock_explicit_true = False
+        sock_explicit_false = False
+        has_security_ctx = False
+
+        for d in dicts:
+            for k, v in d.items():
+                kl = str(k).lower()
+                bv = _bool_val(v)
+                if kl in ("service_enabled", "serviceenabled") and bv is False:
+                    service_enabled = False
+                elif kl in ("helper_writable", "helperwritable") and bv is True:
+                    helper_writable = True
+                elif kl in ("privileged", "privileged_container") and bv is True:
+                    priv = True
+                elif kl == "allowprivilegeescalation":
+                    has_security_ctx = True
+                    if bv is True:
+                        priv = True
+                        nnp_false = True
+                    elif bv is False:
+                        nnp_true = True
+                elif kl == "nonewprivileges":
+                    if bv is True:
+                        nnp_true = True
+                    elif bv is False:
+                        nnp_false = True
+                elif kl == "protectsystem" and str(v).strip().lower() in ("strict", "full"):
+                    protect_sys = "strict"
+                elif kl == "readonlyrootfilesystem" and bv is True:
+                    protect_sys = "strict"
+                elif kl == "securitycontext" and isinstance(v, dict):
+                    has_security_ctx = True
+                elif kl == "capabilities":
+                    if isinstance(v, dict):
+                        drops = [str(x).upper() for x in (v.get("drop") or [])]
+                        if "ALL" in drops:
+                            drop_all = True
+                        for item in (v.get("add") or []):
+                            up_item = str(item).upper()
+                            if up_item in unsafe_caps and up_item not in found_caps:
+                                found_caps.append(up_item)
+                    elif isinstance(v, list):
+                        for item in v:
+                            up_item = str(item).upper()
+                            if up_item in unsafe_caps and up_item not in found_caps:
+                                found_caps.append(up_item)
+                elif kl in ("ambient_caps", "ambientcapabilities") and isinstance(v, list):
+                    for item in v:
+                        up_item = str(item).upper()
+                        if up_item in unsafe_caps and up_item not in found_caps:
+                            found_caps.append(up_item)
+                elif kl == "drop" and isinstance(v, list) and "ALL" in [str(x).upper() for x in v]:
+                    drop_all = True
+                elif kl in ("socket_acl_restricted", "socketaclrestricted"):
+                    if bv is True:
+                        sock_explicit_true = True
+                    elif bv is False:
+                        sock_explicit_false = True
+                elif kl in ("socketmode", "socket_mode"):
+                    mode_s = str(v).strip().lstrip("0")
+                    if mode_s in ("600", "660"):
+                        sock_explicit_true = True
+                    elif mode_s in ("666", "777"):
+                        sock_explicit_false = True
+
+        caps_out = [] if drop_all else found_caps
+        if has_security_ctx and not sock_explicit_true and not sock_explicit_false:
+            sock_restricted = True
+        else:
+            sock_restricted = bool(sock_explicit_true and not sock_explicit_false)
+        return _result(
+            "json",
+            True,
+            service_enabled=service_enabled,
+            helper_writable=helper_writable,
+            privileged_container=priv,
+            no_new_priv=bool(nnp_true and not nnp_false),
+            protect_sys=protect_sys,
+            ambient_caps=caps_out,
+            sock_restricted=sock_restricted,
+        )
+
+    # 2) systemd INI unit manifest
+    if re.search(r"(?m)^\[[A-Za-z0-9_.-]+\]\s*$", stripped):
+        for raw_ln in stripped.splitlines():
+            ln = raw_ln.strip()
+            if not ln or ln.startswith(("#", ";", "[")):
+                continue
+            if re.match(r"^[A-Za-z0-9_.-]+\s*:", ln):
+                return _result("systemd_ini", False)
+        cp = configparser.ConfigParser(delimiters=("=",), interpolation=None, strict=False)
+        cp.optionxform = str
+        try:
+            cp.read_string(manifest_text)
+        except configparser.Error:
+            return _result("systemd_ini", False)
+        if not cp.has_section("Service"):
+            return _result("systemd_ini", False)
+
+        kv: Dict[str, str] = {}
+        for sec in cp.sections():
+            for k, v in cp.items(sec):
+                kv[k.strip().lower()] = v.strip()
+
+        service_enabled = kv.get("serviceenabled", kv.get("service_enabled", "true")).lower() != "false"
+        helper_writable = kv.get("helperwritable", kv.get("helper_writable", "false")).lower() == "true"
+        for exec_key in ("execstart", "execstartpre"):
+            if re.search(r"chmod\s+(?:0?777|a\+w)", kv.get(exec_key, "").lower()):
+                helper_writable = True
+        priv = kv.get("privileged", kv.get("privilegedcontainer", "false")).lower() == "true"
+        no_new_priv = kv.get("nonewprivileges", "false").lower() == "true"
+        protect_sys: Any = "strict" if kv.get("protectsystem", "").lower() in ("strict", "full") else False
+
+        caps_raw = kv.get("ambientcapabilities", "").upper()
+        bbox_raw = kv.get("capabilityboundingset", None)
+        ambient_caps: List[str] = []
+        if bbox_raw is None or bbox_raw.strip() != "":
+            for cap in unsafe_caps:
+                if cap in caps_raw:
+                    ambient_caps.append(cap)
+
+        sock_mode = kv.get("socketmode", "").strip().lstrip("0")
+        restrict_af = kv.get("restrictaddressfamilies", "").upper()
+        sock_restricted = False
+        if sock_mode in ("600", "660"):
+            sock_restricted = True
+        elif sock_mode in ("666", "777"):
+            sock_restricted = False
+        elif restrict_af and "AF_UNIX" not in restrict_af:
+            sock_restricted = True
+        elif kv.get("socket_acl_restricted", "").lower() == "true":
+            sock_restricted = True
+
+        return _result(
+            "systemd_ini",
+            True,
+            service_enabled=service_enabled,
+            helper_writable=helper_writable,
+            privileged_container=priv,
+            no_new_priv=no_new_priv,
+            protect_sys=protect_sys,
+            ambient_caps=ambient_caps,
+            sock_restricted=sock_restricted,
+        )
+
+    # 3) Kubernetes / container YAML manifest
+    for raw_ln in stripped.splitlines():
+        ln = raw_ln.strip()
+        if not ln or ln.startswith("#") or ln in ("---", "..."):
+            continue
+        if ln.startswith("[") and ln.endswith("]"):
+            return _result("k8s_yaml", False)
+        if not (ln.startswith("- ") or ln == "-" or re.match(r"^['\"]?[A-Za-z0-9_./-]+['\"]?\s*:", ln)):
+            return _result("k8s_yaml", False)
+
+    low = stripped.lower()
+    service_enabled = not bool(re.search(r"(?:serviceenabled|service_enabled)\s*:\s*false", low))
+    helper_writable = bool(re.search(r"(?:helperwritable|helper_writable)\s*:\s*true", low))
+    priv = bool(re.search(r"(?:privileged|privileged_container|allowprivilegeescalation)\s*:\s*true", low))
+    nnp_true = bool(re.search(r"(?:allowprivilegeescalation\s*:\s*false|nonewprivileges\s*:\s*true)", low))
+    nnp_false = bool(re.search(r"(?:allowprivilegeescalation\s*:\s*true|nonewprivileges\s*:\s*false)", low))
     no_new_priv = bool(nnp_true and not nnp_false)
-
-    protect_sys: Any = False
-    if re.search(r"protectsystem[\"']?\s*[:=]\s*[\"']?(?:strict|full)", low):
-        protect_sys = "strict"
-
-    drop_all = bool(re.search(r"drop[\"']?\s*:\s*\[\s*['\"]?all['\"]?\s*\]", low))
-    ambient_caps: List[str] = []
-    if not drop_all:
-        for cap in ("CAP_SYS_ADMIN", "CAP_DAC_READ_SEARCH", "CAP_NET_ADMIN"):
-            if cap.lower() in low:
-                ambient_caps.append(cap)
-
-    sock_restricted = bool(
-        re.search(r"(?:socket_acl_restricted[\"']?\s*[:=]\s*[\"']?true|socketmode\s*=\s*0?(?:600|660))", low)
-    ) and not bool(
-        re.search(r"(?:socket_acl_restricted[\"']?\s*[:=]\s*[\"']?false|socketmode\s*=\s*0?(?:666|777))", low)
+    protect_sys = (
+        "strict"
+        if re.search(r"(?:readonlyrootfilesystem\s*:\s*true|protectsystem\s*:\s*['\"]?(?:strict|full)['\"]?)", low)
+        else False
     )
+    drop_all = bool(
+        re.search(r"drop\s*:\s*\[\s*['\"]?all['\"]?\s*\]", low)
+        or re.search(r"drop\s*:\s*\n\s*-\s*['\"]?all['\"]?", low)
+    )
+    ambient_caps = [] if drop_all else [cap for cap in unsafe_caps if cap.lower() in low]
 
-    return {
-        "service_enabled": service_enabled,
-        "helper_writable": helper_writable,
-        "privileged_container": priv,
-        "NoNewPrivileges": no_new_priv,
-        "ProtectSystem": protect_sys,
-        "ambient_caps": ambient_caps,
-        "socket_acl_restricted": sock_restricted,
-    }
+    has_perm_sock = bool(
+        re.search(r"(?:socketmode\s*:\s*['\"]?0?(?:666|777)['\"]?|socketaclrestricted\s*:\s*false|hostsocket\s*:\s*true)", low)
+    )
+    has_rest_sock = bool(
+        re.search(r"(?:socketmode\s*:\s*['\"]?0?(?:600|660)['\"]?|socketaclrestricted\s*:\s*true)", low)
+    )
+    if has_perm_sock:
+        sock_restricted = False
+    elif has_rest_sock or "securitycontext:" in low:
+        sock_restricted = True
+    else:
+        sock_restricted = False
+
+    return _result(
+        "k8s_yaml",
+        True,
+        service_enabled=service_enabled,
+        helper_writable=helper_writable,
+        privileged_container=priv,
+        no_new_priv=no_new_priv,
+        protect_sys=protect_sys,
+        ambient_caps=ambient_caps,
+        sock_restricted=sock_restricted,
+    )
 
 
 def _harden_manifest_text(manifest_text: str, defense_mode: str) -> str:
-    """Deterministically transform a host/container manifest on disk inside upperdir."""
+    """Harden a manifest strictly in its native format (JSON, systemd INI, or Kubernetes YAML)."""
+    parsed_meta = _parse_target_host_config(manifest_text)
+    fmt = parsed_meta["format"]
+    if not parsed_meta["format_valid"]:
+        raise ValueError(f"Cannot patch invalid {fmt} manifest")
+
+    if fmt == "json":
+        doc = json.loads(manifest_text)
+        if defense_mode == "naive_block_all":
+            if "serviceEnabled" in doc:
+                doc["serviceEnabled"] = False
+            else:
+                doc["service_enabled"] = False
+            return json.dumps(doc, indent=2) + "\n"
+
+        def _harden_json_obj(node: Any) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    _harden_json_obj(item)
+                return
+            if not isinstance(node, dict):
+                return
+            for k in list(node.keys()):
+                kl = str(k).lower()
+                if kl in ("service_enabled", "serviceenabled"):
+                    node[k] = True
+                elif kl in ("helper_writable", "helperwritable"):
+                    node[k] = False
+                elif kl in ("privileged", "privileged_container"):
+                    node[k] = False
+                elif kl == "allowprivilegeescalation":
+                    node[k] = False
+                elif kl == "nonewprivileges":
+                    node[k] = True
+                elif kl == "protectsystem":
+                    node[k] = "strict"
+                elif kl == "readonlyrootfilesystem":
+                    node[k] = True
+                elif kl in ("ambient_caps", "ambientcapabilities"):
+                    node[k] = []
+                elif kl == "capabilities":
+                    node[k] = {"drop": ["ALL"]}
+                elif kl in ("socket_acl_restricted", "socketaclrestricted"):
+                    node[k] = True
+                elif kl in ("socketmode", "socket_mode"):
+                    node[k] = "0600"
+                elif kl == "securitycontext" and isinstance(node[k], dict):
+                    _harden_json_obj(node[k])
+                    node[k]["privileged"] = False
+                    node[k]["allowPrivilegeEscalation"] = False
+                    node[k]["readOnlyRootFilesystem"] = True
+                    node[k]["capabilities"] = {"drop": ["ALL"]}
+                else:
+                    _harden_json_obj(node[k])
+
+        _harden_json_obj(doc)
+        has_k8s_sc = "securityContext" in json.dumps(doc)
+        if has_k8s_sc:
+            if "socket_acl_restricted" in doc:
+                doc["socket_acl_restricted"] = True
+        else:
+            doc["NoNewPrivileges"] = True
+            doc["ProtectSystem"] = "strict"
+            doc["privileged_container"] = False
+            doc["helper_writable"] = False
+            doc["ambient_caps"] = []
+            doc["capabilities"] = {"drop": ["ALL"]}
+            doc["socket_acl_restricted"] = True
+        return json.dumps(doc, indent=2) + "\n"
+
+    if fmt == "systemd_ini":
+        cp = configparser.ConfigParser(delimiters=("=",), interpolation=None, strict=False)
+        cp.optionxform = str
+        cp.read_string(manifest_text)
+        svc = cp["Service"]
+
+        def _set_key(section: configparser.SectionProxy, canonical: str, value: str) -> None:
+            for existing in list(section.keys()):
+                if existing.lower() == canonical.lower():
+                    section[existing] = value
+                    return
+            section[canonical] = value
+
+        if defense_mode == "naive_block_all":
+            _set_key(svc, "ServiceEnabled", "false")
+        else:
+            for k in list(svc.keys()):
+                if k.lower() in ("execstart", "execstartpre"):
+                    svc[k] = re.sub(r"(?i)chmod\s+(?:0?777|a\+w)", "chmod 0750", svc[k])
+                elif k.lower() in ("privileged", "privilegedcontainer"):
+                    svc[k] = "false"
+            if any(k.lower() in ("serviceenabled", "service_enabled") for k in svc.keys()):
+                _set_key(svc, "ServiceEnabled", "true")
+            _set_key(svc, "NoNewPrivileges", "true")
+            _set_key(svc, "ProtectSystem", "strict")
+            _set_key(svc, "HelperWritable", "false")
+            _set_key(svc, "AmbientCapabilities", "")
+            _set_key(svc, "CapabilityBoundingSet", "")
+            _set_key(svc, "RestrictAddressFamilies", "AF_INET AF_INET6")
+            if cp.has_section("Socket"):
+                _set_key(cp["Socket"], "SocketMode", "0600")
+            elif any(k.lower() == "socketmode" for k in svc.keys()):
+                _set_key(svc, "SocketMode", "0600")
+
+        buf = io.StringIO()
+        cp.write(buf, space_around_delimiters=False)
+        return buf.getvalue()
+
+    # 3) Kubernetes / container YAML manifest
+    lines = manifest_text.splitlines()
     if defense_mode == "naive_block_all":
-        if re.search(r"(?i)(?:service_enabled|serviceenabled)\s*[:=]", manifest_text):
-            return re.sub(
-                r"(?i)(service_enabled|serviceenabled)([\"']?\s*[:=]\s*[\"']?)true",
-                r"\1\g<2>false",
-                manifest_text,
-            )
-        return manifest_text.rstrip() + "\nservice_enabled: false\n"
+        replaced = False
+        new_lines: List[str] = []
+        for ln in lines:
+            if re.match(r"^\s*(?:serviceEnabled|service_enabled)\s*:", ln, flags=re.IGNORECASE):
+                new_lines.append(re.sub(r":\s*true\s*$", ": false", ln, flags=re.IGNORECASE))
+                replaced = True
+            else:
+                new_lines.append(ln)
+        if not replaced:
+            new_lines.append("serviceEnabled: false")
+        return "\n".join(new_lines) + "\n"
 
-    out = re.sub(r"(?i)(service_enabled|serviceenabled)([\"']?\s*[:=]\s*[\"']?)false", r"\1\g<2>true", manifest_text)
-    out = re.sub(r"(?i)(helper_writable[\"']?\s*[:=]\s*[\"']?)true", r"\g<1>false", out)
-    out = re.sub(r"(?i)chmod\s+(?:0?777|a\+w)", "chmod 0750", out)
-    out = re.sub(
-        r"(?i)((?:privileged|privileged_container|allowprivilegeescalation)[\"']?\s*[:=]\s*[\"']?)true",
-        r"\g<1>false",
-        out,
-    )
-    out = re.sub(r"(?i)(nonewprivileges[\"']?\s*[:=]\s*[\"']?)false", r"\g<1>true", out)
-    out = re.sub(r"(?i)(protectsystem[\"']?\s*[:=]\s*[\"']?)false", r"\g<1>strict", out)
-    out = re.sub(r"(?i)(socketmode\s*=\s*)0?(?:666|777)", r"\g<1>0600", out)
-    out = re.sub(r"(?i)(socket_acl_restricted[\"']?\s*[:=]\s*[\"']?)false", r"\g<1>true", out)
-    out = re.sub(r"(?i)capabilities[\"']?\s*[:=]\s*\[[^\]]*\]", 'capabilities:\n  drop: ["ALL"]', out)
+    out_lines: List[str] = []
+    i = 0
+    saw_security_ctx = False
+    while i < len(lines):
+        ln = lines[i]
+        m_sc = re.match(r"^([ \t]*)securityContext\s*:\s*(?:\{\})?\s*(?:#.*)?$", ln)
+        if m_sc:
+            saw_security_ctx = True
+            sc_indent = m_sc.group(1)
+            child_indent = sc_indent + "  "
+            j = i + 1
+            kept_children: List[str] = []
+            saw_helper_key = False
+            saw_sock_mode = False
+            saw_sock_acl = False
+            skip_caps_indent: Optional[int] = None
+            while j < len(lines):
+                cln = lines[j]
+                if cln.strip() == "":
+                    break
+                cur_indent = len(cln) - len(cln.lstrip(" \t"))
+                if cur_indent <= len(sc_indent):
+                    break
+                if skip_caps_indent is not None:
+                    if cur_indent > skip_caps_indent:
+                        j += 1
+                        continue
+                    skip_caps_indent = None
+                c_stripped = cln.strip()
+                if re.match(r"^capabilities\s*:", c_stripped, flags=re.IGNORECASE):
+                    skip_caps_indent = cur_indent
+                    j += 1
+                    continue
+                if re.match(r"^(?:privileged|allowPrivilegeEscalation|readOnlyRootFilesystem)\s*:", c_stripped, flags=re.IGNORECASE):
+                    j += 1
+                    continue
+                if re.match(r"^(?:helperWritable|helper_writable)\s*:", c_stripped, flags=re.IGNORECASE):
+                    saw_helper_key = True
+                    j += 1
+                    continue
+                if re.match(r"^socketMode\s*:", c_stripped, flags=re.IGNORECASE):
+                    saw_sock_mode = True
+                    j += 1
+                    continue
+                if re.match(r"^(?:socketAclRestricted|socket_acl_restricted)\s*:", c_stripped, flags=re.IGNORECASE):
+                    saw_sock_acl = True
+                    j += 1
+                    continue
+                kept_children.append(cln)
+                j += 1
 
-    low = out.lower()
-    extras: List[str] = []
-    if not re.search(r"nonewprivileges[\"']?\s*[:=]\s*[\"']?true", low):
-        extras.append("NoNewPrivileges=true")
-    if not re.search(r"protectsystem[\"']?\s*[:=]\s*[\"']?(?:strict|full)", low):
-        extras.append("ProtectSystem=strict")
-    if not re.search(r"(?:socket_acl_restricted[\"']?\s*[:=]\s*[\"']?true|socketmode\s*=\s*0?(?:600|660))", low):
-        extras.append("SocketMode=0600")
-    if not re.search(r"drop[\"']?\s*:\s*\[\s*['\"]?all['\"]?\s*\]", low):
-        extras.append('drop: ["ALL"]')
-    if not re.search(r"helper_writable[\"']?\s*[:=]\s*[\"']?false", low):
-        extras.append("helper_writable: false")
-    if extras:
-        out = out.rstrip() + "\n" + "\n".join(extras) + "\n"
-    return out
+            out_lines.append(f"{sc_indent}securityContext:")
+            out_lines.extend(kept_children)
+            out_lines.append(f"{child_indent}privileged: false")
+            out_lines.append(f"{child_indent}allowPrivilegeEscalation: false")
+            out_lines.append(f"{child_indent}readOnlyRootFilesystem: true")
+            if saw_helper_key:
+                out_lines.append(f"{child_indent}helperWritable: false")
+            if saw_sock_mode:
+                out_lines.append(f'{child_indent}socketMode: "0600"')
+            if saw_sock_acl:
+                out_lines.append(f"{child_indent}socketAclRestricted: true")
+            out_lines.append(f"{child_indent}capabilities:")
+            out_lines.append(f"{child_indent}  drop:")
+            out_lines.append(f"{child_indent}    - ALL")
+            i = j
+            continue
+
+        m_cap = re.match(r"^([ \t]*)capabilities\s*:\s*(?:\[[^\]]*\])?\s*(?:#.*)?$", ln)
+        if m_cap:
+            cap_indent = m_cap.group(1)
+            j = i + 1
+            while j < len(lines):
+                cln = lines[j]
+                if cln.strip() == "":
+                    break
+                cur_indent = len(cln) - len(cln.lstrip(" \t"))
+                if cur_indent <= len(cap_indent):
+                    break
+                j += 1
+            out_lines.append(f"{cap_indent}capabilities:")
+            out_lines.append(f"{cap_indent}  drop:")
+            out_lines.append(f"{cap_indent}    - ALL")
+            i = j
+            continue
+
+        ln_fixed = re.sub(r"(?i)^([ \t]*(?:serviceEnabled|service_enabled)\s*:\s*)false\b", r"\g<1>true", ln)
+        ln_fixed = re.sub(r"(?i)^([ \t]*(?:privileged|privileged_container|allowPrivilegeEscalation)\s*:\s*)true\b", r"\g<1>false", ln_fixed)
+        ln_fixed = re.sub(r"(?i)^([ \t]*readOnlyRootFilesystem\s*:\s*)false\b", r"\g<1>true", ln_fixed)
+        ln_fixed = re.sub(r"(?i)^([ \t]*(?:helperWritable|helper_writable)\s*:\s*)true\b", r"\g<1>false", ln_fixed)
+        ln_fixed = re.sub(r"(?i)^([ \t]*(?:socketAclRestricted|socket_acl_restricted)\s*:\s*)false\b", r"\g<1>true", ln_fixed)
+        ln_fixed = re.sub(r"(?i)^([ \t]*socketMode\s*:\s*)['\"]?0?(?:666|777)['\"]?", r'\g<1>"0600"', ln_fixed)
+        out_lines.append(ln_fixed)
+        i += 1
+
+    if not saw_security_ctx:
+        out_lines.extend([
+            "securityContext:",
+            "  privileged: false",
+            "  allowPrivilegeEscalation: false",
+            "  readOnlyRootFilesystem: true",
+            "  capabilities:",
+            "    drop:",
+            "      - ALL",
+        ])
+    return "\n".join(out_lines) + "\n"
+
+
+def _validate_hardened_manifest_syntax(manifest_text: str, expected_format: str) -> bool:
+    """Control-Plane strict parser verification ensuring hardened manifest preserves valid target syntax."""
+    parsed = _parse_target_host_config(manifest_text)
+    if not parsed["format_valid"] or parsed["format"] != expected_format:
+        return False
+    if expected_format == "json":
+        return isinstance(json.loads(manifest_text), dict)
+    if expected_format == "systemd_ini":
+        cp = configparser.ConfigParser(delimiters=("=",), interpolation=None, strict=False)
+        cp.read_string(manifest_text)
+        return cp.has_section("Service")
+    if expected_format == "k8s_yaml":
+        import yaml  # type: ignore[import-untyped]
+
+        doc = yaml.safe_load(manifest_text)
+        return isinstance(doc, dict)
+    return False
 
 
 def _build_m3_host_runtime_sim() -> str:
     parser_src = inspect.getsource(_parse_target_host_config)
     return (
-        "import os, re\n"
+        "import configparser, json, os, re\n"
         "from pathlib import Path\n"
-        "from typing import Any, Dict, List\n\n"
+        "from typing import Any, Dict, List, Optional\n\n"
         f"{parser_src}\n\n"
         '''\
 def check_action(vector: str) -> str:
@@ -1956,13 +2410,14 @@ def _run_m3_attack_path_hardening(
         "host_runtime_sim.py": _build_m3_host_runtime_sim(),
     }
     if has_real_manifest:
-        init_summary = f"Clonato manifest target reale in `{chamber.sandbox_id}` (modalità Shadow Clone CoW; lowerdir immutabile)."
-    else:
-        seed_files["systemd_unit.ini"] = "[Service]\nNoNewPrivileges=false\nProtectSystem=false\n"
-        seed_files["k8s_pod.yaml"] = "securityContext:\n  privileged: true\n  allowPrivilegeEscalation: true\n"
         init_summary = (
-            f"Simulazione Shadow Clone CoW `{chamber.sandbox_id}` avviata su **fixture sintetica** di riferimento "
-            "(nessun manifest host reale fornito; non rappresenta un audit dell'host locale)."
+            f"Clonato manifest target reale (`{baseline_cfg['format']}`, valid={baseline_cfg['format_valid']}) "
+            f"in `{chamber.sandbox_id}` (Shadow Clone CoW; lowerdir immutabile)."
+        )
+    else:
+        init_summary = (
+            f"Simulazione Shadow Clone CoW `{chamber.sandbox_id}` avviata su **fixture sintetica** (`systemd_ini`, "
+            "nessun manifest host reale fornito; non rappresenta un audit dell'host locale)."
         )
 
     chamber.seed_lowerdir(seed_files)
@@ -1970,8 +2425,35 @@ def _run_m3_attack_path_hardening(
         state="INIT_ARENA",
         actor="CONTROL_PLANE",
         summary=init_summary,
-        passed=True,
+        passed=bool(baseline_cfg["format_valid"]),
     ))
+
+    if not baseline_cfg["format_valid"]:
+        transitions.append(AckStateTransition(
+            state="CERTIFY_REPORT",
+            actor="ORACLE",
+            summary=f"Manifest rifiutato: sintassi `{baseline_cfg['format']}` non valida o formato misto.",
+            passed=False,
+        ))
+        return _MissionExecutionOutcome(
+            transitions=transitions,
+            contracts=contracts,
+            evidences=evidences,
+            mutation_rounds=[],
+            tpr_fpr_matrix=AckTprFprMatrix(
+                true_positive_rate=0.0,
+                false_positive_rate=0.0,
+                evasion_resistance_rate=0.0,
+                functional_survival_rate=0.0,
+                pre_patch_breach_confirmed=False,
+                post_patch_breaches=0,
+            ),
+            blue_summary="Nessuna patch applicata: manifest non valido.",
+            certified=False,
+            certification_verdict="INVALID_MANIFEST_FORMAT",
+            rationale="Il manifest fornito ha formato misto o sintassi non valida e non può essere certificato.",
+            audit_scope=audit_scope,
+        )
 
     _ = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="http://127.0.0.1:PORT/cloned_target_manifest")
     rel_base, _ = chamber.write_red_artifact("privesc_m3_base.py", '''\
@@ -2062,30 +2544,28 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
 
     _ = fow.build_blue_context(baseline_summary=json.dumps(baseline_cfg), oob_baseline=base_ev)
     if defense_mode == "naive_block_all":
-        blue_summary = "naive_block_all: disattivato completamente il servizio target (`service_enabled: false`) in `cloned_target_manifest.conf`."
+        blue_summary = f"naive_block_all ({baseline_cfg['format']}): disattivato il servizio nel manifest clonato."
     else:
         blue_summary = (
-            "structural: patch diretta di `cloned_target_manifest.conf` in upperdir CoW "
-            "(NoNewPrivileges=true, ProtectSystem=strict, helper_writable=false, capabilities drop ALL, SocketMode=0600)."
+            f"structural ({baseline_cfg['format']}): hardening format-preserving di `cloned_target_manifest.conf` "
+            "con validazione sintattica post-patch."
         )
 
+    parse_fn_src = inspect.getsource(_parse_target_host_config)
     harden_fn_src = inspect.getsource(_harden_manifest_text)
     rel_blue, _ = chamber.write_blue_artifact(
         "apply_hardening_m3.py",
         (
-            "import os, re\n"
+            "import configparser, io, json, os, re\n"
             "from pathlib import Path\n"
-            "from typing import List\n\n"
+            "from typing import Any, Dict, List, Optional\n\n"
+            f"{parse_fn_src}\n\n"
             f"{harden_fn_src}\n\n"
             "up = Path(os.environ['ACK_UPPERDIR'])\n"
             "manifest_path = up / 'cloned_target_manifest.conf'\n"
             "manifest_path.write_text(_harden_manifest_text(manifest_path.read_text(encoding='utf-8'), "
             f"{defense_mode!r}"
             "), encoding='utf-8')\n"
-            "if (up / 'systemd_unit.ini').exists():\n"
-            "    (up / 'systemd_unit.ini').write_text('[Service]\\nNoNewPrivileges=true\\nProtectSystem=strict\\n', encoding='utf-8')\n"
-            "if (up / 'k8s_pod.yaml').exists():\n"
-            "    (up / 'k8s_pod.yaml').write_text('securityContext:\\n  privileged: false\\n  allowPrivilegeEscalation: false\\n  capabilities:\\n    drop: [\"ALL\"]\\n', encoding='utf-8')\n"
         ),
     )
     blue_contract = _contract(
@@ -2101,9 +2581,12 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
     contracts.append(blue_contract)
     brc, _, _, bfs = chamber.run_contract(blue_contract)
     manifest_modified = "cloned_target_manifest.conf" in bfs.modified
-    post_cfg = _parse_target_host_config((chamber.upperdir / "cloned_target_manifest.conf").read_text(encoding="utf-8"))
+    post_manifest_text = (chamber.upperdir / "cloned_target_manifest.conf").read_text(encoding="utf-8")
+    post_cfg = _parse_target_host_config(post_manifest_text)
+    post_syntax_ok = _validate_hardened_manifest_syntax(post_manifest_text, str(baseline_cfg["format"]))
     post_manifest_hardened = bool(
-        not post_cfg["helper_writable"]
+        post_syntax_ok
+        and not post_cfg["helper_writable"]
         and not post_cfg["privileged_container"]
         and post_cfg["NoNewPrivileges"]
         and post_cfg["ProtectSystem"] == "strict"
@@ -2115,13 +2598,16 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
         exit_code=brc,
         fs_diff=bfs,
         isolation_backend=chamber.isolation_backend,
-        oracle_verdict="DEFENSE_HELD_CLEAN" if (brc == 0 and manifest_modified) else "EXECUTION_ERROR",
+        oracle_verdict="DEFENSE_HELD_CLEAN" if (brc == 0 and manifest_modified and post_syntax_ok) else "EXECUTION_ERROR",
     ))
     transitions.append(AckStateTransition(
         state="BLUE_DEFEND",
         actor="BLUE",
-        summary=f"Hardening CoW applicato su `cloned_target_manifest.conf` ({defense_mode}, modified={manifest_modified}).",
-        passed=(brc == 0 and manifest_modified),
+        summary=(
+            f"Hardening CoW applicato su `cloned_target_manifest.conf` ({defense_mode}, "
+            f"format={baseline_cfg['format']}, valid={post_syntax_ok}, modified={manifest_modified})."
+        ),
+        passed=(brc == 0 and manifest_modified and post_syntax_ok),
     ))
 
     # Boot isolated TARGET server over hardened cloned_target_manifest.conf
@@ -2165,7 +2651,7 @@ print("SERVICE_HEALTHY_200", end="")
             actor="ORACLE",
             summary=(
                 f"Check operativo servizio post-hardening: passed={func_ok} ({func_verdict}); "
-                f"manifest_modified={manifest_modified}, post_hardened={post_manifest_hardened}."
+                f"format={baseline_cfg['format']} valid={post_syntax_ok}, modified={manifest_modified}, hardened={post_manifest_hardened}."
             ),
             passed=bool(func_ok and manifest_modified and post_manifest_hardened),
         ))
@@ -2288,13 +2774,13 @@ out = body.get("output") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}
         rationale = f"Certificazione negata (fail-closed): {exec_errors} mutazioni non eseguite (`EXECUTION_ERROR`)."
     elif certified and has_real_manifest:
         cert_verdict = "CERTIFIED_HARDENED_CLONED_MANIFEST"
-        rationale = "Hardening verificato in clone CoW direttamente su `cloned_target_manifest.conf` con lowerdir immutabile e servizio sano."
+        rationale = f"Hardening verificato in clone CoW su `cloned_target_manifest.conf` ({baseline_cfg['format']}) con sintassi valida e lowerdir immutabile."
     elif certified:
         cert_verdict = "CERTIFIED_SYNTHETIC_SHADOW_CLONE_SIMULATION"
-        rationale = "Hardening certificato sulla fixture sintetica `cloned_target_manifest.conf` (non audit del sistema host corrente)."
+        rationale = "Hardening certificato sulla fixture sintetica `cloned_target_manifest.conf` (systemd_ini valido; non audit host corrente)."
     elif not (manifest_modified and post_manifest_hardened):
         cert_verdict = "HARDENING_BYPASSED"
-        rationale = "Hardening respinto out-of-band: `cloned_target_manifest.conf` non modificato o vettori ancora attivi."
+        rationale = "Hardening respinto out-of-band: `cloned_target_manifest.conf` non modificato, sintassi invalidata o vettori ancora attivi."
     else:
         cert_verdict = "HARDENING_BYPASSED"
         rationale = "Hardening aggirato dopo la patch."

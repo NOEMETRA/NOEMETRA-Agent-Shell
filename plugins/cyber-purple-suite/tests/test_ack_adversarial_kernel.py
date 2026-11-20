@@ -168,6 +168,29 @@ def test_ack_confinement_blocks_host_file_read_direct_canary_read_and_external_n
         assert fs_s.canary_accessed is False
         assert chamber.canary_token not in out_s
         assert "PermissionError" in err_s
+
+        # 6) Red must NEVER overwrite target modules in upperdir, and target_server rejects any untrusted change
+        _, _ = chamber.write_red_artifact(
+            "rogue_tamper_target.py",
+            "import os\nfrom pathlib import Path\n(Path(os.environ['ACK_UPPERDIR']) / 'target_service.py').write_text('print(open(\"canary_vault/canary.txt\").read())')\n",
+        )
+        c_tamper = c_host.model_copy(
+            update={
+                "action_id": "act_rogue_tamper",
+                "artifact_path": "artifacts/red/rogue_tamper_target.py",
+                "entrypoint": ["python3", "artifacts/red/rogue_tamper_target.py"],
+                "limits": ActionExecutionLimits(timeout_sec=10, max_procs=1, network_mode="none"),
+            }
+        )
+        rc_t, _, err_t, _ = chamber.run_contract(c_tamper)
+        assert rc_t != 0
+        assert "PermissionError" in err_t
+
+        # Even if a target module is altered externally on disk, target_server refuses to load it as TARGET
+        (chamber.upperdir / "target_service.py").write_text("def tampered(): pass\n", encoding="utf-8")
+        with pytest.raises(PermissionError):
+            with chamber.target_server("target_service.py", "tampered"):
+                pass
     finally:
         chamber.cleanup()
 
@@ -190,58 +213,103 @@ def test_ack_failed_mutation_execution_is_never_certified_as_defended():
 def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
     kernel = AdversarialCyberKernel()
 
-    # 1) Default invocation without manifest explicitly marks synthetic_fixture_simulation
+    # 1) Default invocation without manifest explicitly marks synthetic_fixture_simulation (systemd INI)
     rep_syn = kernel.run_mission("ack-m3-attack-path-hardening", mutation_rounds=3, defense_mode="structural")
     assert rep_syn.audit_scope == "synthetic_fixture_simulation"
     assert "SYNTHETIC" in rep_syn.certification_verdict
     assert rep_syn.certified is True
 
-    # 2) Cloning a real vulnerable Kubernetes/systemd manifest switches audit_scope to cloned_target_manifest
-    vuln_manifest = "\n".join([
+    # 2) Valid pure Kubernetes Pod YAML, pure systemd INI, and pure JSON all harden cleanly preserving format
+    vuln_yaml_manifest = "\n".join([
+        "apiVersion: v1",
+        "kind: Pod",
+        "metadata:",
+        "  name: api-worker",
+        "spec:",
+        "  containers:",
+        "    - name: worker",
+        "      image: python:3.12-slim",
+        "      securityContext:",
+        "        privileged: true",
+        "        allowPrivilegeEscalation: true",
+        "        capabilities:",
+        "          add:",
+        "            - CAP_SYS_ADMIN",
+    ])
+    vuln_ini_manifest = "\n".join([
         "[Service]",
         "NoNewPrivileges=false",
         "ProtectSystem=false",
-        "securityContext:",
-        "  privileged: true",
-        "  allowPrivilegeEscalation: true",
-        "capabilities: [CAP_SYS_ADMIN]",
+        "HelperWritable=true",
+        "AmbientCapabilities=CAP_SYS_ADMIN",
+        "[Socket]",
+        "SocketMode=0666",
     ])
-    rep_vuln_clone = kernel.run_mission(
-        "ack-m3-attack-path-hardening",
-        mutation_rounds=3,
-        defense_mode="structural",
-        target_config_content=vuln_manifest,
-    )
-    assert rep_vuln_clone.audit_scope == "cloned_target_manifest"
-    assert rep_vuln_clone.certification_verdict == "CERTIFIED_HARDENED_CLONED_MANIFEST"
-    assert rep_vuln_clone.certified is True
-    assert rep_vuln_clone.tpr_fpr_matrix.pre_patch_breach_confirmed is True
-    assert ActionExecutionLimits().max_procs == 1
-    blue_m3_ev = next(ev for ev in rep_vuln_clone.oracle_evidences if ev.action_id == "act_blue_m3_harden")
-    assert "cloned_target_manifest.conf" in blue_m3_ev.fs_diff.modified
-    assert blue_m3_ev.fs_diff.lowerdir_untouched is True
+    vuln_json_manifest = json.dumps({
+        "service_enabled": True,
+        "helper_writable": True,
+        "privileged_container": True,
+        "NoNewPrivileges": False,
+        "ProtectSystem": False,
+        "ambient_caps": ["CAP_SYS_ADMIN"],
+        "socket_acl_restricted": False,
+    }, indent=2)
 
-    # 3) Already hardened manifest must NOT claim a fake pre-patch escalation
-    hardened_manifest = "\n".join([
-        "[Service]",
-        "NoNewPrivileges=true",
-        "ProtectSystem=strict",
-        "SocketMode=0600",
-        "securityContext:",
-        "  privileged: false",
-        "  allowPrivilegeEscalation: false",
-        "  drop: ['ALL']",
+    for manifest in (vuln_yaml_manifest, vuln_ini_manifest, vuln_json_manifest):
+        rep_vuln_clone = kernel.run_mission(
+            "ack-m3-attack-path-hardening",
+            mutation_rounds=3,
+            defense_mode="structural",
+            target_config_content=manifest,
+        )
+        assert rep_vuln_clone.audit_scope == "cloned_target_manifest"
+        assert rep_vuln_clone.certification_verdict == "CERTIFIED_HARDENED_CLONED_MANIFEST"
+        assert rep_vuln_clone.certified is True
+        assert rep_vuln_clone.tpr_fpr_matrix.pre_patch_breach_confirmed is True
+        assert ActionExecutionLimits().max_procs == 1
+        blue_m3_ev = next(ev for ev in rep_vuln_clone.oracle_evidences if ev.action_id == "act_blue_m3_harden")
+        assert "cloned_target_manifest.conf" in blue_m3_ev.fs_diff.modified
+        assert blue_m3_ev.fs_diff.lowerdir_untouched is True
+
+    # 3) Already hardened YAML manifest must NOT claim a fake pre-patch escalation
+    hardened_yaml_manifest = "\n".join([
+        "apiVersion: v1",
+        "kind: Pod",
+        "metadata:",
+        "  name: api-worker-hardened",
+        "spec:",
+        "  containers:",
+        "    - name: worker",
+        "      image: python:3.12-slim",
+        "      securityContext:",
+        "        privileged: false",
+        "        allowPrivilegeEscalation: false",
+        "        readOnlyRootFilesystem: true",
+        "        capabilities:",
+        "          drop:",
+        "            - ALL",
     ])
     rep_hardened_clone = kernel.run_mission(
         "ack-m3-attack-path-hardening",
         mutation_rounds=3,
         defense_mode="structural",
-        target_config_content=hardened_manifest,
+        target_config_content=hardened_yaml_manifest,
     )
     assert rep_hardened_clone.audit_scope == "cloned_target_manifest"
     assert rep_hardened_clone.tpr_fpr_matrix.pre_patch_breach_confirmed is False
     assert rep_hardened_clone.certified is False
     assert rep_hardened_clone.certification_verdict == "NO_BASELINE_PRIVESC_IN_CLONED_MANIFEST"
+
+    # 4) Mixed INI+YAML invalid document must be rejected rather than certified
+    mixed_invalid = "[Service]\nNoNewPrivileges=false\nsecurityContext:\n  privileged: true\n"
+    rep_invalid = kernel.run_mission(
+        "ack-m3-attack-path-hardening",
+        mutation_rounds=3,
+        defense_mode="structural",
+        target_config_content=mixed_invalid,
+    )
+    assert rep_invalid.certified is False
+    assert rep_invalid.certification_verdict == "INVALID_MANIFEST_FORMAT"
 
 
 def test_ack_oracle_anti_cheating_and_bypass_rejection(tmp_path):
