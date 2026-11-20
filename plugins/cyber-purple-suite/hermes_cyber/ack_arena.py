@@ -1922,8 +1922,22 @@ def _yaml_safe_load_compat(text: str) -> Any:
                 hex_part = inner[i + 2 : i + 2 + hex_len]
                 if len(hex_part) != hex_len:
                     raise ValueError(f"Truncated \\{esc} escape in YAML scalar")
-                out.append(chr(int(hex_part, 16)))
-                i += 2 + hex_len
+                code = int(hex_part, 16)
+                if code > 0x10FFFF:
+                    raise ValueError(f"Unicode escape out of range in YAML scalar: \\{esc}{hex_part}")
+                if esc == "u" and 0xD800 <= code <= 0xDBFF:
+                    if inner[i + 6 : i + 8] != "\\u" or len(inner) < i + 12:
+                        raise ValueError("Unpaired high UTF-16 surrogate in YAML scalar")
+                    low = int(inner[i + 8 : i + 12], 16)
+                    if not (0xDC00 <= low <= 0xDFFF):
+                        raise ValueError("Invalid low UTF-16 surrogate in YAML scalar")
+                    out.append(chr(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)))
+                    i += 12
+                elif 0xD800 <= code <= 0xDFFF:
+                    raise ValueError("Unpaired UTF-16 surrogate in YAML scalar")
+                else:
+                    out.append(chr(code))
+                    i += 2 + hex_len
             else:
                 raise ValueError(f"Unsupported YAML escape sequence: \\{esc}")
         return "".join(out)
@@ -2169,7 +2183,7 @@ def _yaml_safe_dump_compat(data: Any) -> str:
             or ": " in s
             or s.endswith(":")
         ):
-            return json.dumps(s)
+            return json.dumps(s, ensure_ascii=False)
         return s
 
     lines: List[str] = []

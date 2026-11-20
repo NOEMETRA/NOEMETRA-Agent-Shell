@@ -308,6 +308,7 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest(monk
         '    null_str: "null"',
         "    single_esc: 'it''s'",
         '    multiline_esc: "line1\\nline2"',
+        '    emoji_esc: "\\ud83d\\ude00"',
         "spec:",
         "  containers:",
         "    - name: worker",
@@ -317,6 +318,7 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest(monk
 
     monkeypatch.setenv("ACK_FORCE_STDLIB_YAML", "1")
     stdlib_hardened = _harden_manifest_text(quoted_yaml, "structural")
+    stdlib_hardened.encode("utf-8")
     stdlib_parsed = _yaml_safe_load_compat(stdlib_hardened)
     ann = stdlib_parsed["metadata"]["annotations"]
     assert ann["bool_str"] == "true" and isinstance(ann["bool_str"], str)
@@ -324,6 +326,7 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest(monk
     assert ann["null_str"] == "null" and isinstance(ann["null_str"], str)
     assert ann["single_esc"] == "it's"
     assert ann["multiline_esc"] == "line1\nline2"
+    assert ann["emoji_esc"] == "\U0001f600"
     assert "securityContext" not in stdlib_parsed
     assert _parse_target_host_config(stdlib_hardened)["all_containers_hardened"] is True
     assert _parse_target_host_config(vuln_unprefixed_cap_yaml)["ambient_caps"] == ["CAP_SYS_ADMIN"]
