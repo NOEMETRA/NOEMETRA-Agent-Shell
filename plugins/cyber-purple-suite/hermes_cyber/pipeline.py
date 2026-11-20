@@ -1034,6 +1034,7 @@ class CyberPurpleAssistant:
         *,
         mutation_rounds: int = 3,
         defense_mode: str = "structural",
+        target_config_content: Optional[str] = None,
     ) -> AckCertificationReport:
         """Execute an isolated CoW DetonationChamber ACK mission and store the latest certified report."""
         self._check_profile_storage_live()
@@ -1041,6 +1042,7 @@ class CyberPurpleAssistant:
             mission_id,
             mutation_rounds=mutation_rounds,
             defense_mode=defense_mode,
+            target_config_content=target_config_content,
         )
         self._last_ack_report = report
         return report

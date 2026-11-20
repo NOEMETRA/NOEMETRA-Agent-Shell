@@ -336,6 +336,7 @@ AckOracleVerdictType = Literal[
     "DEFENSE_HELD_CLEAN",
     "DEFENSE_REJECTED_BROKEN_FUNC",
     "DEFENSE_REJECTED_HIGH_FPR",
+    "EXECUTION_ERROR",
 ]
 
 AckMissionKind = Literal[
@@ -409,6 +410,9 @@ class OutOfBandOracleEvidence(BaseModel):
     functional_suite_passed: Optional[bool] = None
     fpr_value: Optional[float] = None
     crash_reproduced: bool = False
+    execution_valid: bool = True
+    attempts_executed: int = 0
+    isolation_backend: str = "confined_supervisor_audit_hook"
     oracle_verdict: AckOracleVerdictType
 
 
@@ -443,6 +447,8 @@ class AckMutationRoundResult(BaseModel):
     previous_failed_classes: List[str] = Field(default_factory=list)
     contract: ConstrainedActionContract
     oracle_evidence: OutOfBandOracleEvidence
+    execution_valid: bool = True
+    attempts_executed: int = 0
     bypass_succeeded: bool = False
 
 
@@ -477,6 +483,8 @@ class AckCertificationReport(BaseModel):
     sandbox_id: str
     tier_used: str = "tier1_cow_arena"
     shadow_clone_only: bool = False
+    audit_scope: Literal["synthetic_fixture_simulation", "cloned_target_manifest"] = "synthetic_fixture_simulation"
+    isolation_backend: str = "confined_supervisor_audit_hook"
     defense_mode: str = "structural"
     target_invariant: str
     certified: bool

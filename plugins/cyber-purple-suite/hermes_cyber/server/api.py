@@ -86,6 +86,7 @@ class AckMissionRunRequest(BaseModel):
         "naive_block_all",
         "overbroad_alert_all",
     ] = "structural"
+    target_config_content: Optional[str] = None
 
 
 @router.get("/status")
@@ -195,6 +196,7 @@ async def run_ack_mission(req: AckMissionRunRequest, request: Request):
             req.mission_id,
             mutation_rounds=req.mutation_rounds,
             defense_mode=req.defense_mode,
+            target_config_content=req.target_config_content,
         )
         return report.model_dump(mode="json")
     except KeyError as exc:

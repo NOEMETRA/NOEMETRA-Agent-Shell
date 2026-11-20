@@ -59,9 +59,143 @@ def test_all_four_ack_missions_structural_pass_seven_states_and_oob_invariants(m
     classes = [r.attack_class for r in rep.mutation_rounds]
     assert len(set(classes)) == 3, f"Red must change attack class every round, got {classes}"
 
-    # Out-of-band FS checks must confirm lowerdir immutability and no post-patch bypasses
+    # Out-of-band FS checks must confirm lowerdir immutability, valid executions, and no post-patch bypasses
     assert all(ev.fs_diff.lowerdir_untouched for ev in rep.oracle_evidences)
-    assert all(not r.bypass_succeeded for r in rep.mutation_rounds)
+    assert all(r.execution_valid and r.attempts_executed >= 1 and not r.bypass_succeeded for r in rep.mutation_rounds)
+
+
+def test_ack_confinement_blocks_host_file_read_direct_canary_read_and_external_network(tmp_path):
+    host_secret = tmp_path / "host_sensitive.txt"
+    host_secret.write_text("HOST_SECRET_DO_NOT_READ", encoding="utf-8")
+
+    chamber = DetonationChamber()
+    try:
+        chamber.seed_lowerdir({"target_service.py": "def noop(): return 'ok'\n"})
+        chamber.write_blue_artifact("blue_secret.txt", "BLUE_SECRET_RULE")
+
+        # 1) Attempting to read an external host file outside DetonationChamber must fail with PermissionError
+        _, _ = chamber.write_red_artifact(
+            "rogue_host_read.py",
+            f"print(open({str(host_secret)!r}, encoding='utf-8').read())\n",
+        )
+        c_host = ConstrainedActionContract(
+            action_id="act_rogue_host",
+            actor="RED",
+            phase="RED_WEAPONIZE",
+            sandbox_id=chamber.sandbox_id,
+            primitive="EXEC_ARTIFACT",
+            artifact_path="artifacts/red/rogue_host_read.py",
+            entrypoint=["python3", "artifacts/red/rogue_host_read.py"],
+            limits=ActionExecutionLimits(timeout_sec=10, max_procs=4, network_mode="none"),
+            target_invariant="INV_HOST_CONFINEMENT",
+        )
+        rc_h, out_h, err_h, _ = chamber.run_contract(c_host)
+        assert rc_h != 0
+        assert "HOST_SECRET_DO_NOT_READ" not in out_h
+        assert "PermissionError" in err_h
+
+        # 2) Red artifact attempting direct canary read (without going through target_service) must be blocked
+        _, _ = chamber.write_red_artifact(
+            "rogue_direct_canary.py",
+            "import os; from pathlib import Path; print((Path(os.environ['ACK_UPPERDIR']) / 'canary_vault' / 'canary.txt').read_text())\n",
+        )
+        c_can = c_host.model_copy(
+            update={
+                "action_id": "act_rogue_canary",
+                "artifact_path": "artifacts/red/rogue_direct_canary.py",
+                "entrypoint": ["python3", "artifacts/red/rogue_direct_canary.py"],
+            }
+        )
+        rc_c, out_c, err_c, fs_c = chamber.run_contract(c_can)
+        assert rc_c != 0
+        assert fs_c.canary_accessed is False
+        assert "PermissionError" in err_c
+
+        # 3) External DNS / socket connection blocked under network_mode="none"
+        _, _ = chamber.write_red_artifact(
+            "rogue_net.py",
+            "import socket; s = socket.socket(); s.connect(('8.8.8.8', 53))\n",
+        )
+        c_net = c_host.model_copy(
+            update={
+                "action_id": "act_rogue_net",
+                "artifact_path": "artifacts/red/rogue_net.py",
+                "entrypoint": ["python3", "artifacts/red/rogue_net.py"],
+            }
+        )
+        rc_n, _, err_n, _ = chamber.run_contract(c_net)
+        assert rc_n != 0
+        assert "PermissionError" in err_n
+    finally:
+        chamber.cleanup()
+
+
+def test_ack_failed_mutation_execution_is_never_certified_as_defended():
+    kernel = AdversarialCyberKernel()
+    rep = kernel.run_mission(
+        "ack-m1-exploit-patch-bypass",
+        mutation_rounds=3,
+        defense_mode="structural",
+        inject_broken_mutation=True,
+    )
+    assert rep.certified is False
+    assert rep.certification_verdict == "REJECTED_MUTATION_EXECUTION_ERROR"
+    assert rep.mutation_rounds[0].execution_valid is False
+    assert rep.mutation_rounds[0].oracle_evidence.oracle_verdict == "EXECUTION_ERROR"
+    assert rep.mutation_rounds[0].oracle_evidence.execution_valid is False
+
+
+def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
+    kernel = AdversarialCyberKernel()
+
+    # 1) Default invocation without manifest explicitly marks synthetic_fixture_simulation
+    rep_syn = kernel.run_mission("ack-m3-attack-path-hardening", mutation_rounds=3, defense_mode="structural")
+    assert rep_syn.audit_scope == "synthetic_fixture_simulation"
+    assert "SYNTHETIC" in rep_syn.certification_verdict
+    assert rep_syn.certified is True
+
+    # 2) Cloning a real vulnerable Kubernetes/systemd manifest switches audit_scope to cloned_target_manifest
+    vuln_manifest = "\n".join([
+        "[Service]",
+        "NoNewPrivileges=false",
+        "ProtectSystem=false",
+        "securityContext:",
+        "  privileged: true",
+        "  allowPrivilegeEscalation: true",
+        "capabilities: [CAP_SYS_ADMIN]",
+    ])
+    rep_vuln_clone = kernel.run_mission(
+        "ack-m3-attack-path-hardening",
+        mutation_rounds=3,
+        defense_mode="structural",
+        target_config_content=vuln_manifest,
+    )
+    assert rep_vuln_clone.audit_scope == "cloned_target_manifest"
+    assert rep_vuln_clone.certification_verdict == "CERTIFIED_HARDENED_CLONED_MANIFEST"
+    assert rep_vuln_clone.certified is True
+    assert rep_vuln_clone.tpr_fpr_matrix.pre_patch_breach_confirmed is True
+
+    # 3) Already hardened manifest must NOT claim a fake pre-patch escalation
+    hardened_manifest = "\n".join([
+        "[Service]",
+        "NoNewPrivileges=true",
+        "ProtectSystem=strict",
+        "SocketMode=0600",
+        "securityContext:",
+        "  privileged: false",
+        "  allowPrivilegeEscalation: false",
+        "  drop: ['ALL']",
+    ])
+    rep_hardened_clone = kernel.run_mission(
+        "ack-m3-attack-path-hardening",
+        mutation_rounds=3,
+        defense_mode="structural",
+        target_config_content=hardened_manifest,
+    )
+    assert rep_hardened_clone.audit_scope == "cloned_target_manifest"
+    assert rep_hardened_clone.tpr_fpr_matrix.pre_patch_breach_confirmed is False
+    assert rep_hardened_clone.certified is False
+    assert rep_hardened_clone.certification_verdict == "NO_BASELINE_PRIVESC_IN_CLONED_MANIFEST"
 
 
 def test_ack_oracle_anti_cheating_and_bypass_rejection(tmp_path):

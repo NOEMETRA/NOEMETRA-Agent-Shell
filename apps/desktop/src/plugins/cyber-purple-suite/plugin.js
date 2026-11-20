@@ -948,8 +948,10 @@ function CyberPurplePage({ ctx }) {
                                   jsx('span', { className: ackReport.certified ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red', children: ackReport.certified ? 'CERTIFIED' : 'REJECTED' }),
                                   jsx('span', { className: 'cp-badge cp-b-purple', children: ackReport.certification_verdict }),
                                   jsx('span', { className: 'cp-badge cp-b-blue', children: `Sandbox: ${ackReport.sandbox_id}` }),
+                                  ackReport.isolation_backend ? jsx('span', { className: 'cp-badge cp-b-purple', children: ackReport.isolation_backend }) : null,
+                                  ackReport.audit_scope ? jsx('span', { className: ackReport.audit_scope === 'cloned_target_manifest' ? 'cp-badge cp-b-green' : 'cp-badge cp-b-amber', children: ackReport.audit_scope }) : null,
                                   ackReport.fog_of_war?.enforced ? jsx('span', { className: 'cp-badge cp-b-green', children: 'Fog of War Enforced' }) : null,
-                                  ackReport.shadow_clone_only ? jsx('span', { className: 'cp-badge cp-b-amber', children: 'Shadow Clone Only (Lowerdir Host Untouched)' }) : null
+                                  ackReport.shadow_clone_only ? jsx('span', { className: 'cp-badge cp-b-amber', children: 'Shadow Clone CoW' }) : null
                                 ]
                               }),
                               jsx('div', { style: { fontWeight: 700, fontSize: '13.5px', marginBottom: '4px' }, children: ackReport.title }),

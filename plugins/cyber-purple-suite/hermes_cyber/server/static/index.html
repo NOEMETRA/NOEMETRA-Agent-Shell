@@ -287,6 +287,8 @@
           <span class="badge ${rep.certified ? 'b-green' : 'b-red'}">${rep.certified ? 'CERTIFIED' : 'REJECTED'}</span>
           <span class="badge b-purple">${esc(rep.certification_verdict)}</span>
           <span class="badge b-blue">Sandbox: ${esc(rep.sandbox_id)}</span>
+          ${rep.isolation_backend ? `<span class="badge b-purple">${esc(rep.isolation_backend)}</span>` : ''}
+          ${rep.audit_scope ? `<span class="badge ${rep.audit_scope === 'cloned_target_manifest' ? 'b-green' : 'b-amber'}">${esc(rep.audit_scope)}</span>` : ''}
           ${fow.enforced ? '<span class="badge b-green">Fog of War Enforced</span>' : ''}
           ${rep.shadow_clone_only ? '<span class="badge b-amber">Shadow Clone CoW</span>' : ''}
           <h3 style="margin:6px 0;">${esc(rep.title)}</h3>

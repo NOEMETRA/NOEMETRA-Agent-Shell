@@ -80,11 +80,13 @@ def cyber_run_ack_mission(args: Any = None, **kwargs) -> str:
     mission_id = str(_extract_arg(args, kwargs, "mission_id", "ack-m1-exploit-patch-bypass") or "")
     mutation_rounds = int(_extract_arg(args, kwargs, "mutation_rounds", 3) or 3)
     defense_mode = str(_extract_arg(args, kwargs, "defense_mode", "structural") or "structural")
+    target_config = _extract_arg(args, kwargs, "target_config_content", None)
     try:
         report = _get_cyber_assistant().run_ack_mission(
             mission_id=mission_id,
             mutation_rounds=mutation_rounds,
             defense_mode=defense_mode,
+            target_config_content=str(target_config) if target_config is not None else None,
         )
         return json.dumps(report.model_dump(mode="json"), indent=2)
     except Exception as exc:
@@ -182,6 +184,10 @@ TOOLS = [
                     "defense_mode": {
                         "type": "string",
                         "description": "structural | naive_string_replace | naive_block_all | overbroad_alert_all",
+                    },
+                    "target_config_content": {
+                        "type": "string",
+                        "description": "Manifest/config reale opzionale clonato in lowerdir per ack-m3-attack-path-hardening",
                     },
                 },
                 "required": ["mission_id"],
