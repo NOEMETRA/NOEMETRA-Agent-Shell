@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import configparser
 import ctypes
 import hashlib
 import inspect
-import io
 import json
 import os
 import queue
@@ -14,9 +12,11 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import uuid
+import yaml  # type: ignore[import-untyped]
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -161,6 +161,7 @@ _PY_ROOTS = [
         sys.exec_prefix,
         getattr(sys, "base_exec_prefix", sys.exec_prefix),
         Path(os.__file__).resolve().parent,
+        *(_POLICY.get("extra_py_roots") or []),
     )
     if p
 ]
@@ -523,7 +524,8 @@ class DetonationChamber:
         return artifact_abs, extra_args
 
     def _base_confined_env(self, policy: Dict[str, Any]) -> Dict[str, str]:
-        return {
+        enriched_policy = dict(policy)
+        env: Dict[str, str] = {
             "PATH": os.environ.get("PATH", ""),
             "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
             "TEMP": str(self.upperdir),
@@ -531,8 +533,18 @@ class DetonationChamber:
             "PYTHONDONTWRITEBYTECODE": "1",
             "ACK_SANDBOX_ID": self.sandbox_id,
             "ACK_UPPERDIR": str(self.upperdir),
-            "ACK_CONFINE_POLICY": json.dumps(policy),
         }
+        if enriched_policy.get("actor") in ("BLUE", "TARGET"):
+            site_dirs = list(dict.fromkeys(
+                str(Path(p).resolve())
+                for p in (sysconfig.get_path("purelib"), sysconfig.get_path("platlib"))
+                if p and Path(p).is_dir()
+            ))
+            if site_dirs:
+                enriched_policy["extra_py_roots"] = site_dirs
+                env["PYTHONPATH"] = os.pathsep.join(site_dirs)
+        env["ACK_CONFINE_POLICY"] = json.dumps(enriched_policy)
+        return env
 
     @staticmethod
     def _resolve_confined_python() -> str:
@@ -1819,7 +1831,7 @@ SocketMode=0666
 
 
 def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
-    """Parse JSON, systemd INI, or Kubernetes YAML host manifests with strict format validation."""
+    """Parse JSON, systemd INI (preserving repeated directives), or Kubernetes YAML manifests with strict validation."""
     stripped = (manifest_text or "").strip()
     unsafe_caps = ("CAP_SYS_ADMIN", "CAP_DAC_READ_SEARCH", "CAP_NET_ADMIN")
 
@@ -1834,6 +1846,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
         protect_sys: Any = False,
         ambient_caps: Optional[List[str]] = None,
         sock_restricted: bool = False,
+        all_containers_hardened: bool = True,
     ) -> Dict[str, Any]:
         return {
             "format": fmt,
@@ -1845,53 +1858,45 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
             "ProtectSystem": protect_sys,
             "ambient_caps": list(ambient_caps or []),
             "socket_acl_restricted": sock_restricted,
+            "all_containers_hardened": all_containers_hardened,
         }
 
-    if not stripped:
-        return _result("invalid", False)
+    def _bool_val(val: Any) -> Optional[bool]:
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            s = val.strip().lower()
+            if s in ("true", "yes", "1"):
+                return True
+            if s in ("false", "no", "0"):
+                return False
+        return None
 
-    # 1) JSON manifest
-    if stripped.startswith("{"):
-        try:
-            doc = json.loads(stripped)
-        except Exception:
-            return _result("json", False)
-        if not isinstance(doc, dict):
-            return _result("json", False)
-
+    def _collect_dicts_and_containers(root_doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         dicts: List[Dict[str, Any]] = []
-        bfs_queue: List[Any] = [doc]
+        containers: List[Dict[str, Any]] = []
+        bfs_queue: List[Any] = [root_doc]
         while bfs_queue:
             cur = bfs_queue.pop(0)
             if isinstance(cur, dict):
                 dicts.append(cur)
-                bfs_queue.extend(cur.values())
+                for k, v in cur.items():
+                    if str(k).lower() in ("containers", "initcontainers", "ephemeralcontainers") and isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, dict):
+                                containers.append(item)
+                    bfs_queue.append(v)
             elif isinstance(cur, list):
                 bfs_queue.extend(cur)
+        return dicts, containers
 
-        def _bool_val(val: Any) -> Optional[bool]:
-            if isinstance(val, bool):
-                return val
-            if isinstance(val, str):
-                s = val.strip().lower()
-                if s in ("true", "yes", "1"):
-                    return True
-                if s in ("false", "no", "0"):
-                    return False
-            return None
+    def _eval_structured_doc(fmt: str, doc: Dict[str, Any]) -> Dict[str, Any]:
+        dicts, containers = _collect_dicts_and_containers(doc)
 
         service_enabled = True
         helper_writable = False
-        priv = False
-        nnp_true = False
-        nnp_false = False
-        protect_sys: Any = False
-        drop_all = False
-        found_caps: List[str] = []
         sock_explicit_true = False
         sock_explicit_false = False
-        has_security_ctx = False
-
         for d in dicts:
             for k, v in d.items():
                 kl = str(k).lower()
@@ -1900,7 +1905,85 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
                     service_enabled = False
                 elif kl in ("helper_writable", "helperwritable") and bv is True:
                     helper_writable = True
-                elif kl in ("privileged", "privileged_container") and bv is True:
+                elif kl in ("socket_acl_restricted", "socketaclrestricted"):
+                    if bv is True:
+                        sock_explicit_true = True
+                    elif bv is False:
+                        sock_explicit_false = True
+                elif kl in ("socketmode", "socket_mode"):
+                    mode_s = str(v).strip().lstrip("0")
+                    if mode_s in ("600", "660"):
+                        sock_explicit_true = True
+                    elif mode_s in ("666", "777"):
+                        sock_explicit_false = True
+                elif isinstance(v, str) and re.search(r"chmod\s+(?:0?777|a\+w)", v.lower()):
+                    helper_writable = True
+
+        # Reject misplaced container-only securityContext at Pod root when containers exist without hardening
+        if containers:
+            all_hardened = True
+            any_priv = False
+            all_nnp = True
+            all_ro_root = True
+            found_caps: List[str] = []
+            for c in containers:
+                sc = c.get("securityContext")
+                if not isinstance(sc, dict):
+                    all_hardened = False
+                    all_nnp = False
+                    all_ro_root = False
+                    if "CAP_DAC_READ_SEARCH" not in found_caps:
+                        found_caps.append("CAP_DAC_READ_SEARCH")
+                    continue
+                if sc.get("privileged") is True or sc.get("allowPrivilegeEscalation") is True:
+                    any_priv = True
+                if sc.get("allowPrivilegeEscalation") is not False:
+                    all_hardened = False
+                    all_nnp = False
+                if sc.get("readOnlyRootFilesystem") is not True:
+                    all_hardened = False
+                    all_ro_root = False
+                if sc.get("privileged") is True:
+                    all_hardened = False
+                caps = sc.get("capabilities")
+                drops = [str(x).upper() for x in (caps.get("drop") or [])] if isinstance(caps, dict) else []
+                adds = [str(x).upper() for x in (caps.get("add") or [])] if isinstance(caps, dict) else []
+                for cap_name in adds:
+                    if cap_name in unsafe_caps and cap_name not in found_caps:
+                        found_caps.append(cap_name)
+                if "ALL" not in drops:
+                    all_hardened = False
+                    if not adds and "CAP_DAC_READ_SEARCH" not in found_caps:
+                        found_caps.append("CAP_DAC_READ_SEARCH")
+                elif any(cap_name in unsafe_caps for cap_name in adds):
+                    all_hardened = False
+
+            sock_restricted = bool(not sock_explicit_false) if (not sock_explicit_false and not sock_explicit_true) else bool(sock_explicit_true and not sock_explicit_false)
+            return _result(
+                fmt,
+                True,
+                service_enabled=service_enabled,
+                helper_writable=helper_writable,
+                privileged_container=any_priv,
+                no_new_priv=all_nnp,
+                protect_sys="strict" if all_ro_root else False,
+                ambient_caps=found_caps,
+                sock_restricted=sock_restricted,
+                all_containers_hardened=all_hardened,
+            )
+
+        priv = False
+        nnp_true = False
+        nnp_false = False
+        protect_sys: Any = False
+        drop_all = False
+        found_caps = []
+        has_security_ctx = False
+        for d in dicts:
+            for k, v in d.items():
+                kl = str(k).lower()
+                bv = _bool_val(v)
+                if kl in ("privileged", "privileged_container") and bv is True:
                     priv = True
                 elif kl == "allowprivilegeescalation":
                     has_security_ctx = True
@@ -1922,8 +2005,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
                     has_security_ctx = True
                 elif kl == "capabilities":
                     if isinstance(v, dict):
-                        drops = [str(x).upper() for x in (v.get("drop") or [])]
-                        if "ALL" in drops:
+                        if "ALL" in [str(x).upper() for x in (v.get("drop") or [])]:
                             drop_all = True
                         for item in (v.get("add") or []):
                             up_item = str(item).upper()
@@ -1941,17 +2023,6 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
                             found_caps.append(up_item)
                 elif kl == "drop" and isinstance(v, list) and "ALL" in [str(x).upper() for x in v]:
                     drop_all = True
-                elif kl in ("socket_acl_restricted", "socketaclrestricted"):
-                    if bv is True:
-                        sock_explicit_true = True
-                    elif bv is False:
-                        sock_explicit_false = True
-                elif kl in ("socketmode", "socket_mode"):
-                    mode_s = str(v).strip().lstrip("0")
-                    if mode_s in ("600", "660"):
-                        sock_explicit_true = True
-                    elif mode_s in ("666", "777"):
-                        sock_explicit_false = True
 
         caps_out = [] if drop_all else found_caps
         if has_security_ctx and not sock_explicit_true and not sock_explicit_false:
@@ -1959,7 +2030,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
         else:
             sock_restricted = bool(sock_explicit_true and not sock_explicit_false)
         return _result(
-            "json",
+            fmt,
             True,
             service_enabled=service_enabled,
             helper_writable=helper_writable,
@@ -1968,49 +2039,87 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
             protect_sys=protect_sys,
             ambient_caps=caps_out,
             sock_restricted=sock_restricted,
+            all_containers_hardened=True,
         )
 
-    # 2) systemd INI unit manifest
-    if re.search(r"(?m)^\[[A-Za-z0-9_.-]+\]\s*$", stripped):
-        for raw_ln in stripped.splitlines():
-            ln = raw_ln.strip()
-            if not ln or ln.startswith(("#", ";", "[")):
-                continue
-            if re.match(r"^[A-Za-z0-9_.-]+\s*:", ln):
-                return _result("systemd_ini", False)
-        cp = configparser.ConfigParser(delimiters=("=",), interpolation=None, strict=False)
-        cp.optionxform = str
+    if not stripped:
+        return _result("invalid", False)
+
+    # 1) JSON manifest
+    if stripped.startswith("{"):
         try:
-            cp.read_string(manifest_text)
-        except configparser.Error:
-            return _result("systemd_ini", False)
-        if not cp.has_section("Service"):
-            return _result("systemd_ini", False)
+            doc = json.loads(stripped)
+        except Exception:
+            return _result("json", False)
+        if not isinstance(doc, dict):
+            return _result("json", False)
+        return _eval_structured_doc("json", doc)
 
-        kv: Dict[str, str] = {}
-        for sec in cp.sections():
-            for k, v in cp.items(sec):
-                kv[k.strip().lower()] = v.strip()
-
-        service_enabled = kv.get("serviceenabled", kv.get("service_enabled", "true")).lower() != "false"
-        helper_writable = kv.get("helperwritable", kv.get("helper_writable", "false")).lower() == "true"
-        for exec_key in ("execstart", "execstartpre"):
-            if re.search(r"chmod\s+(?:0?777|a\+w)", kv.get(exec_key, "").lower()):
-                helper_writable = True
-        priv = kv.get("privileged", kv.get("privilegedcontainer", "false")).lower() == "true"
-        no_new_priv = kv.get("nonewprivileges", "false").lower() == "true"
-        protect_sys: Any = "strict" if kv.get("protectsystem", "").lower() in ("strict", "full") else False
-
-        caps_raw = kv.get("ambientcapabilities", "").upper()
-        bbox_raw = kv.get("capabilityboundingset", None)
+    # 2) systemd INI unit manifest (line-by-line preserving repeated directives)
+    if re.search(r"(?m)^\[[A-Za-z0-9_.-]+\]\s*$", stripped):
+        current_section: Optional[str] = None
+        seen_sections: set[str] = set()
+        service_enabled = True
+        helper_writable = False
+        priv = False
+        no_new_priv = False
+        protect_sys: Any = False
         ambient_caps: List[str] = []
-        if bbox_raw is None or bbox_raw.strip() != "":
-            for cap in unsafe_caps:
-                if cap in caps_raw:
-                    ambient_caps.append(cap)
+        sock_mode = ""
+        restrict_af = ""
+        sock_acl_str = ""
 
-        sock_mode = kv.get("socketmode", "").strip().lstrip("0")
-        restrict_af = kv.get("restrictaddressfamilies", "").upper()
+        for raw_ln in manifest_text.splitlines():
+            ln = raw_ln.strip()
+            if not ln or ln.startswith(("#", ";")):
+                continue
+            m_sec = re.match(r"^\[([A-Za-z0-9_.-]+)\]\s*(?:[#;].*)?$", ln)
+            if m_sec:
+                current_section = m_sec.group(1)
+                seen_sections.add(current_section)
+                continue
+            if current_section is None or re.match(r"^[A-Za-z0-9_.-]+\s*:", ln) or "=" not in ln:
+                return _result("systemd_ini", False)
+            k, v = ln.split("=", 1)
+            kl = k.strip().lower()
+            vs = v.strip()
+            vl = vs.lower()
+            if kl in ("serviceenabled", "service_enabled"):
+                service_enabled = vl != "false"
+            elif kl in ("helperwritable", "helper_writable"):
+                if vl == "true":
+                    helper_writable = True
+                elif vl == "false":
+                    helper_writable = False
+            elif kl in ("execstart", "execstartpre", "execstartpost"):
+                if re.search(r"chmod\s+(?:0?777|a\+w)", vl):
+                    helper_writable = True
+            elif kl in ("privileged", "privilegedcontainer"):
+                priv = vl == "true"
+            elif kl == "nonewprivileges":
+                no_new_priv = vl == "true"
+            elif kl == "protectsystem":
+                protect_sys = "strict" if vl in ("strict", "full") else False
+            elif kl == "ambientcapabilities":
+                if not vs:
+                    ambient_caps = []
+                else:
+                    for cap in unsafe_caps:
+                        if cap in vs.upper() and cap not in ambient_caps:
+                            ambient_caps.append(cap)
+            elif kl == "capabilityboundingset":
+                if not vs:
+                    ambient_caps = []
+            elif kl == "socketmode":
+                sock_mode = vs.lstrip("0")
+            elif kl == "restrictaddressfamilies":
+                restrict_af = vs.upper()
+            elif kl in ("socket_acl_restricted", "socketaclrestricted"):
+                sock_acl_str = vl
+
+        if "Service" not in seen_sections:
+            return _result("systemd_ini", False)
+
         sock_restricted = False
         if sock_mode in ("600", "660"):
             sock_restricted = True
@@ -2018,7 +2127,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
             sock_restricted = False
         elif restrict_af and "AF_UNIX" not in restrict_af:
             sock_restricted = True
-        elif kv.get("socket_acl_restricted", "").lower() == "true":
+        elif sock_acl_str == "true":
             sock_restricted = True
 
         return _result(
@@ -2033,317 +2142,247 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
             sock_restricted=sock_restricted,
         )
 
-    # 3) Kubernetes / container YAML manifest
+    # 3) Kubernetes / container YAML manifest parsed cleanly with PyYAML
     for raw_ln in stripped.splitlines():
         ln = raw_ln.strip()
         if not ln or ln.startswith("#") or ln in ("---", "..."):
             continue
-        if ln.startswith("[") and ln.endswith("]"):
+        if re.match(r"^\[[A-Za-z0-9_.-]+\]$", ln):
             return _result("k8s_yaml", False)
-        if not (ln.startswith("- ") or ln == "-" or re.match(r"^['\"]?[A-Za-z0-9_./-]+['\"]?\s*:", ln)):
-            return _result("k8s_yaml", False)
-
-    low = stripped.lower()
-    service_enabled = not bool(re.search(r"(?:serviceenabled|service_enabled)\s*:\s*false", low))
-    helper_writable = bool(re.search(r"(?:helperwritable|helper_writable)\s*:\s*true", low))
-    priv = bool(re.search(r"(?:privileged|privileged_container|allowprivilegeescalation)\s*:\s*true", low))
-    nnp_true = bool(re.search(r"(?:allowprivilegeescalation\s*:\s*false|nonewprivileges\s*:\s*true)", low))
-    nnp_false = bool(re.search(r"(?:allowprivilegeescalation\s*:\s*true|nonewprivileges\s*:\s*false)", low))
-    no_new_priv = bool(nnp_true and not nnp_false)
-    protect_sys = (
-        "strict"
-        if re.search(r"(?:readonlyrootfilesystem\s*:\s*true|protectsystem\s*:\s*['\"]?(?:strict|full)['\"]?)", low)
-        else False
-    )
-    drop_all = bool(
-        re.search(r"drop\s*:\s*\[\s*['\"]?all['\"]?\s*\]", low)
-        or re.search(r"drop\s*:\s*\n\s*-\s*['\"]?all['\"]?", low)
-    )
-    ambient_caps = [] if drop_all else [cap for cap in unsafe_caps if cap.lower() in low]
-
-    has_perm_sock = bool(
-        re.search(r"(?:socketmode\s*:\s*['\"]?0?(?:666|777)['\"]?|socketaclrestricted\s*:\s*false|hostsocket\s*:\s*true)", low)
-    )
-    has_rest_sock = bool(
-        re.search(r"(?:socketmode\s*:\s*['\"]?0?(?:600|660)['\"]?|socketaclrestricted\s*:\s*true)", low)
-    )
-    if has_perm_sock:
-        sock_restricted = False
-    elif has_rest_sock or "securitycontext:" in low:
-        sock_restricted = True
-    else:
-        sock_restricted = False
-
-    return _result(
-        "k8s_yaml",
-        True,
-        service_enabled=service_enabled,
-        helper_writable=helper_writable,
-        privileged_container=priv,
-        no_new_priv=no_new_priv,
-        protect_sys=protect_sys,
-        ambient_caps=ambient_caps,
-        sock_restricted=sock_restricted,
-    )
+    try:
+        yaml_doc = yaml.safe_load(stripped)
+    except Exception:
+        return _result("k8s_yaml", False)
+    if not isinstance(yaml_doc, dict):
+        return _result("k8s_yaml", False)
+    return _eval_structured_doc("k8s_yaml", yaml_doc)
 
 
 def _harden_manifest_text(manifest_text: str, defense_mode: str) -> str:
-    """Harden a manifest strictly in its native format (JSON, systemd INI, or Kubernetes YAML)."""
+    """Harden a manifest strictly in its native format (JSON, line-preserving systemd INI, or container-aware YAML)."""
     parsed_meta = _parse_target_host_config(manifest_text)
     fmt = parsed_meta["format"]
     if not parsed_meta["format_valid"]:
         raise ValueError(f"Cannot patch invalid {fmt} manifest")
 
-    if fmt == "json":
-        doc = json.loads(manifest_text)
+    if fmt in ("json", "k8s_yaml"):
+        doc = json.loads(manifest_text) if fmt == "json" else yaml.safe_load(manifest_text)
+        if not isinstance(doc, dict):
+            raise ValueError(f"Expected mapping root in {fmt} manifest")
+
         if defense_mode == "naive_block_all":
-            if "serviceEnabled" in doc:
-                doc["serviceEnabled"] = False
-            else:
-                doc["service_enabled"] = False
-            return json.dumps(doc, indent=2) + "\n"
+            key = "serviceEnabled" if fmt == "k8s_yaml" or "serviceEnabled" in doc else "service_enabled"
+            doc[key] = False
+            return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else yaml.safe_dump(doc, sort_keys=False)
 
-        def _harden_json_obj(node: Any) -> None:
-            if isinstance(node, list):
-                for item in node:
-                    _harden_json_obj(item)
-                return
-            if not isinstance(node, dict):
-                return
-            for k in list(node.keys()):
-                kl = str(k).lower()
-                if kl in ("service_enabled", "serviceenabled"):
-                    node[k] = True
-                elif kl in ("helper_writable", "helperwritable"):
-                    node[k] = False
-                elif kl in ("privileged", "privileged_container"):
-                    node[k] = False
-                elif kl == "allowprivilegeescalation":
-                    node[k] = False
-                elif kl == "nonewprivileges":
-                    node[k] = True
-                elif kl == "protectsystem":
-                    node[k] = "strict"
-                elif kl == "readonlyrootfilesystem":
-                    node[k] = True
-                elif kl in ("ambient_caps", "ambientcapabilities"):
-                    node[k] = []
-                elif kl == "capabilities":
-                    node[k] = {"drop": ["ALL"]}
-                elif kl in ("socket_acl_restricted", "socketaclrestricted"):
-                    node[k] = True
-                elif kl in ("socketmode", "socket_mode"):
-                    node[k] = "0600"
-                elif kl == "securitycontext" and isinstance(node[k], dict):
-                    _harden_json_obj(node[k])
-                    node[k]["privileged"] = False
-                    node[k]["allowPrivilegeEscalation"] = False
-                    node[k]["readOnlyRootFilesystem"] = True
-                    node[k]["capabilities"] = {"drop": ["ALL"]}
-                else:
-                    _harden_json_obj(node[k])
+        containers: List[Dict[str, Any]] = []
+        bfs_queue: List[Any] = [doc]
+        while bfs_queue:
+            cur = bfs_queue.pop(0)
+            if isinstance(cur, dict):
+                for k in list(cur.keys()):
+                    v = cur[k]
+                    kl = str(k).lower()
+                    if kl in ("service_enabled", "serviceenabled"):
+                        cur[k] = True
+                    elif kl in ("helper_writable", "helperwritable"):
+                        cur[k] = False
+                    elif kl in ("socket_acl_restricted", "socketaclrestricted"):
+                        cur[k] = True
+                    elif kl in ("socketmode", "socket_mode"):
+                        cur[k] = "0600"
+                    elif isinstance(v, str) and re.search(r"chmod\s+(?:0?777|a\+w)", v.lower()):
+                        cur[k] = re.sub(r"(?i)chmod\s+(?:0?777|a\+w)", "chmod 0750", v)
+                    if kl in ("containers", "initcontainers", "ephemeralcontainers") and isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, dict):
+                                containers.append(item)
+                    bfs_queue.append(v)
+            elif isinstance(cur, list):
+                bfs_queue.extend(cur)
 
-        _harden_json_obj(doc)
-        has_k8s_sc = "securityContext" in json.dumps(doc)
-        if has_k8s_sc:
-            if "socket_acl_restricted" in doc:
-                doc["socket_acl_restricted"] = True
+        def _harden_security_ctx(sc: Dict[str, Any]) -> None:
+            sc["privileged"] = False
+            sc["allowPrivilegeEscalation"] = False
+            sc["readOnlyRootFilesystem"] = True
+            sc["capabilities"] = {"drop": ["ALL"]}
+
+        if containers:
+            for c in containers:
+                sc = c.get("securityContext")
+                if not isinstance(sc, dict):
+                    sc = {}
+                    c["securityContext"] = sc
+                _harden_security_ctx(sc)
         else:
-            doc["NoNewPrivileges"] = True
-            doc["ProtectSystem"] = "strict"
-            doc["privileged_container"] = False
-            doc["helper_writable"] = False
-            doc["ambient_caps"] = []
-            doc["capabilities"] = {"drop": ["ALL"]}
-            doc["socket_acl_restricted"] = True
-        return json.dumps(doc, indent=2) + "\n"
-
-    if fmt == "systemd_ini":
-        cp = configparser.ConfigParser(delimiters=("=",), interpolation=None, strict=False)
-        cp.optionxform = str
-        cp.read_string(manifest_text)
-        svc = cp["Service"]
-
-        def _set_key(section: configparser.SectionProxy, canonical: str, value: str) -> None:
-            for existing in list(section.keys()):
-                if existing.lower() == canonical.lower():
-                    section[existing] = value
+            def _harden_standalone(node: Any) -> None:
+                if isinstance(node, list):
+                    for item in node:
+                        _harden_standalone(item)
                     return
-            section[canonical] = value
+                if not isinstance(node, dict):
+                    return
+                for k in list(node.keys()):
+                    kl = str(k).lower()
+                    if kl in ("privileged", "privileged_container"):
+                        node[k] = False
+                    elif kl == "allowprivilegeescalation":
+                        node[k] = False
+                    elif kl == "nonewprivileges":
+                        node[k] = True
+                    elif kl == "protectsystem":
+                        node[k] = "strict"
+                    elif kl == "readonlyrootfilesystem":
+                        node[k] = True
+                    elif kl in ("ambient_caps", "ambientcapabilities"):
+                        node[k] = []
+                    elif kl == "capabilities":
+                        node[k] = {"drop": ["ALL"]}
+                    elif kl == "securitycontext" and isinstance(node[k], dict):
+                        _harden_standalone(node[k])
+                        _harden_security_ctx(node[k])
+                    else:
+                        _harden_standalone(node[k])
 
-        if defense_mode == "naive_block_all":
-            _set_key(svc, "ServiceEnabled", "false")
-        else:
-            for k in list(svc.keys()):
-                if k.lower() in ("execstart", "execstartpre"):
-                    svc[k] = re.sub(r"(?i)chmod\s+(?:0?777|a\+w)", "chmod 0750", svc[k])
-                elif k.lower() in ("privileged", "privilegedcontainer"):
-                    svc[k] = "false"
-            if any(k.lower() in ("serviceenabled", "service_enabled") for k in svc.keys()):
-                _set_key(svc, "ServiceEnabled", "true")
-            _set_key(svc, "NoNewPrivileges", "true")
-            _set_key(svc, "ProtectSystem", "strict")
-            _set_key(svc, "HelperWritable", "false")
-            _set_key(svc, "AmbientCapabilities", "")
-            _set_key(svc, "CapabilityBoundingSet", "")
-            _set_key(svc, "RestrictAddressFamilies", "AF_INET AF_INET6")
-            if cp.has_section("Socket"):
-                _set_key(cp["Socket"], "SocketMode", "0600")
-            elif any(k.lower() == "socketmode" for k in svc.keys()):
-                _set_key(svc, "SocketMode", "0600")
-
-        buf = io.StringIO()
-        cp.write(buf, space_around_delimiters=False)
-        return buf.getvalue()
-
-    # 3) Kubernetes / container YAML manifest
-    lines = manifest_text.splitlines()
-    if defense_mode == "naive_block_all":
-        replaced = False
-        new_lines: List[str] = []
-        for ln in lines:
-            if re.match(r"^\s*(?:serviceEnabled|service_enabled)\s*:", ln, flags=re.IGNORECASE):
-                new_lines.append(re.sub(r":\s*true\s*$", ": false", ln, flags=re.IGNORECASE))
-                replaced = True
+            _harden_standalone(doc)
+            if isinstance(doc.get("securityContext"), dict):
+                _harden_security_ctx(doc["securityContext"])
+            elif fmt == "json":
+                doc["NoNewPrivileges"] = True
+                doc["ProtectSystem"] = "strict"
+                doc["privileged_container"] = False
+                doc["helper_writable"] = False
+                doc["ambient_caps"] = []
+                doc["capabilities"] = {"drop": ["ALL"]}
+                doc["socket_acl_restricted"] = True
             else:
-                new_lines.append(ln)
-        if not replaced:
-            new_lines.append("serviceEnabled: false")
-        return "\n".join(new_lines) + "\n"
+                doc["securityContext"] = {
+                    "privileged": False,
+                    "allowPrivilegeEscalation": False,
+                    "readOnlyRootFilesystem": True,
+                    "capabilities": {"drop": ["ALL"]},
+                }
+
+        return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else yaml.safe_dump(doc, sort_keys=False)
+
+    # Line-preserving systemd INI patcher (preserves all comments, blank lines, and repeated directives like ExecStartPre=)
+    raw_lines = manifest_text.splitlines()
+    has_socket_sec = any(re.match(r"^\s*\[Socket\]\s*(?:[#;].*)?$", ln) for ln in raw_lines)
+    if defense_mode == "naive_block_all":
+        desired_svc: Dict[str, str] = {"ServiceEnabled": "false"}
+    else:
+        desired_svc = {
+            "NoNewPrivileges": "true",
+            "ProtectSystem": "strict",
+            "HelperWritable": "false",
+            "AmbientCapabilities": "",
+            "CapabilityBoundingSet": "",
+            "RestrictAddressFamilies": "AF_INET AF_INET6",
+        }
+    desired_lower = {k.lower(): (k, v) for k, v in desired_svc.items()}
 
     out_lines: List[str] = []
-    i = 0
-    saw_security_ctx = False
-    while i < len(lines):
-        ln = lines[i]
-        m_sc = re.match(r"^([ \t]*)securityContext\s*:\s*(?:\{\})?\s*(?:#.*)?$", ln)
-        if m_sc:
-            saw_security_ctx = True
-            sc_indent = m_sc.group(1)
-            child_indent = sc_indent + "  "
-            j = i + 1
-            kept_children: List[str] = []
-            saw_helper_key = False
-            saw_sock_mode = False
-            saw_sock_acl = False
-            skip_caps_indent: Optional[int] = None
-            while j < len(lines):
-                cln = lines[j]
-                if cln.strip() == "":
-                    break
-                cur_indent = len(cln) - len(cln.lstrip(" \t"))
-                if cur_indent <= len(sc_indent):
-                    break
-                if skip_caps_indent is not None:
-                    if cur_indent > skip_caps_indent:
-                        j += 1
-                        continue
-                    skip_caps_indent = None
-                c_stripped = cln.strip()
-                if re.match(r"^capabilities\s*:", c_stripped, flags=re.IGNORECASE):
-                    skip_caps_indent = cur_indent
-                    j += 1
-                    continue
-                if re.match(r"^(?:privileged|allowPrivilegeEscalation|readOnlyRootFilesystem)\s*:", c_stripped, flags=re.IGNORECASE):
-                    j += 1
-                    continue
-                if re.match(r"^(?:helperWritable|helper_writable)\s*:", c_stripped, flags=re.IGNORECASE):
-                    saw_helper_key = True
-                    j += 1
-                    continue
-                if re.match(r"^socketMode\s*:", c_stripped, flags=re.IGNORECASE):
-                    saw_sock_mode = True
-                    j += 1
-                    continue
-                if re.match(r"^(?:socketAclRestricted|socket_acl_restricted)\s*:", c_stripped, flags=re.IGNORECASE):
-                    saw_sock_acl = True
-                    j += 1
-                    continue
-                kept_children.append(cln)
-                j += 1
+    cur_sec: Optional[str] = None
+    seen_svc: set[str] = set()
+    seen_sock_mode = False
 
-            out_lines.append(f"{sc_indent}securityContext:")
-            out_lines.extend(kept_children)
-            out_lines.append(f"{child_indent}privileged: false")
-            out_lines.append(f"{child_indent}allowPrivilegeEscalation: false")
-            out_lines.append(f"{child_indent}readOnlyRootFilesystem: true")
-            if saw_helper_key:
-                out_lines.append(f"{child_indent}helperWritable: false")
-            if saw_sock_mode:
-                out_lines.append(f'{child_indent}socketMode: "0600"')
-            if saw_sock_acl:
-                out_lines.append(f"{child_indent}socketAclRestricted: true")
-            out_lines.append(f"{child_indent}capabilities:")
-            out_lines.append(f"{child_indent}  drop:")
-            out_lines.append(f"{child_indent}    - ALL")
-            i = j
+    def _flush_section_missing(sec_name: Optional[str]) -> None:
+        if sec_name == "Service":
+            insert_idx = len(out_lines)
+            while insert_idx > 0 and not out_lines[insert_idx - 1].strip():
+                insert_idx -= 1
+            additions: List[str] = []
+            for canonical, val in desired_svc.items():
+                if canonical.lower() not in seen_svc:
+                    additions.append(f"{canonical}={val}")
+            out_lines[insert_idx:insert_idx] = additions
+        elif sec_name == "Socket" and defense_mode != "naive_block_all" and not seen_sock_mode:
+            insert_idx = len(out_lines)
+            while insert_idx > 0 and not out_lines[insert_idx - 1].strip():
+                insert_idx -= 1
+            out_lines.insert(insert_idx, "SocketMode=0600")
+
+    for raw_ln in raw_lines:
+        stripped_ln = raw_ln.strip()
+        m_sec = re.match(r"^\[([A-Za-z0-9_.-]+)\]\s*(?:[#;].*)?$", stripped_ln)
+        if m_sec:
+            _flush_section_missing(cur_sec)
+            cur_sec = m_sec.group(1)
+            out_lines.append(raw_ln)
             continue
 
-        m_cap = re.match(r"^([ \t]*)capabilities\s*:\s*(?:\[[^\]]*\])?\s*(?:#.*)?$", ln)
-        if m_cap:
-            cap_indent = m_cap.group(1)
-            j = i + 1
-            while j < len(lines):
-                cln = lines[j]
-                if cln.strip() == "":
-                    break
-                cur_indent = len(cln) - len(cln.lstrip(" \t"))
-                if cur_indent <= len(cap_indent):
-                    break
-                j += 1
-            out_lines.append(f"{cap_indent}capabilities:")
-            out_lines.append(f"{cap_indent}  drop:")
-            out_lines.append(f"{cap_indent}    - ALL")
-            i = j
+        if not stripped_ln or stripped_ln.startswith(("#", ";")) or "=" not in raw_ln:
+            out_lines.append(raw_ln)
             continue
 
-        ln_fixed = re.sub(r"(?i)^([ \t]*(?:serviceEnabled|service_enabled)\s*:\s*)false\b", r"\g<1>true", ln)
-        ln_fixed = re.sub(r"(?i)^([ \t]*(?:privileged|privileged_container|allowPrivilegeEscalation)\s*:\s*)true\b", r"\g<1>false", ln_fixed)
-        ln_fixed = re.sub(r"(?i)^([ \t]*readOnlyRootFilesystem\s*:\s*)false\b", r"\g<1>true", ln_fixed)
-        ln_fixed = re.sub(r"(?i)^([ \t]*(?:helperWritable|helper_writable)\s*:\s*)true\b", r"\g<1>false", ln_fixed)
-        ln_fixed = re.sub(r"(?i)^([ \t]*(?:socketAclRestricted|socket_acl_restricted)\s*:\s*)false\b", r"\g<1>true", ln_fixed)
-        ln_fixed = re.sub(r"(?i)^([ \t]*socketMode\s*:\s*)['\"]?0?(?:666|777)['\"]?", r'\g<1>"0600"', ln_fixed)
-        out_lines.append(ln_fixed)
-        i += 1
+        key_part, val_part = raw_ln.split("=", 1)
+        kl = key_part.strip().lower()
+        key_clean = key_part.strip()
 
-    if not saw_security_ctx:
-        out_lines.extend([
-            "securityContext:",
-            "  privileged: false",
-            "  allowPrivilegeEscalation: false",
-            "  readOnlyRootFilesystem: true",
-            "  capabilities:",
-            "    drop:",
-            "      - ALL",
-        ])
+        if cur_sec == "Service":
+            if defense_mode != "naive_block_all" and kl in ("execstart", "execstartpre", "execstartpost"):
+                out_lines.append(f"{key_clean}={re.sub(r'(?i)chmod\s+(?:0?777|a\+w)', 'chmod 0750', val_part.strip())}")
+                continue
+            if kl in ("serviceenabled", "service_enabled"):
+                target_val = "false" if defense_mode == "naive_block_all" else "true"
+                if kl in seen_svc:
+                    continue
+                seen_svc.add(kl)
+                seen_svc.add("serviceenabled")
+                out_lines.append(f"{key_clean}={target_val}")
+                continue
+            if kl in desired_lower:
+                if kl in seen_svc:
+                    continue
+                seen_svc.add(kl)
+                out_lines.append(f"{key_clean}={desired_lower[kl][1]}")
+                continue
+            if defense_mode != "naive_block_all" and kl in ("privileged", "privilegedcontainer"):
+                out_lines.append(f"{key_clean}=false")
+                continue
+            if defense_mode != "naive_block_all" and not has_socket_sec and kl == "socketmode":
+                out_lines.append(f"{key_clean}=0600")
+                continue
+        elif cur_sec == "Socket" and defense_mode != "naive_block_all" and kl == "socketmode":
+            seen_sock_mode = True
+            out_lines.append(f"{key_clean}=0600")
+            continue
+
+        out_lines.append(raw_ln)
+
+    _flush_section_missing(cur_sec)
     return "\n".join(out_lines) + "\n"
 
 
-def _validate_hardened_manifest_syntax(manifest_text: str, expected_format: str) -> bool:
+def _validate_hardened_manifest_syntax(manifest_text: str, expected_format: str, *, enforce_hardened: bool = True) -> bool:
     """Control-Plane strict parser verification ensuring hardened manifest preserves valid target syntax."""
-    parsed = _parse_target_host_config(manifest_text)
-    if not parsed["format_valid"] or parsed["format"] != expected_format:
+    try:
+        parsed = _parse_target_host_config(manifest_text)
+        if not parsed["format_valid"] or parsed["format"] != expected_format:
+            return False
+        if expected_format == "json":
+            doc = json.loads(manifest_text)
+            return isinstance(doc, dict) and (not enforce_hardened or bool(parsed["all_containers_hardened"]))
+        if expected_format == "systemd_ini":
+            return True
+        if expected_format == "k8s_yaml":
+            doc = yaml.safe_load(manifest_text)
+            if not isinstance(doc, dict):
+                return False
+            if enforce_hardened and not parsed["all_containers_hardened"]:
+                return False
+            return True
+    except Exception:
         return False
-    if expected_format == "json":
-        return isinstance(json.loads(manifest_text), dict)
-    if expected_format == "systemd_ini":
-        cp = configparser.ConfigParser(delimiters=("=",), interpolation=None, strict=False)
-        cp.read_string(manifest_text)
-        return cp.has_section("Service")
-    if expected_format == "k8s_yaml":
-        import yaml  # type: ignore[import-untyped]
-
-        doc = yaml.safe_load(manifest_text)
-        return isinstance(doc, dict)
     return False
 
 
 def _build_m3_host_runtime_sim() -> str:
     parser_src = inspect.getsource(_parse_target_host_config)
     return (
-        "import configparser, json, os, re\n"
+        "import json, os, re, yaml\n"
         "from pathlib import Path\n"
-        "from typing import Any, Dict, List, Optional\n\n"
+        "from typing import Any, Dict, List, Optional, Tuple\n\n"
         f"{parser_src}\n\n"
         '''\
 def check_action(vector: str) -> str:
@@ -2556,9 +2595,9 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
     rel_blue, _ = chamber.write_blue_artifact(
         "apply_hardening_m3.py",
         (
-            "import configparser, io, json, os, re\n"
+            "import json, os, re, yaml\n"
             "from pathlib import Path\n"
-            "from typing import Any, Dict, List, Optional\n\n"
+            "from typing import Any, Dict, List, Optional, Tuple\n\n"
             f"{parse_fn_src}\n\n"
             f"{harden_fn_src}\n\n"
             "up = Path(os.environ['ACK_UPPERDIR'])\n"
@@ -2583,9 +2622,14 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
     manifest_modified = "cloned_target_manifest.conf" in bfs.modified
     post_manifest_text = (chamber.upperdir / "cloned_target_manifest.conf").read_text(encoding="utf-8")
     post_cfg = _parse_target_host_config(post_manifest_text)
-    post_syntax_ok = _validate_hardened_manifest_syntax(post_manifest_text, str(baseline_cfg["format"]))
+    post_syntax_ok = _validate_hardened_manifest_syntax(
+        post_manifest_text,
+        str(baseline_cfg["format"]),
+        enforce_hardened=(defense_mode != "naive_block_all"),
+    )
     post_manifest_hardened = bool(
         post_syntax_ok
+        and post_cfg["all_containers_hardened"]
         and not post_cfg["helper_writable"]
         and not post_cfg["privileged_container"]
         and post_cfg["NoNewPrivileges"]

@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from cyber_hermes_plugin.cyber_plugin import TOOLS, cyber_run_ack_mission
-from hermes_cyber.ack_arena import AdversarialCyberKernel, DetonationChamber
+from hermes_cyber.ack_arena import AdversarialCyberKernel, DetonationChamber, _harden_manifest_text
 from hermes_cyber.models import ActionExecutionLimits, ConstrainedActionContract
 from hermes_cyber.server.standalone import app
 from hermes_cyber.server.state import reset_cyber_assistants
@@ -219,7 +220,7 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
     assert "SYNTHETIC" in rep_syn.certification_verdict
     assert rep_syn.certified is True
 
-    # 2) Valid pure Kubernetes Pod YAML, pure systemd INI, and pure JSON all harden cleanly preserving format
+    # 2) Valid multi-container Kubernetes Pod YAML (sidecar lacks securityContext), systemd INI (repeated ExecStartPre), and JSON
     vuln_yaml_manifest = "\n".join([
         "apiVersion: v1",
         "kind: Pod",
@@ -235,9 +236,15 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
         "        capabilities:",
         "          add:",
         "            - CAP_SYS_ADMIN",
+        "    - name: sidecar",
+        "      image: busybox:1.36",
     ])
     vuln_ini_manifest = "\n".join([
         "[Service]",
+        "ExecStartPre=/usr/bin/check-env",
+        "ExecStartPre=/bin/chmod 0777 /usr/local/bin/helper.sh",
+        "Environment=APP_ENV=prod",
+        "Environment=LOG_LEVEL=info",
         "NoNewPrivileges=false",
         "ProtectSystem=false",
         "HelperWritable=true",
@@ -254,6 +261,21 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
         "ambient_caps": ["CAP_SYS_ADMIN"],
         "socket_acl_restricted": False,
     }, indent=2)
+
+    hardened_yaml_out = _harden_manifest_text(vuln_yaml_manifest, "structural")
+    parsed_yaml_out = yaml.safe_load(hardened_yaml_out)
+    assert "securityContext" not in parsed_yaml_out
+    for c_doc in parsed_yaml_out["spec"]["containers"]:
+        assert c_doc["securityContext"]["allowPrivilegeEscalation"] is False
+        assert c_doc["securityContext"]["privileged"] is False
+        assert c_doc["securityContext"]["readOnlyRootFilesystem"] is True
+        assert "ALL" in c_doc["securityContext"]["capabilities"]["drop"]
+
+    hardened_ini_out = _harden_manifest_text(vuln_ini_manifest, "structural")
+    assert "ExecStartPre=/usr/bin/check-env" in hardened_ini_out
+    assert "ExecStartPre=/bin/chmod 0750 /usr/local/bin/helper.sh" in hardened_ini_out
+    assert "Environment=APP_ENV=prod" in hardened_ini_out
+    assert "Environment=LOG_LEVEL=info" in hardened_ini_out
 
     for manifest in (vuln_yaml_manifest, vuln_ini_manifest, vuln_json_manifest):
         rep_vuln_clone = kernel.run_mission(
@@ -300,16 +322,19 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
     assert rep_hardened_clone.certified is False
     assert rep_hardened_clone.certification_verdict == "NO_BASELINE_PRIVESC_IN_CLONED_MANIFEST"
 
-    # 4) Mixed INI+YAML invalid document must be rejected rather than certified
-    mixed_invalid = "[Service]\nNoNewPrivileges=false\nsecurityContext:\n  privileged: true\n"
-    rep_invalid = kernel.run_mission(
-        "ack-m3-attack-path-hardening",
-        mutation_rounds=3,
-        defense_mode="structural",
-        target_config_content=mixed_invalid,
-    )
-    assert rep_invalid.certified is False
-    assert rep_invalid.certification_verdict == "INVALID_MANIFEST_FORMAT"
+    # 4) Mixed INI+YAML invalid document AND malformed YAML with unmatched bracket must be rejected cleanly
+    for bad_manifest in (
+        "[Service]\nNoNewPrivileges=false\nsecurityContext:\n  privileged: true\n",
+        "apiVersion: v1\nkind: Pod\nmetadata: [unclosed\n",
+    ):
+        rep_invalid = kernel.run_mission(
+            "ack-m3-attack-path-hardening",
+            mutation_rounds=3,
+            defense_mode="structural",
+            target_config_content=bad_manifest,
+        )
+        assert rep_invalid.certified is False
+        assert rep_invalid.certification_verdict == "INVALID_MANIFEST_FORMAT"
 
 
 def test_ack_oracle_anti_cheating_and_bypass_rejection(tmp_path):
