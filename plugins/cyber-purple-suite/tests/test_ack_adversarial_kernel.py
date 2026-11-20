@@ -7,10 +7,15 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from ruamel.yaml import YAML
 
 from cyber_hermes_plugin.cyber_plugin import TOOLS, cyber_run_ack_mission
-from hermes_cyber.ack_arena import AdversarialCyberKernel, DetonationChamber, _harden_manifest_text
+from hermes_cyber.ack_arena import (
+    AdversarialCyberKernel,
+    DetonationChamber,
+    _harden_manifest_text,
+    _parse_target_host_config,
+    _yaml_safe_load_compat,
+)
 from hermes_cyber.models import ActionExecutionLimits, ConstrainedActionContract
 from hermes_cyber.server.standalone import app
 from hermes_cyber.server.state import reset_cyber_assistants
@@ -211,7 +216,7 @@ def test_ack_failed_mutation_execution_is_never_certified_as_defended():
     assert rep.mutation_rounds[0].oracle_evidence.execution_valid is False
 
 
-def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
+def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest(monkeypatch):
     kernel = AdversarialCyberKernel()
 
     # 1) Default invocation without manifest explicitly marks synthetic_fixture_simulation (systemd INI)
@@ -283,13 +288,24 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
     ])
 
     hardened_yaml_out = _harden_manifest_text(vuln_yaml_manifest, "structural")
-    parsed_yaml_out = YAML(typ="safe", pure=True).load(hardened_yaml_out)
+    parsed_yaml_out = _yaml_safe_load_compat(hardened_yaml_out)
     assert "securityContext" not in parsed_yaml_out
     for c_doc in parsed_yaml_out["spec"]["containers"]:
         assert c_doc["securityContext"]["allowPrivilegeEscalation"] is False
         assert c_doc["securityContext"]["privileged"] is False
         assert c_doc["securityContext"]["readOnlyRootFilesystem"] is True
         assert "ALL" in c_doc["securityContext"]["capabilities"]["drop"]
+
+    # Also verify pure-stdlib YAML fallback (simulating clean Python 3.11-3.13 without ruamel.yaml/PyYAML)
+    monkeypatch.setenv("ACK_FORCE_STDLIB_YAML", "1")
+    stdlib_hardened = _harden_manifest_text(vuln_yaml_manifest, "structural")
+    stdlib_parsed = _yaml_safe_load_compat(stdlib_hardened)
+    assert "securityContext" not in stdlib_parsed
+    assert len(stdlib_parsed["spec"]["containers"]) == 2
+    assert _parse_target_host_config(stdlib_hardened)["all_containers_hardened"] is True
+    assert _parse_target_host_config(vuln_unprefixed_cap_yaml)["ambient_caps"] == ["CAP_SYS_ADMIN"]
+    assert _parse_target_host_config("apiVersion: v1\nkind: Pod\nmetadata: [unclosed\n")["format_valid"] is False
+    monkeypatch.delenv("ACK_FORCE_STDLIB_YAML", raising=False)
 
     hardened_ini_out = _harden_manifest_text(vuln_ini_manifest, "structural")
     assert "ExecStartPre=/usr/bin/check-env" in hardened_ini_out

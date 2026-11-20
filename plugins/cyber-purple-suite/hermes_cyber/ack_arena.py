@@ -22,8 +22,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 
-from ruamel.yaml import YAML
-
 from hermes_cyber.models import (
     AckCertificationReport,
     AckMissionDescriptor,
@@ -1832,6 +1830,285 @@ SocketMode=0666
 """
 
 
+def _yaml_safe_load_compat(text: str) -> Any:
+    """Load YAML preferring ruamel.yaml/PyYAML when present, with strict pure-stdlib fallback for Python 3.11-3.13."""
+    if os.environ.get("ACK_FORCE_STDLIB_YAML") != "1":
+        try:
+            from ruamel.yaml import YAML  # type: ignore[import-untyped]
+
+            return YAML(typ="safe", pure=True).load(text)
+        except ImportError:
+            try:
+                import yaml  # type: ignore[import-untyped]
+
+                return yaml.safe_load(text)
+            except ImportError:
+                pass
+
+    def _split_csv_top(s: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        quote: Optional[str] = None
+        for ch in s:
+            if quote is not None:
+                buf.append(ch)
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                buf.append(ch)
+            elif ch in ("[", "{"):
+                depth += 1
+                buf.append(ch)
+            elif ch in ("]", "}"):
+                depth -= 1
+                if depth < 0:
+                    raise ValueError("Unmatched closing bracket in YAML flow collection")
+                buf.append(ch)
+            elif ch == "," and depth == 0:
+                items.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        if quote is not None or depth != 0:
+            raise ValueError("Unclosed quote or bracket in YAML flow collection")
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _split_kv(line_s: str) -> Tuple[str, str]:
+        quote: Optional[str] = None
+        for idx, ch in enumerate(line_s):
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == ":" and (idx + 1 == len(line_s) or line_s[idx + 1] in (" ", "\t")):
+                k_raw = line_s[:idx].strip()
+                if len(k_raw) >= 2 and k_raw[0] == k_raw[-1] and k_raw[0] in ("'", '"'):
+                    k_raw = k_raw[1:-1]
+                return k_raw, line_s[idx + 1 :].strip()
+        raise ValueError(f"Invalid YAML mapping line: {line_s!r}")
+
+    def _parse_scalar(val_s: str) -> Any:
+        vs = val_s.strip()
+        if vs.startswith("["):
+            if not vs.endswith("]"):
+                raise ValueError("Unclosed flow sequence in YAML")
+            inner = vs[1:-1].strip()
+            return [_parse_scalar(x) for x in _split_csv_top(inner)] if inner else []
+        if vs.startswith("{"):
+            if not vs.endswith("}"):
+                raise ValueError("Unclosed flow mapping in YAML")
+            inner = vs[1:-1].strip()
+            out_d: Dict[str, Any] = {}
+            if inner:
+                for entry in _split_csv_top(inner):
+                    ek, ev = _split_kv(entry)
+                    out_d[ek] = _parse_scalar(ev)
+            return out_d
+        if len(vs) >= 1 and vs[0] in ("'", '"'):
+            if len(vs) < 2 or vs[-1] != vs[0]:
+                raise ValueError("Unclosed quoted string in YAML")
+            return vs[1:-1]
+        if any(ch in vs for ch in ("[", "]", "{", "}")):
+            raise ValueError("Unbalanced bracket in YAML scalar")
+        low_v = vs.lower()
+        if low_v == "true":
+            return True
+        if low_v == "false":
+            return False
+        if low_v in ("null", "~", ""):
+            return None
+        if re.match(r"^-?\d+$", vs) and not (len(vs) > 1 and vs.startswith("0")):
+            return int(vs)
+        return vs
+
+    tokens: List[Tuple[int, str]] = []
+    for raw_ln in text.splitlines():
+        in_q: Optional[str] = None
+        cut_idx = len(raw_ln)
+        for ci, cch in enumerate(raw_ln):
+            if in_q is not None:
+                if cch == in_q:
+                    in_q = None
+                continue
+            if cch in ("'", '"'):
+                in_q = cch
+            elif cch == "#" and (ci == 0 or raw_ln[ci - 1] in (" ", "\t")):
+                cut_idx = ci
+                break
+        if in_q is not None:
+            raise ValueError("Unclosed quote on YAML line")
+        clean = raw_ln[:cut_idx]
+        s = clean.strip()
+        if not s or s in ("---", "..."):
+            continue
+        if re.match(r"^\[[A-Za-z0-9_.-]+\]$", s):
+            raise ValueError("INI section header inside YAML")
+        indent = len(clean) - len(clean.lstrip(" "))
+        if "\t" in clean[:indent]:
+            raise ValueError("Tab indentation not allowed in YAML")
+        tokens.append((indent, s))
+
+    if not tokens:
+        return {}
+
+    def _is_seq_line(s_val: str) -> bool:
+        return s_val == "-" or s_val.startswith("- ")
+
+    def _parse_node(pos: int, expected_indent: int) -> Tuple[Any, int]:
+        if _is_seq_line(tokens[pos][1]):
+            seq: List[Any] = []
+            seq_ind = tokens[pos][0]
+            while pos < len(tokens) and tokens[pos][0] == seq_ind and _is_seq_line(tokens[pos][1]):
+                rest = tokens[pos][1][1:].strip()
+                item_pos = pos + 1
+                if not rest:
+                    if item_pos < len(tokens) and tokens[item_pos][0] > seq_ind:
+                        item_val, item_pos = _parse_node(item_pos, tokens[item_pos][0])
+                    else:
+                        item_val = None
+                    seq.append(item_val)
+                    pos = item_pos
+                    continue
+                if re.search(r":(?:\s|$)", rest):
+                    fk, fv = _split_kv(rest)
+                    item_dict: Dict[str, Any] = {}
+                    if fv:
+                        item_dict[fk] = _parse_scalar(fv)
+                    elif item_pos < len(tokens) and tokens[item_pos][0] > seq_ind + 2:
+                        sub_val, item_pos = _parse_node(item_pos, tokens[item_pos][0])
+                        item_dict[fk] = sub_val
+                    else:
+                        item_dict[fk] = None
+                    sibling_ind = seq_ind + 2
+                    while item_pos < len(tokens) and tokens[item_pos][0] == sibling_ind and not _is_seq_line(tokens[item_pos][1]):
+                        sk, sv = _split_kv(tokens[item_pos][1])
+                        item_pos += 1
+                        if sv:
+                            item_dict[sk] = _parse_scalar(sv)
+                        elif item_pos < len(tokens) and (
+                            tokens[item_pos][0] > sibling_ind
+                            or (tokens[item_pos][0] == sibling_ind and _is_seq_line(tokens[item_pos][1]))
+                        ):
+                            sub_val, item_pos = _parse_node(item_pos, tokens[item_pos][0])
+                            item_dict[sk] = sub_val
+                        else:
+                            item_dict[sk] = None
+                    seq.append(item_dict)
+                    pos = item_pos
+                    continue
+                seq.append(_parse_scalar(rest))
+                pos = item_pos
+            return seq, pos
+
+        mapping: Dict[str, Any] = {}
+        while pos < len(tokens) and tokens[pos][0] == expected_indent and not _is_seq_line(tokens[pos][1]):
+            mk, mv = _split_kv(tokens[pos][1])
+            pos += 1
+            if mv:
+                mapping[mk] = _parse_scalar(mv)
+            elif pos < len(tokens) and (
+                tokens[pos][0] > expected_indent
+                or (tokens[pos][0] == expected_indent and _is_seq_line(tokens[pos][1]))
+            ):
+                sub_val, pos = _parse_node(pos, tokens[pos][0])
+                mapping[mk] = sub_val
+            else:
+                mapping[mk] = None
+        return mapping, pos
+
+    parsed_doc, end_pos = _parse_node(0, tokens[0][0])
+    if end_pos != len(tokens):
+        raise ValueError("Unexpected indentation or trailing content in YAML")
+    return parsed_doc
+
+
+def _yaml_safe_dump_compat(data: Any) -> str:
+    """Dump YAML preferring ruamel.yaml/PyYAML when present, with pure-stdlib fallback for Python 3.11-3.13."""
+    if os.environ.get("ACK_FORCE_STDLIB_YAML") != "1":
+        try:
+            from ruamel.yaml import YAML  # type: ignore[import-untyped]
+
+            y = YAML(typ="safe", pure=True)
+            y.default_flow_style = False
+            y.sort_base_mapping_type_on_output = False
+            buf = io.StringIO()
+            y.dump(data, buf)
+            return buf.getvalue()
+        except ImportError:
+            try:
+                import yaml  # type: ignore[import-untyped]
+
+                return str(yaml.safe_dump(data, sort_keys=False))
+            except ImportError:
+                pass
+
+    def _fmt_scalar(v: Any) -> str:
+        if v is None:
+            return "null"
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
+        s = str(v)
+        if not s or any(c in s for c in (":", "#", "{", "}", "[", "]", "\n")) or s.startswith(("0", "-")):
+            return json.dumps(s)
+        return s
+
+    lines: List[str] = []
+
+    def _emit(node: Any, ind: int) -> None:
+        pad = " " * ind
+        if isinstance(node, dict):
+            if not node:
+                lines.append(f"{pad}{{}}")
+                return
+            for k, v in node.items():
+                if isinstance(v, dict) and v:
+                    lines.append(f"{pad}{k}:")
+                    _emit(v, ind + 2)
+                elif isinstance(v, list) and v:
+                    lines.append(f"{pad}{k}:")
+                    _emit(v, ind + 2)
+                elif isinstance(v, dict):
+                    lines.append(f"{pad}{k}: {{}}")
+                elif isinstance(v, list):
+                    lines.append(f"{pad}{k}: []")
+                else:
+                    lines.append(f"{pad}{k}: {_fmt_scalar(v)}")
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, dict) and item:
+                    first = True
+                    for k, v in item.items():
+                        prefix = f"{pad}- " if first else f"{pad}  "
+                        first = False
+                        if isinstance(v, (dict, list)) and v:
+                            lines.append(f"{prefix}{k}:")
+                            _emit(v, ind + 4)
+                        elif isinstance(v, dict):
+                            lines.append(f"{prefix}{k}: {{}}")
+                        elif isinstance(v, list):
+                            lines.append(f"{prefix}{k}: []")
+                        else:
+                            lines.append(f"{prefix}{k}: {_fmt_scalar(v)}")
+                elif isinstance(item, (dict, list)) and item:
+                    lines.append(f"{pad}-")
+                    _emit(item, ind + 2)
+                else:
+                    lines.append(f"{pad}- {_fmt_scalar(item)}")
+
+    _emit(data, 0)
+    return "\n".join(lines) + "\n"
+
+
 def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
     """Parse JSON, systemd INI (preserving repeated directives), or Kubernetes YAML manifests with strict validation."""
     stripped = (manifest_text or "").strip()
@@ -2154,7 +2431,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
             sock_restricted=sock_restricted,
         )
 
-    # 3) Kubernetes / container YAML manifest parsed cleanly with ruamel.yaml
+    # 3) Kubernetes / container YAML manifest parsed cleanly (ruamel.yaml / PyYAML / stdlib fallback)
     for raw_ln in stripped.splitlines():
         ln = raw_ln.strip()
         if not ln or ln.startswith("#") or ln in ("---", "..."):
@@ -2162,7 +2439,7 @@ def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
         if re.match(r"^\[[A-Za-z0-9_.-]+\]$", ln):
             return _result("k8s_yaml", False)
     try:
-        yaml_doc = YAML(typ="safe", pure=True).load(stripped)
+        yaml_doc = _yaml_safe_load_compat(stripped)
     except Exception:
         return _result("k8s_yaml", False)
     if not isinstance(yaml_doc, dict):
@@ -2177,23 +2454,15 @@ def _harden_manifest_text(manifest_text: str, defense_mode: str) -> str:
     if not parsed_meta["format_valid"]:
         raise ValueError(f"Cannot patch invalid {fmt} manifest")
 
-    def _dump_yaml(data: Any) -> str:
-        y = YAML(typ="safe", pure=True)
-        y.default_flow_style = False
-        y.sort_base_mapping_type_on_output = False
-        buf = io.StringIO()
-        y.dump(data, buf)
-        return buf.getvalue()
-
     if fmt in ("json", "k8s_yaml"):
-        doc = json.loads(manifest_text) if fmt == "json" else YAML(typ="safe", pure=True).load(manifest_text)
+        doc = json.loads(manifest_text) if fmt == "json" else _yaml_safe_load_compat(manifest_text)
         if not isinstance(doc, dict):
             raise ValueError(f"Expected mapping root in {fmt} manifest")
 
         if defense_mode == "naive_block_all":
             key = "serviceEnabled" if fmt == "k8s_yaml" or "serviceEnabled" in doc else "service_enabled"
             doc[key] = False
-            return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else _dump_yaml(doc)
+            return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else _yaml_safe_dump_compat(doc)
 
         containers: List[Dict[str, Any]] = []
         bfs_queue: List[Any] = [doc]
@@ -2283,7 +2552,7 @@ def _harden_manifest_text(manifest_text: str, defense_mode: str) -> str:
                     "capabilities": {"drop": ["ALL"]},
                 }
 
-        return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else _dump_yaml(doc)
+        return (json.dumps(doc, indent=2) + "\n") if fmt == "json" else _yaml_safe_dump_compat(doc)
 
     # Line-preserving systemd INI patcher (preserves all comments, blank lines, and repeated directives like ExecStartPre=)
     raw_lines = manifest_text.splitlines()
@@ -2387,7 +2656,7 @@ def _validate_hardened_manifest_syntax(manifest_text: str, expected_format: str,
         if expected_format == "systemd_ini":
             return True
         if expected_format == "k8s_yaml":
-            doc = YAML(typ="safe", pure=True).load(manifest_text)
+            doc = _yaml_safe_load_compat(manifest_text)
             if not isinstance(doc, dict):
                 return False
             if enforce_hardened and not parsed["all_containers_hardened"]:
@@ -2399,12 +2668,13 @@ def _validate_hardened_manifest_syntax(manifest_text: str, expected_format: str,
 
 
 def _build_m3_host_runtime_sim() -> str:
+    yaml_load_src = inspect.getsource(_yaml_safe_load_compat)
     parser_src = inspect.getsource(_parse_target_host_config)
     return (
         "import io, json, os, re\n"
         "from pathlib import Path\n"
-        "from typing import Any, Dict, List, Optional, Tuple\n"
-        "from ruamel.yaml import YAML\n\n"
+        "from typing import Any, Dict, List, Optional, Tuple\n\n"
+        f"{yaml_load_src}\n\n"
         f"{parser_src}\n\n"
         '''\
 def check_action(vector: str) -> str:
@@ -2612,6 +2882,8 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
             "con validazione sintattica post-patch."
         )
 
+    yaml_load_src = inspect.getsource(_yaml_safe_load_compat)
+    yaml_dump_src = inspect.getsource(_yaml_safe_dump_compat)
     parse_fn_src = inspect.getsource(_parse_target_host_config)
     harden_fn_src = inspect.getsource(_harden_manifest_text)
     rel_blue, _ = chamber.write_blue_artifact(
@@ -2619,8 +2891,9 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
         (
             "import io, json, os, re\n"
             "from pathlib import Path\n"
-            "from typing import Any, Dict, List, Optional, Tuple\n"
-            "from ruamel.yaml import YAML\n\n"
+            "from typing import Any, Dict, List, Optional, Tuple\n\n"
+            f"{yaml_load_src}\n\n"
+            f"{yaml_dump_src}\n\n"
             f"{parse_fn_src}\n\n"
             f"{harden_fn_src}\n\n"
             "up = Path(os.environ['ACK_UPPERDIR'])\n"
