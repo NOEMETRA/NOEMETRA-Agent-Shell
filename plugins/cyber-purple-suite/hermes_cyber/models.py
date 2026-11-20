@@ -351,7 +351,7 @@ class ActionExecutionLimits(BaseModel):
     """Strict resource and network confinement bounds inside the Detonation Chamber."""
 
     timeout_sec: int = Field(default=15, ge=1, le=120)
-    max_procs: int = Field(default=32, ge=1, le=256)
+    max_procs: int = Field(default=1, ge=1, le=256)
     network_mode: Literal["isolated_veth", "loopback_only", "none"] = "isolated_veth"
 
 

@@ -126,6 +126,48 @@ def test_ack_confinement_blocks_host_file_read_direct_canary_read_and_external_n
         rc_n, _, err_n, _ = chamber.run_contract(c_net)
         assert rc_n != 0
         assert "PermissionError" in err_n
+
+        # 4) Child process spawning (subprocess.Popen) must be unconditionally blocked to prevent audit-hook escape
+        _, _ = chamber.write_red_artifact(
+            "rogue_proc.py",
+            "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'print(\"ESCAPED\")'])\n",
+        )
+        c_proc = c_host.model_copy(
+            update={
+                "action_id": "act_rogue_proc",
+                "artifact_path": "artifacts/red/rogue_proc.py",
+                "entrypoint": ["python3", "artifacts/red/rogue_proc.py"],
+                "limits": ActionExecutionLimits(timeout_sec=10, max_procs=1, network_mode="none"),
+            }
+        )
+        rc_p, out_p, err_p, _ = chamber.run_contract(c_proc)
+        assert rc_p != 0
+        assert "ESCAPED" not in out_p
+        assert "PermissionError" in err_p
+
+        # 5) Spoofing frame co_filename via compile() must NEVER bypass process-level canary isolation
+        spoof_target = str(chamber.upperdir / "target_service.py")
+        _, _ = chamber.write_red_artifact(
+            "rogue_compile_spoof.py",
+            (
+                "import os\nfrom pathlib import Path\n"
+                f"code = compile(\"print((Path(os.environ['ACK_UPPERDIR']) / 'canary_vault' / 'canary.txt').read_text())\", {spoof_target!r}, 'exec')\n"
+                "exec(code)\n"
+            ),
+        )
+        c_spoof = c_host.model_copy(
+            update={
+                "action_id": "act_rogue_spoof",
+                "artifact_path": "artifacts/red/rogue_compile_spoof.py",
+                "entrypoint": ["python3", "artifacts/red/rogue_compile_spoof.py"],
+                "limits": ActionExecutionLimits(timeout_sec=10, max_procs=1, network_mode="none"),
+            }
+        )
+        rc_s, out_s, err_s, fs_s = chamber.run_contract(c_spoof)
+        assert rc_s != 0
+        assert fs_s.canary_accessed is False
+        assert chamber.canary_token not in out_s
+        assert "PermissionError" in err_s
     finally:
         chamber.cleanup()
 
@@ -174,6 +216,10 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest():
     assert rep_vuln_clone.certification_verdict == "CERTIFIED_HARDENED_CLONED_MANIFEST"
     assert rep_vuln_clone.certified is True
     assert rep_vuln_clone.tpr_fpr_matrix.pre_patch_breach_confirmed is True
+    assert ActionExecutionLimits().max_procs == 1
+    blue_m3_ev = next(ev for ev in rep_vuln_clone.oracle_evidences if ev.action_id == "act_blue_m3_harden")
+    assert "cloned_target_manifest.conf" in blue_m3_ev.fs_diff.modified
+    assert blue_m3_ev.fs_diff.lowerdir_untouched is True
 
     # 3) Already hardened manifest must NOT claim a fake pre-patch escalation
     hardened_manifest = "\n".join([

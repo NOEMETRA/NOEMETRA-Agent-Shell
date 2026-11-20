@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import inspect
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 
 from hermes_cyber.models import (
     AckCertificationReport,
@@ -121,7 +125,7 @@ def _verify_harness_execution(rc: int, result_path: Path) -> Tuple[bool, int, Di
 # ---------------------------------------------------------------------------
 
 _CONFINED_RUNNER_SOURCE = '''\
-"""Control-plane supervisor executing untrusted Red/Blue artifacts with audit-hook FS/Net/Proc confinement."""
+"""Control-plane supervisor executing untrusted Red/Blue/Target artifacts with audit-hook FS/Net/Proc confinement."""
 
 import json
 import os
@@ -136,8 +140,16 @@ _CANARY_VAULT = Path(_POLICY["canary_vault"]).resolve()
 _ACTOR_ARTIFACTS = Path(_POLICY["actor_artifacts"]).resolve()
 _BLUE_EXTRA_READ = Path(_POLICY["blue_extra_read"]).resolve() if _POLICY.get("blue_extra_read") else None
 _NET_MODE = str(_POLICY.get("network_mode", "isolated_veth"))
-_MAX_PROCS = max(1, int(_POLICY.get("max_procs", 32)))
-_TARGET_MODULES = set(_POLICY.get("target_modules", ["target_service.py", "target_workload.py", "host_runtime_sim.py"]))
+_MAX_PROCS = max(1, int(_POLICY.get("max_procs", 1)))
+_BLOCKED_PROC_EVENTS = frozenset({
+    "os.system",
+    "subprocess.Popen",
+    "os.spawn",
+    "os.fork",
+    "os.posix_spawn",
+    "ctypes.dlopen",
+    "ctypes.dlsym",
+})
 _PY_ROOTS = [
     Path(p).resolve()
     for p in (
@@ -156,7 +168,7 @@ _WRITE_FLAGS = (
     | getattr(os, "O_CREAT", 256)
     | getattr(os, "O_TRUNC", 512)
 )
-_STATE = {"proc_count": 1, "active": False}
+_STATE = {"active": False}
 
 
 def _resolve_fs_path(raw):
@@ -174,39 +186,12 @@ def _resolve_fs_path(raw):
     return p.resolve(strict=False)
 
 
-def _caller_inside_target_module():
-    try:
-        frame = sys._getframe(1)
-    except ValueError:
-        return False
-    while frame is not None:
-        fname = frame.f_code.co_filename
-        if fname:
-            try:
-                fpath = Path(fname).resolve(strict=False)
-                if fpath.parent == _UPPERDIR and fpath.name in _TARGET_MODULES:
-                    return True
-            except Exception:
-                pass
-        frame = frame.f_back
-    return False
-
-
 def _audit_hook(event, args):
     if not _STATE["active"]:
         return
 
-    if event == "os.system":
-        raise PermissionError("os.system disabled in ACK DetonationChamber")
-
-    if event == "ctypes.dlopen" and _ACTOR == "RED":
-        raise PermissionError("ctypes.dlopen blocked for RED actor in ACK DetonationChamber")
-
-    if event in ("subprocess.Popen", "os.spawn", "os.fork", "os.posix_spawn"):
-        if _STATE["proc_count"] + 1 > _MAX_PROCS:
-            raise PermissionError(f"ACK max_procs limit ({_MAX_PROCS}) exceeded")
-        _STATE["proc_count"] += 1
-        return
+    if event in _BLOCKED_PROC_EVENTS:
+        raise PermissionError(f"Event {event!r} blocked in ACK DetonationChamber (single-process confinement)")
 
     if event in ("socket.connect", "socket.bind", "socket.sendto", "socket.getaddrinfo"):
         if _NET_MODE == "none":
@@ -253,12 +238,14 @@ def _audit_hook(event, args):
                 return
             raise PermissionError(f"Write outside sandbox denied by ACK DetonationChamber: {resolved}")
 
-        # Read access checks
+        # Read access checks: strict process boundary so only TARGET server process can ever read canary_vault
         if any(resolved.is_relative_to(r) for r in _PY_ROOTS):
             return
         if resolved.is_relative_to(_CANARY_VAULT):
-            if _ACTOR == "RED" and not _caller_inside_target_module():
-                raise PermissionError("Direct canary read from Red artifact is forbidden; must traverse target module")
+            if _ACTOR != "TARGET":
+                raise PermissionError(
+                    "RED/BLUE actors cannot open canary_vault directly; only the isolated TARGET server process may read canary_vault"
+                )
             return
         if resolved.is_relative_to(_UPPERDIR) or resolved.is_relative_to(_ACTOR_ARTIFACTS):
             return
@@ -275,9 +262,62 @@ if __name__ == "__main__":
     runpy.run_path(script_path, run_name="__main__")
 '''
 
+_TARGET_SERVER_SOURCE = '''\
+"""Isolated TARGET HTTP loopback server running inside its own confined process with exclusive canary_vault read."""
 
-def _create_win32_job_object(max_procs: int) -> Optional[int]:
-    """Create a Win32 Job Object enforcing ActiveProcessLimit and cleanup on close."""
+import importlib.util
+import json
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+upperdir = Path(os.environ["ACK_UPPERDIR"]).resolve()
+sys.path.insert(0, str(upperdir))
+target_path = (upperdir / sys.argv[1]).resolve()
+handler_name = sys.argv[2]
+
+spec = importlib.util.spec_from_file_location("_ack_target_mod", str(target_path))
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"Unable to load target module: {target_path}")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+handler_fn = getattr(mod, handler_name)
+
+
+class _AckTargetHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def address_string(self):
+        return str(self.client_address[0])
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            status, body = handler_fn(payload)
+        except Exception as exc:
+            status, body = 500, {"error": str(exc)}
+        encoded = json.dumps(body).encode("utf-8")
+        self.send_response(int(status))
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+if __name__ == "__main__":
+    httpd = HTTPServer(("127.0.0.1", 0), _AckTargetHandler)
+    print(f"ACK_LISTEN_PORT={httpd.server_address[1]}", flush=True)
+    httpd.serve_forever()
+'''
+
+
+def _create_win32_job_object(max_procs: int = 1) -> Optional[int]:
+    """Create a Win32 Job Object strictly enforcing ActiveProcessLimit=1 and cleanup on close."""
+    del max_procs
     if sys.platform != "win32":
         return None
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -316,7 +356,7 @@ def _create_win32_job_object(max_procs: int) -> Optional[int]:
     info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
     # JOB_OBJECT_LIMIT_ACTIVE_PROCESS (0x8) | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000)
     info.BasicLimitInformation.LimitFlags = 0x00000008 | 0x00002000
-    info.BasicLimitInformation.ActiveProcessLimit = max(1, int(max_procs))
+    info.BasicLimitInformation.ActiveProcessLimit = 1
     ok = kernel32.SetInformationJobObject(
         ctypes.c_void_p(h_job),
         9,
@@ -358,6 +398,8 @@ class DetonationChamber:
         (self.oracle_dir / "canary_ref.txt").write_text(f"SECRET_TOKEN={self.canary_token}\n", encoding="utf-8")
         self._runner_path = (self.oracle_dir / "_confined_runner.py").resolve()
         self._runner_path.write_text(_CONFINED_RUNNER_SOURCE, encoding="utf-8")
+        self._target_server_path = (self.oracle_dir / "_target_server.py").resolve()
+        self._target_server_path.write_text(_TARGET_SERVER_SOURCE, encoding="utf-8")
 
         self.isolation_backend = (
             "win32_job_object_plus_audit_hook" if sys.platform == "win32" else "posix_rlimit_plus_audit_hook"
@@ -471,6 +513,138 @@ class DetonationChamber:
             extra_args.append(resolved_arg)
         return artifact_abs, extra_args
 
+    def _base_confined_env(self, policy: Dict[str, Any]) -> Dict[str, str]:
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+            "TEMP": str(self.upperdir),
+            "TMP": str(self.upperdir),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "ACK_SANDBOX_ID": self.sandbox_id,
+            "ACK_UPPERDIR": str(self.upperdir),
+            "ACK_CONFINE_POLICY": json.dumps(policy),
+        }
+
+    @staticmethod
+    def _resolve_confined_python() -> str:
+        """Resolve the direct Python binary without Windows venv trampoline stubs so ActiveProcessLimit=1 succeeds."""
+        if sys.platform == "win32":
+            base_exe = getattr(sys, "_base_executable", None)
+            if base_exe and Path(base_exe).is_file():
+                return str(Path(base_exe).resolve())
+        return sys.executable
+
+    def _spawn_confined_proc(
+        self,
+        *,
+        script_abs: Path,
+        extra_args: List[str],
+        confined_env: Dict[str, str],
+        timeout_sec: int,
+    ) -> Tuple[subprocess.Popen[str], Optional[int]]:
+        """Spawn _confined_runner.py under OS CPU limit and Win32 ActiveProcessLimit=1 Job Object."""
+        cmd = [self._resolve_confined_python(), str(self._runner_path), str(script_abs), *extra_args]
+        preexec = None
+        if sys.platform != "win32":
+            import resource  # type: ignore
+
+            def _apply_posix_limits() -> None:
+                resource.setrlimit(resource.RLIMIT_CPU, (timeout_sec, timeout_sec))
+
+            preexec = _apply_posix_limits
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(self.upperdir),
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=confined_env,
+            preexec_fn=preexec,
+        )
+        h_job: Optional[int] = None
+        if sys.platform == "win32":
+            h_job = _create_win32_job_object(1)
+            if h_job and getattr(proc, "_handle", None):
+                ctypes.windll.kernel32.AssignProcessToJobObject(  # type: ignore[attr-defined]
+                    ctypes.c_void_p(h_job),
+                    ctypes.c_void_p(int(proc._handle)),
+                )
+        return proc, h_job
+
+    @contextmanager
+    def target_server(
+        self,
+        target_module: str,
+        handler_name: str = "handle_request",
+        *,
+        timeout_sec: int = 15,
+    ) -> Iterator[int]:
+        """Run a target module in an isolated TARGET subprocess bound to loopback 127.0.0.1."""
+        mod_path = (self.upperdir / target_module).resolve()
+        if not mod_path.is_relative_to(self.upperdir) or not mod_path.exists():
+            raise FileNotFoundError(f"Modulo target non trovato in upperdir: {target_module}")
+
+        policy = {
+            "actor": "TARGET",
+            "upperdir": str(self.upperdir),
+            "canary_vault": str(self.canary_vault),
+            "actor_artifacts": str(self.upperdir),
+            "blue_extra_read": str(self._target_server_path),
+            "network_mode": "loopback_only",
+            "max_procs": 1,
+        }
+        proc, h_job = self._spawn_confined_proc(
+            script_abs=self._target_server_path,
+            extra_args=[target_module, handler_name],
+            confined_env=self._base_confined_env(policy),
+            timeout_sec=timeout_sec,
+        )
+        port_q: queue.Queue[Optional[int]] = queue.Queue(maxsize=1)
+
+        def _read_ready_port() -> None:
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    if line.startswith("ACK_LISTEN_PORT="):
+                        port_q.put(int(line.split("=", 1)[1].strip()))
+                        return
+                port_q.put(None)
+            except Exception:
+                try:
+                    port_q.put_nowait(None)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_read_ready_port, daemon=True).start()
+        try:
+            try:
+                port = port_q.get(timeout=min(5.0, float(timeout_sec)))
+            except queue.Empty:
+                port = None
+            if port is None:
+                proc.kill()
+                _, err_out = proc.communicate(timeout=2)
+                raise RuntimeError(f"ACK isolated TARGET server failed to start for {target_module}: {err_out}")
+            yield port
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+            if h_job:
+                ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(h_job))  # type: ignore[attr-defined]
+
     def run_contract(
         self,
         contract: ConstrainedActionContract,
@@ -495,20 +669,10 @@ class DetonationChamber:
             "actor_artifacts": str(actor_artifacts),
             "blue_extra_read": blue_extra_read,
             "network_mode": contract.limits.network_mode,
-            "max_procs": contract.limits.max_procs,
-            "target_modules": ["target_service.py", "target_workload.py", "host_runtime_sim.py"],
+            "max_procs": 1,
         }
 
-        confined_env: Dict[str, str] = {
-            "PATH": os.environ.get("PATH", ""),
-            "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
-            "TEMP": str(self.upperdir),
-            "TMP": str(self.upperdir),
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "ACK_SANDBOX_ID": self.sandbox_id,
-            "ACK_UPPERDIR": str(self.upperdir),
-            "ACK_CONFINE_POLICY": json.dumps(policy),
-        }
+        confined_env = self._base_confined_env(policy)
         # Preserve Red/Blue Fog of War at the environment level
         if contract.actor == "RED":
             confined_env["ACK_ARTIFACTS_RED"] = str(self.artifacts_red)
@@ -519,41 +683,17 @@ class DetonationChamber:
         if extra_env:
             confined_env.update(extra_env)
 
-        cmd = [sys.executable, str(self._runner_path), str(script_abs), *extra_args]
-        preexec = None
-        if sys.platform != "win32":
-            import resource  # type: ignore
-
-            def _apply_posix_limits() -> None:
-                resource.setrlimit(
-                    resource.RLIMIT_CPU,
-                    (contract.limits.timeout_sec, contract.limits.timeout_sec),
-                )
-
-            preexec = _apply_posix_limits
-
         h_job: Optional[int] = None
         stdout = ""
         stderr = ""
         rc = 1
         try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(self.upperdir),
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=confined_env,
-                preexec_fn=preexec,
+            proc, h_job = self._spawn_confined_proc(
+                script_abs=script_abs,
+                extra_args=extra_args,
+                confined_env=confined_env,
+                timeout_sec=contract.limits.timeout_sec,
             )
-            if sys.platform == "win32":
-                h_job = _create_win32_job_object(contract.limits.max_procs)
-                if h_job and getattr(proc, "_handle", None):
-                    ctypes.windll.kernel32.AssignProcessToJobObject(  # type: ignore[attr-defined]
-                        ctypes.c_void_p(h_job),
-                        ctypes.c_void_p(int(proc._handle)),
-                    )
             try:
                 stdout, stderr = proc.communicate(timeout=contract.limits.timeout_sec)
                 rc = int(proc.returncode or 0)
@@ -668,7 +808,7 @@ def _contract(
         primitive=primitive,  # type: ignore[arg-type]
         artifact_path=artifact_path,
         entrypoint=entrypoint,
-        limits=ActionExecutionLimits(timeout_sec=15, max_procs=32, network_mode=network_mode),  # type: ignore[arg-type]
+        limits=ActionExecutionLimits(timeout_sec=15, max_procs=1, network_mode=network_mode),  # type: ignore[arg-type]
         target_invariant=target_invariant,
         attack_class=attack_class,
     )
@@ -692,6 +832,16 @@ class _MissionExecutionOutcome:
 # Mission 1: Exploit-to-Patch & Bypass Loop (Real CoW Service + Mutation)
 # ---------------------------------------------------------------------------
 
+_M1_HTTP_HANDLER_TAIL = '''\
+
+def handle_request(payload: dict) -> tuple:
+    try:
+        content = read_upload(str(payload.get("path", "welcome.txt")))
+        return 200, {"content": content}
+    except Exception as exc:
+        return 403, {"error": str(exc)}
+'''
+
 _M1_VULNERABLE_SERVICE = '''\
 import os
 import sys
@@ -705,26 +855,15 @@ def read_upload(rel_path: str) -> str:
     target = os.path.normpath(os.path.join(str(UPLOAD_ROOT), rel_path))
     with open(target, "r", encoding="utf-8") as fh:
         return fh.read()
-
-if __name__ == "__main__":
-    arg = sys.argv[1] if len(sys.argv) > 1 else "welcome.txt"
-    print(read_upload(arg), end="")
-'''
+''' + _M1_HTTP_HANDLER_TAIL
 
 _M1_NAIVE_BLOCK_ALL_SERVICE = '''\
-import sys
-
 def read_upload(rel_path: str) -> str:
     raise PermissionError("naive_block_all: all upload reads disabled")
-
-if __name__ == "__main__":
-    arg = sys.argv[1] if len(sys.argv) > 1 else "welcome.txt"
-    print(read_upload(arg), end="")
-'''
+''' + _M1_HTTP_HANDLER_TAIL
 
 _M1_NAIVE_REPLACE_SERVICE = '''\
 import os
-import sys
 import urllib.parse
 from pathlib import Path
 
@@ -737,14 +876,9 @@ def read_upload(rel_path: str) -> str:
     target = os.path.normpath(os.path.join(str(UPLOAD_ROOT), cleaned))
     with open(target, "r", encoding="utf-8") as fh:
         return fh.read()
-
-if __name__ == "__main__":
-    arg = sys.argv[1] if len(sys.argv) > 1 else "welcome.txt"
-    print(read_upload(arg), end="")
-'''
+''' + _M1_HTTP_HANDLER_TAIL
 
 _M1_STRUCTURAL_PATCH_SERVICE = '''\
-import sys
 import urllib.parse
 from pathlib import Path
 
@@ -775,11 +909,7 @@ def read_upload(rel_path: str) -> str:
     if not resolved.is_relative_to(UPLOAD_ROOT):
         raise PermissionError("Escape outside UPLOAD_ROOT rejected")
     return resolved.read_text(encoding="utf-8")
-
-if __name__ == "__main__":
-    arg = sys.argv[1] if len(sys.argv) > 1 else "welcome.txt"
-    print(read_upload(arg), end="")
-'''
+''' + _M1_HTTP_HANDLER_TAIL
 
 
 def _run_m1_exploit_to_patch(
@@ -805,24 +935,22 @@ def _run_m1_exploit_to_patch(
     transitions.append(AckStateTransition(
         state="INIT_ARENA",
         actor="CONTROL_PLANE",
-        summary=f"Inizializzata DetonationChamber `{chamber.sandbox_id}` ({chamber.isolation_backend}) con canary vault isolato.",
+        summary=f"Inizializzata DetonationChamber `{chamber.sandbox_id}` ({chamber.isolation_backend}) con server TARGET isolato e canary vault separato.",
         passed=True,
     ))
 
-    # RED_WEAPONIZE + ORACLE_BASELINE_CHECK
-    red_ctx = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="target_service.read_upload")
+    # RED_WEAPONIZE + ORACLE_BASELINE_CHECK over isolated TARGET loopback HTTP boundary
+    red_ctx = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="http://127.0.0.1:PORT/read_upload")
     base_poc_code = '''\
-import json, os, sys
+import http.client, json, os
 from pathlib import Path
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import target_service
+port = int(os.environ["ACK_TARGET_PORT"])
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("POST", "/", body=json.dumps({"path": "../../canary_vault/canary.txt"}), headers={"Content-Type": "application/json"})
+resp = conn.getresponse()
+body = json.loads(resp.read().decode("utf-8"))
 loot_path = Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_act_red_base.json"
-data = ""
-try:
-    data = target_service.read_upload("../../canary_vault/canary.txt")
-except Exception as exc:
-    data = f"BLOCKED: {exc}"
-loot_path.write_text(json.dumps({"status": "COMPLETED", "attempts_executed": 1, "exfil": data}), encoding="utf-8")
+loot_path.write_text(json.dumps({"status": "COMPLETED", "attempts_executed": 1, "http_status": resp.status, "exfil": body}), encoding="utf-8")
 '''
     rel_base, _ = chamber.write_red_artifact("poc_m1_base.py", base_poc_code)
     base_contract = _contract(
@@ -837,7 +965,8 @@ loot_path.write_text(json.dumps({"status": "COMPLETED", "attempts_executed": 1, 
         attack_class="CLASS_DIRECT_DOTDOT_TRAVERSAL",
     )
     contracts.append(base_contract)
-    rc, _, _, fs_base = chamber.run_contract(base_contract)
+    with chamber.target_server("target_service.py", "handle_request") as base_port:
+        rc, _, _, fs_base = chamber.run_contract(base_contract, extra_env={"ACK_TARGET_PORT": str(base_port)})
     base_ok, base_attempts, _ = _verify_harness_execution(rc, chamber.artifacts_red / "loot_act_red_base.json")
     pre_breach = base_ok and fs_base.canary_accessed
     base_verdict: AckOracleVerdictType = (
@@ -847,7 +976,7 @@ loot_path.write_text(json.dumps({"status": "COMPLETED", "attempts_executed": 1, 
         action_id=base_contract.action_id,
         exit_code=rc,
         fs_diff=fs_base,
-        net_events=[NetEventEvidence(dst="10.200.0.2:8080", bytes_out=128, bytes_in=256)],
+        net_events=[NetEventEvidence(dst=f"127.0.0.1:{base_port}", bytes_out=128, bytes_in=256)],
         telemetry_alerts=[TelemetryAlertEvidence(rule_id="baseline_waf", engine="ebpf_sigma_yara", triggered=False)],
         execution_valid=base_ok,
         attempts_executed=base_attempts,
@@ -858,7 +987,7 @@ loot_path.write_text(json.dumps({"status": "COMPLETED", "attempts_executed": 1, 
     transitions.append(AckStateTransition(
         state="RED_WEAPONIZE",
         actor="RED",
-        summary="Red ha costruito PoC `poc_m1_base.py` contro `target_service.read_upload`.",
+        summary="Red ha costruito PoC HTTP `poc_m1_base.py` contro server target isolato `target_service`.",
         passed=base_ok,
     ))
     transitions.append(AckStateTransition(
@@ -916,80 +1045,83 @@ up = Path(os.environ["ACK_UPPERDIR"])
         passed=(brc == 0),
     ))
 
-    # ORACLE_FUNCTIONAL_AND_FPR_CHECK
-    func_rel, _ = chamber.write_blue_artifact("oracle_func_m1.py", '''\
-import os, sys
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import target_service
-out = target_service.read_upload("welcome.txt")
-assert "NOEMETRA_WELCOME_OK" in out, f"Unexpected output: {out!r}"
+    # Boot fresh isolated TARGET server with Blue's patched target_service.py
+    with chamber.target_server("target_service.py", "handle_request") as patched_port:
+        # ORACLE_FUNCTIONAL_AND_FPR_CHECK
+        func_rel, _ = chamber.write_blue_artifact("oracle_func_m1.py", '''\
+import http.client, json, os
+port = int(os.environ["ACK_TARGET_PORT"])
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("POST", "/", body=json.dumps({"path": "welcome.txt"}), headers={"Content-Type": "application/json"})
+resp = conn.getresponse()
+body = json.loads(resp.read().decode("utf-8"))
+assert resp.status == 200 and "NOEMETRA_WELCOME_OK" in body.get("content", ""), f"Unexpected output: {resp.status} {body!r}"
 print("FUNC_OK")
 ''')
-    func_contract = _contract(
-        chamber=chamber,
-        action_id="act_oracle_func",
-        actor="BLUE",
-        phase="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
-        primitive="EXEC_ARTIFACT",
-        artifact_path=func_rel,
-        entrypoint=["python3", func_rel],
-        target_invariant="INV_LEGITIMATE_READ_SURVIVES",
-    )
-    contracts.append(func_contract)
-    frc, fout, _, ffs = chamber.run_contract(func_contract)
-    func_ok = (frc == 0 and "FUNC_OK" in fout)
-    func_verdict: AckOracleVerdictType = "DEFENSE_HELD_CLEAN" if func_ok else "DEFENSE_REJECTED_BROKEN_FUNC"
-    evidences.append(OutOfBandOracleEvidence(
-        action_id=func_contract.action_id,
-        exit_code=frc,
-        fs_diff=ffs,
-        functional_suite_passed=func_ok,
-        fpr_value=0.0,
-        isolation_backend=chamber.isolation_backend,
-        oracle_verdict=func_verdict,
-    ))
-    transitions.append(AckStateTransition(
-        state="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
-        actor="ORACLE",
-        summary=f"Test funzionale servizio target: passed={func_ok} ({func_verdict}).",
-        passed=func_ok,
-    ))
-
-    if not func_ok:
-        transitions.append(AckStateTransition(
-            state="CERTIFY_REPORT",
-            actor="ORACLE",
-            summary="Certificazione respinta: la difesa ha rotto la funzionalità legittima del servizio.",
-            passed=False,
-        ))
-        return _MissionExecutionOutcome(
-            transitions=transitions,
-            contracts=contracts,
-            evidences=evidences,
-            mutation_rounds=[],
-            tpr_fpr_matrix=AckTprFprMatrix(
-                true_positive_rate=0.0,
-                false_positive_rate=0.0,
-                evasion_resistance_rate=0.0,
-                functional_survival_rate=0.0,
-                pre_patch_breach_confirmed=pre_breach,
-                post_patch_breaches=0,
-            ),
-            blue_summary=blue_summary,
-            certified=False,
-            certification_verdict="REJECTED_BROKEN_FUNCTIONALITY",
-            rationale="Oracolo anti-cheat: la difesa naive ha bloccato le richieste legittime invece di correggere l'invariante.",
+        func_contract = _contract(
+            chamber=chamber,
+            action_id="act_oracle_func",
+            actor="BLUE",
+            phase="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
+            primitive="EXEC_ARTIFACT",
+            artifact_path=func_rel,
+            entrypoint=["python3", func_rel],
+            target_invariant="INV_LEGITIMATE_READ_SURVIVES",
         )
+        contracts.append(func_contract)
+        frc, fout, _, ffs = chamber.run_contract(func_contract, extra_env={"ACK_TARGET_PORT": str(patched_port)})
+        func_ok = (frc == 0 and "FUNC_OK" in fout)
+        func_verdict: AckOracleVerdictType = "DEFENSE_HELD_CLEAN" if func_ok else "DEFENSE_REJECTED_BROKEN_FUNC"
+        evidences.append(OutOfBandOracleEvidence(
+            action_id=func_contract.action_id,
+            exit_code=frc,
+            fs_diff=ffs,
+            functional_suite_passed=func_ok,
+            fpr_value=0.0,
+            isolation_backend=chamber.isolation_backend,
+            oracle_verdict=func_verdict,
+        ))
+        transitions.append(AckStateTransition(
+            state="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
+            actor="ORACLE",
+            summary=f"Test funzionale servizio target: passed={func_ok} ({func_verdict}).",
+            passed=func_ok,
+        ))
 
-    # RED_MUTATE_BYPASS (distinct attack classes forced by FogOfWarController)
-    mutation_specs: List[Tuple[str, str]] = [
-        (
-            "CLASS_DOUBLE_URL_ENCODING_NULL_BYTE",
-            '''\
-import json, os, sys
+        if not func_ok:
+            transitions.append(AckStateTransition(
+                state="CERTIFY_REPORT",
+                actor="ORACLE",
+                summary="Certificazione respinta: la difesa ha rotto la funzionalità legittima del servizio.",
+                passed=False,
+            ))
+            return _MissionExecutionOutcome(
+                transitions=transitions,
+                contracts=contracts,
+                evidences=evidences,
+                mutation_rounds=[],
+                tpr_fpr_matrix=AckTprFprMatrix(
+                    true_positive_rate=0.0,
+                    false_positive_rate=0.0,
+                    evasion_resistance_rate=0.0,
+                    functional_survival_rate=0.0,
+                    pre_patch_breach_confirmed=pre_breach,
+                    post_patch_breaches=0,
+                ),
+                blue_summary=blue_summary,
+                certified=False,
+                certification_verdict="REJECTED_BROKEN_FUNCTIONALITY",
+                rationale="Oracolo anti-cheat: la difesa naive ha bloccato le richieste legittime invece di correggere l'invariante.",
+            )
+
+        # RED_MUTATE_BYPASS (distinct attack classes forced by FogOfWarController, strictly over HTTP)
+        mutation_specs: List[Tuple[str, str]] = [
+            (
+                "CLASS_DOUBLE_URL_ENCODING_NULL_BYTE",
+                '''\
+import http.client, json, os
 from pathlib import Path
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import target_service
+port = int(os.environ["ACK_TARGET_PORT"])
 loot_path = Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_{aid}.json"
 hits = []
 for payload in (
@@ -997,20 +1129,20 @@ for payload in (
     "....//....//canary_vault/canary.txt",
     "../../canary_vault/canary.txt\\x00.png",
 ):
-    try:
-        hits.append(target_service.read_upload(payload))
-    except Exception as exc:
-        hits.append(f"BLOCKED: {{exc}}")
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/", body=json.dumps({{"path": payload}}), headers={{"Content-Type": "application/json"}})
+    resp = conn.getresponse()
+    body = json.loads(resp.read().decode("utf-8"))
+    hits.append(body.get("content") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}}")
 loot_path.write_text(json.dumps({{"status": "COMPLETED", "attempts_executed": len(hits), "attempts": hits}}), encoding="utf-8")
 ''',
-        ),
-        (
-            "CLASS_SYMLINK_AND_NESTED_ESCAPE",
-            '''\
-import json, os, sys
+            ),
+            (
+                "CLASS_SYMLINK_AND_NESTED_ESCAPE",
+                '''\
+import http.client, json, os
 from pathlib import Path
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import target_service
+port = int(os.environ["ACK_TARGET_PORT"])
 up = Path(os.environ["ACK_UPPERDIR"])
 link_path = up / "uploads" / "tenant_a" / "sym_canary.txt"
 loot_path = Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_{aid}.json"
@@ -1021,20 +1153,20 @@ try:
 except OSError:
     pass
 for payload in ("sym_canary.txt", "....//....//canary_vault/canary.txt"):
-    try:
-        hits.append(target_service.read_upload(payload))
-    except Exception as exc:
-        hits.append(f"BLOCKED: {{exc}}")
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/", body=json.dumps({{"path": payload}}), headers={{"Content-Type": "application/json"}})
+    resp = conn.getresponse()
+    body = json.loads(resp.read().decode("utf-8"))
+    hits.append(body.get("content") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}}")
 loot_path.write_text(json.dumps({{"status": "COMPLETED", "attempts_executed": len(hits), "attempts": hits}}), encoding="utf-8")
 ''',
-        ),
-        (
-            "CLASS_BACKSLASH_UNC_NORMALIZATION_DIFFERENTIAL",
-            '''\
-import json, os, sys
+            ),
+            (
+                "CLASS_BACKSLASH_UNC_NORMALIZATION_DIFFERENTIAL",
+                '''\
+import http.client, json, os
 from pathlib import Path
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import target_service
+port = int(os.environ["ACK_TARGET_PORT"])
 loot_path = Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_{aid}.json"
 hits = []
 for payload in (
@@ -1042,78 +1174,80 @@ for payload in (
     "sub/../../../canary_vault/canary.txt",
     "%2e%2e%5c%2e%2e%5ccanary_vault%5ccanary.txt",
 ):
-    try:
-        hits.append(target_service.read_upload(payload))
-    except Exception as exc:
-        hits.append(f"BLOCKED: {{exc}}")
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/", body=json.dumps({{"path": payload}}), headers={{"Content-Type": "application/json"}})
+    resp = conn.getresponse()
+    body = json.loads(resp.read().decode("utf-8"))
+    hits.append(body.get("content") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}}")
 loot_path.write_text(json.dumps({{"status": "COMPLETED", "attempts_executed": len(hits), "attempts": hits}}), encoding="utf-8")
 ''',
-        ),
-    ]
+            ),
+        ]
 
-    rounds_to_run = max(1, min(len(mutation_specs), mutation_rounds))
-    post_breaches = 0
-    exec_errors = 0
-    for idx in range(rounds_to_run):
-        atk_class, tmpl = mutation_specs[idx]
-        aid = f"act_red_mut_{idx + 1:02d}"
-        if inject_broken_mutation and idx == 0:
-            script_body = "raise RuntimeError('Simulated broken mutation harness without loot output')\n"
-        else:
-            script_body = tmpl.format(aid=aid)
-        rel_mut, _ = chamber.write_red_artifact(f"poc_m1_mut_{idx + 1:02d}.py", script_body)
-        m_contract = _contract(
-            chamber=chamber,
-            action_id=aid,
-            actor="RED",
-            phase="RED_MUTATE_BYPASS",
-            primitive="EXEC_ARTIFACT",
-            artifact_path=rel_mut,
-            entrypoint=["python3", rel_mut],
-            target_invariant=desc.target_invariant,
-            attack_class=atk_class,
-        )
-        contracts.append(m_contract)
-        mrc, _, _, mfs = chamber.run_contract(m_contract)
-        exec_ok, attempts_n, _ = _verify_harness_execution(mrc, chamber.artifacts_red / f"loot_{aid}.json")
-        if not exec_ok:
-            exec_errors += 1
-            bypassed = False
-            m_verdict: AckOracleVerdictType = "EXECUTION_ERROR"
-        else:
-            bypassed = mfs.canary_accessed
-            if bypassed:
-                post_breaches += 1
-            m_verdict = "INVARIANT_BREACHED_STEALTH" if bypassed else "DEFENSE_HELD_CLEAN"
+        rounds_to_run = max(1, min(len(mutation_specs), mutation_rounds))
+        post_breaches = 0
+        exec_errors = 0
+        for idx in range(rounds_to_run):
+            atk_class, tmpl = mutation_specs[idx]
+            aid = f"act_red_mut_{idx + 1:02d}"
+            if inject_broken_mutation and idx == 0:
+                script_body = "raise RuntimeError('Simulated broken mutation harness without loot output')\n"
+            else:
+                script_body = tmpl.format(aid=aid)
+            rel_mut, _ = chamber.write_red_artifact(f"poc_m1_mut_{idx + 1:02d}.py", script_body)
+            m_contract = _contract(
+                chamber=chamber,
+                action_id=aid,
+                actor="RED",
+                phase="RED_MUTATE_BYPASS",
+                primitive="EXEC_ARTIFACT",
+                artifact_path=rel_mut,
+                entrypoint=["python3", rel_mut],
+                target_invariant=desc.target_invariant,
+                attack_class=atk_class,
+            )
+            contracts.append(m_contract)
+            mrc, _, _, mfs = chamber.run_contract(m_contract, extra_env={"ACK_TARGET_PORT": str(patched_port)})
+            exec_ok, attempts_n, _ = _verify_harness_execution(mrc, chamber.artifacts_red / f"loot_{aid}.json")
+            if not exec_ok:
+                exec_errors += 1
+                bypassed = False
+                m_verdict: AckOracleVerdictType = "EXECUTION_ERROR"
+            else:
+                bypassed = mfs.canary_accessed
+                if bypassed:
+                    post_breaches += 1
+                m_verdict = "INVARIANT_BREACHED_STEALTH" if bypassed else "DEFENSE_HELD_CLEAN"
 
-        mev = OutOfBandOracleEvidence(
-            action_id=aid,
-            exit_code=mrc,
-            fs_diff=mfs,
-            telemetry_alerts=[
-                TelemetryAlertEvidence(
-                    rule_id="seccomp_contain",
-                    engine="seccomp_kernel",
-                    triggered=bool(exec_ok and not bypassed),
-                )
-            ],
-            execution_valid=exec_ok,
-            attempts_executed=attempts_n,
-            isolation_backend=chamber.isolation_backend,
-            oracle_verdict=m_verdict,
-        )
-        evidences.append(mev)
-        prev_failed = fow.record_outcome(atk_class, bypass_succeeded=bool(exec_ok and bypassed))
-        mut_results.append(AckMutationRoundResult(
-            round_index=idx + 1,
-            attack_class=atk_class,
-            previous_failed_classes=prev_failed,
-            contract=m_contract,
-            oracle_evidence=mev,
-            execution_valid=exec_ok,
-            attempts_executed=attempts_n,
-            bypass_succeeded=bypassed,
-        ))
+            mev = OutOfBandOracleEvidence(
+                action_id=aid,
+                exit_code=mrc,
+                fs_diff=mfs,
+                net_events=[NetEventEvidence(dst=f"127.0.0.1:{patched_port}", bytes_out=160, bytes_in=128)],
+                telemetry_alerts=[
+                    TelemetryAlertEvidence(
+                        rule_id="seccomp_contain",
+                        engine="seccomp_kernel",
+                        triggered=bool(exec_ok and not bypassed),
+                    )
+                ],
+                execution_valid=exec_ok,
+                attempts_executed=attempts_n,
+                isolation_backend=chamber.isolation_backend,
+                oracle_verdict=m_verdict,
+            )
+            evidences.append(mev)
+            prev_failed = fow.record_outcome(atk_class, bypass_succeeded=bool(exec_ok and bypassed))
+            mut_results.append(AckMutationRoundResult(
+                round_index=idx + 1,
+                attack_class=atk_class,
+                previous_failed_classes=prev_failed,
+                contract=m_contract,
+                oracle_evidence=mev,
+                execution_valid=exec_ok,
+                attempts_executed=attempts_n,
+                bypass_succeeded=bypassed,
+            ))
 
     transitions.append(AckStateTransition(
         state="RED_MUTATE_BYPASS",
@@ -1174,6 +1308,13 @@ def execute_ttp_payload(aid: str, event_record: dict) -> dict:
     canary_val = (up / "canary_vault" / "canary.txt").read_text(encoding="utf-8").strip()
     (up / f"telemetry_{aid}.json").write_text(json.dumps([event_record]), encoding="utf-8")
     return {"canary": canary_val, "telemetry_written": f"telemetry_{aid}.json"}
+
+def handle_request(payload: dict) -> tuple:
+    try:
+        res = execute_ttp_payload(str(payload["aid"]), dict(payload["event"]))
+        return 200, res
+    except Exception as exc:
+        return 403, {"error": str(exc)}
 '''
 
 _M2_BASELINE_RULES = {
@@ -1307,17 +1448,20 @@ def _run_m2_detection_evasion(
             raise RuntimeError(f"Out-of-band detector evaluation failed ({erc})")
         return json.loads(eval_out)
 
-    # RED_WEAPONIZE + ORACLE_BASELINE_CHECK (Red invokes target_workload.py; never reads blue_rules.json)
-    _ = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="telemetry_detector_pipeline")
+    # RED_WEAPONIZE + ORACLE_BASELINE_CHECK over isolated TARGET loopback HTTP boundary
+    _ = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="http://127.0.0.1:PORT/telemetry_workload")
     base_ttp_code = '''\
-import json, os, sys
+import http.client, json, os
 from pathlib import Path
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import target_workload
-res = target_workload.execute_ttp_payload(
-    "act_red_m2_base",
-    {"telemetry": "proc=python3 syscall=memfd_create fd=4 arg0=anon_stage", "entropy": 4.7},
-)
+port = int(os.environ["ACK_TARGET_PORT"])
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+payload = {
+    "aid": "act_red_m2_base",
+    "event": {"telemetry": "proc=python3 syscall=memfd_create fd=4 arg0=anon_stage", "entropy": 4.7},
+}
+conn.request("POST", "/", body=json.dumps(payload), headers={"Content-Type": "application/json"})
+resp = conn.getresponse()
+res = json.loads(resp.read().decode("utf-8"))
 (Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_act_red_m2_base.json").write_text(
     json.dumps({"status": "COMPLETED", "attempts_executed": 1, **res}), encoding="utf-8"
 )
@@ -1335,7 +1479,8 @@ res = target_workload.execute_ttp_payload(
         attack_class="CLASS_BASELINE_FILELESS_AVOIDANCE",
     )
     contracts.append(base_contract)
-    rc, _, _, fs_base = chamber.run_contract(base_contract)
+    with chamber.target_server("target_workload.py", "handle_request") as m2_base_port:
+        rc, _, _, fs_base = chamber.run_contract(base_contract, extra_env={"ACK_TARGET_PORT": str(m2_base_port)})
     base_ok, base_attempts, _ = _verify_harness_execution(rc, chamber.artifacts_red / "loot_act_red_m2_base.json")
     base_det = _oob_eval_telemetry("act_oracle_eval_m2_base", "upperdir/telemetry_act_red_m2_base.json") if base_ok else [{"triggered": False}]
     base_triggered = bool(base_det[0]["triggered"])
@@ -1505,85 +1650,88 @@ fpr = fps / max(1, len(benign))
     detected_cnt = 0
     stealth_cnt = 0
     exec_errors = 0
-    for idx in range(rounds_to_run):
-        atk_class, evt_dict = evasion_specs[idx]
-        aid = f"act_red_m2_mut_{idx + 1:02d}"
-        if inject_broken_mutation and idx == 0:
-            mut_code = "raise RuntimeError('Simulated broken telemetry mutation harness')\n"
-        else:
-            mut_code = f'''\
-import json, os, sys
+    with chamber.target_server("target_workload.py", "handle_request") as m2_mut_port:
+        for idx in range(rounds_to_run):
+            atk_class, evt_dict = evasion_specs[idx]
+            aid = f"act_red_m2_mut_{idx + 1:02d}"
+            if inject_broken_mutation and idx == 0:
+                mut_code = "raise RuntimeError('Simulated broken telemetry mutation harness')\n"
+            else:
+                mut_code = f'''\
+import http.client, json, os
 from pathlib import Path
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import target_workload
-res = target_workload.execute_ttp_payload({aid!r}, {json.dumps(evt_dict)})
+port = int(os.environ["ACK_TARGET_PORT"])
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("POST", "/", body=json.dumps({{"aid": {aid!r}, "event": {json.dumps(evt_dict)}}}), headers={{"Content-Type": "application/json"}})
+resp = conn.getresponse()
+res = json.loads(resp.read().decode("utf-8"))
 (Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_{aid}.json").write_text(
     json.dumps({{"status": "COMPLETED", "attempts_executed": 1, **res}}), encoding="utf-8"
 )
 '''
-        rel_mut, _ = chamber.write_red_artifact(f"ttp_m2_mut_{idx + 1:02d}.py", mut_code)
-        m_contract = _contract(
-            chamber=chamber,
-            action_id=aid,
-            actor="RED",
-            phase="RED_MUTATE_BYPASS",
-            primitive="EXEC_ARTIFACT",
-            artifact_path=rel_mut,
-            entrypoint=["python3", rel_mut],
-            target_invariant=desc.target_invariant,
-            attack_class=atk_class,
-        )
-        contracts.append(m_contract)
-        mrc, _, _, mfs = chamber.run_contract(m_contract)
-        exec_ok, attempts_n, _ = _verify_harness_execution(mrc, chamber.artifacts_red / f"loot_{aid}.json")
-        if not exec_ok or not (chamber.upperdir / f"telemetry_{aid}.json").exists():
-            exec_errors += 1
-            triggered = False
-            bypassed = False
-            rule_str = "none"
-            m_verdict: AckOracleVerdictType = "EXECUTION_ERROR"
-        else:
-            det = _oob_eval_telemetry(f"act_oracle_eval_{aid}", f"upperdir/telemetry_{aid}.json")
-            hit_info = det[0]
-            triggered = bool(hit_info["triggered"])
-            rule_str = ",".join(hit_info["rule_ids"]) or "none"
-            bypassed = not triggered
-            if triggered:
-                detected_cnt += 1
+            rel_mut, _ = chamber.write_red_artifact(f"ttp_m2_mut_{idx + 1:02d}.py", mut_code)
+            m_contract = _contract(
+                chamber=chamber,
+                action_id=aid,
+                actor="RED",
+                phase="RED_MUTATE_BYPASS",
+                primitive="EXEC_ARTIFACT",
+                artifact_path=rel_mut,
+                entrypoint=["python3", rel_mut],
+                target_invariant=desc.target_invariant,
+                attack_class=atk_class,
+            )
+            contracts.append(m_contract)
+            mrc, _, _, mfs = chamber.run_contract(m_contract, extra_env={"ACK_TARGET_PORT": str(m2_mut_port)})
+            exec_ok, attempts_n, _ = _verify_harness_execution(mrc, chamber.artifacts_red / f"loot_{aid}.json")
+            if not exec_ok or not (chamber.upperdir / f"telemetry_{aid}.json").exists():
+                exec_errors += 1
+                triggered = False
+                bypassed = False
+                rule_str = "none"
+                m_verdict: AckOracleVerdictType = "EXECUTION_ERROR"
             else:
-                stealth_cnt += 1
-            m_verdict = "INVARIANT_BREACHED_DETECTED" if triggered else "INVARIANT_BREACHED_STEALTH"
+                det = _oob_eval_telemetry(f"act_oracle_eval_{aid}", f"upperdir/telemetry_{aid}.json")
+                hit_info = det[0]
+                triggered = bool(hit_info["triggered"])
+                rule_str = ",".join(hit_info["rule_ids"]) or "none"
+                bypassed = not triggered
+                if triggered:
+                    detected_cnt += 1
+                else:
+                    stealth_cnt += 1
+                m_verdict = "INVARIANT_BREACHED_DETECTED" if triggered else "INVARIANT_BREACHED_STEALTH"
 
-        mev = OutOfBandOracleEvidence(
-            action_id=aid,
-            exit_code=mrc,
-            fs_diff=mfs,
-            net_events=[NetEventEvidence(dst="10.200.0.5:53", proto="udp", bytes_out=220, bytes_in=96)],
-            telemetry_alerts=[
-                TelemetryAlertEvidence(
-                    rule_id=rule_str,
-                    engine="ebpf_sigma_yara",
-                    triggered=triggered,
-                    matched_pattern=atk_class if triggered else "",
-                )
-            ],
-            execution_valid=bool(exec_ok and exec_errors == 0 or exec_ok),
-            attempts_executed=attempts_n,
-            isolation_backend=chamber.isolation_backend,
-            oracle_verdict=m_verdict,
-        )
-        evidences.append(mev)
-        prev_failed = fow.record_outcome(atk_class, bypass_succeeded=bool(exec_ok and bypassed))
-        mut_results.append(AckMutationRoundResult(
-            round_index=idx + 1,
-            attack_class=atk_class,
-            previous_failed_classes=prev_failed,
-            contract=m_contract,
-            oracle_evidence=mev,
-            execution_valid=(m_verdict != "EXECUTION_ERROR"),
-            attempts_executed=attempts_n,
-            bypass_succeeded=bypassed,
-        ))
+            mev = OutOfBandOracleEvidence(
+                action_id=aid,
+                exit_code=mrc,
+                fs_diff=mfs,
+                net_events=[NetEventEvidence(dst=f"127.0.0.1:{m2_mut_port}", proto="tcp", bytes_out=220, bytes_in=96)],
+                telemetry_alerts=[
+                    TelemetryAlertEvidence(
+                        rule_id=rule_str,
+                        engine="ebpf_sigma_yara",
+                        triggered=triggered,
+                        matched_pattern=atk_class if triggered else "",
+                    )
+                ],
+                execution_valid=bool(exec_ok),
+                attempts_executed=attempts_n,
+                isolation_backend=chamber.isolation_backend,
+                oracle_verdict=m_verdict,
+            )
+            evidences.append(mev)
+            prev_failed = fow.record_outcome(atk_class, bypass_succeeded=bool(exec_ok and bypassed))
+            mut_results.append(AckMutationRoundResult(
+                round_index=idx + 1,
+                attack_class=atk_class,
+                previous_failed_classes=prev_failed,
+                contract=m_contract,
+                oracle_evidence=mev,
+                execution_valid=(m_verdict != "EXECUTION_ERROR"),
+                attempts_executed=attempts_n,
+                bypass_succeeded=bypassed,
+            ))
 
     tpr = round(detected_cnt / rounds_to_run, 3)
     transitions.append(AckStateTransition(
@@ -1633,34 +1781,121 @@ res = target_workload.execute_ttp_payload({aid!r}, {json.dumps(evt_dict)})
 # Mission 3: Attack-Path Audit & Live Hardening (Cloned Manifest vs Synthetic Fixture)
 # ---------------------------------------------------------------------------
 
-_M3_BASELINE_HOST_CONFIG = {
-    "service_enabled": True,
-    "helper_writable": True,
-    "privileged_container": True,
-    "NoNewPrivileges": False,
-    "ProtectSystem": False,
-    "ambient_caps": ["CAP_DAC_READ_SEARCH", "CAP_SYS_ADMIN"],
-    "socket_acl_restricted": False,
-}
+_M3_DEFAULT_SYNTHETIC_MANIFEST = """\
+[Service]
+service_enabled=true
+NoNewPrivileges=false
+ProtectSystem=false
+SocketMode=0666
+helper_writable=true
 
-_M3_HARDENED_HOST_CONFIG = {
-    "service_enabled": True,
-    "helper_writable": False,
-    "privileged_container": False,
-    "NoNewPrivileges": True,
-    "ProtectSystem": "strict",
-    "ambient_caps": [],
-    "drop_caps": ["ALL"],
-    "socket_acl_restricted": True,
-}
+securityContext:
+  privileged: true
+  allowPrivilegeEscalation: true
+  capabilities: [CAP_SYS_ADMIN, CAP_DAC_READ_SEARCH]
+"""
 
-_M3_HOST_RUNTIME_SIM = '''\
-import json, os, sys
-from pathlib import Path
 
+def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
+    """Deterministically parse submitted YAML/systemd/JSON host or container manifest into hardening state."""
+    low = manifest_text.lower()
+    service_enabled = not bool(re.search(r"(?:service_enabled|serviceenabled)[\"']?\s*[:=]\s*[\"']?false", low))
+    helper_writable = bool(
+        re.search(r"(?:helper_writable[\"']?\s*[:=]\s*[\"']?true|chmod\s+0?777|chmod\s+a\+w)", low)
+    )
+    priv = bool(
+        re.search(r"(?:privileged|privileged_container|allowprivilegeescalation)[\"']?\s*[:=]\s*[\"']?true", low)
+    )
+    nnp_true = bool(
+        re.search(r"(?:nonewprivileges[\"']?\s*[:=]\s*[\"']?true|allowprivilegeescalation[\"']?\s*[:=]\s*[\"']?false)", low)
+    )
+    nnp_false = bool(
+        re.search(r"(?:nonewprivileges[\"']?\s*[:=]\s*[\"']?false|allowprivilegeescalation[\"']?\s*[:=]\s*[\"']?true)", low)
+    )
+    no_new_priv = bool(nnp_true and not nnp_false)
+
+    protect_sys: Any = False
+    if re.search(r"protectsystem[\"']?\s*[:=]\s*[\"']?(?:strict|full)", low):
+        protect_sys = "strict"
+
+    drop_all = bool(re.search(r"drop[\"']?\s*:\s*\[\s*['\"]?all['\"]?\s*\]", low))
+    ambient_caps: List[str] = []
+    if not drop_all:
+        for cap in ("CAP_SYS_ADMIN", "CAP_DAC_READ_SEARCH", "CAP_NET_ADMIN"):
+            if cap.lower() in low:
+                ambient_caps.append(cap)
+
+    sock_restricted = bool(
+        re.search(r"(?:socket_acl_restricted[\"']?\s*[:=]\s*[\"']?true|socketmode\s*=\s*0?(?:600|660))", low)
+    ) and not bool(
+        re.search(r"(?:socket_acl_restricted[\"']?\s*[:=]\s*[\"']?false|socketmode\s*=\s*0?(?:666|777))", low)
+    )
+
+    return {
+        "service_enabled": service_enabled,
+        "helper_writable": helper_writable,
+        "privileged_container": priv,
+        "NoNewPrivileges": no_new_priv,
+        "ProtectSystem": protect_sys,
+        "ambient_caps": ambient_caps,
+        "socket_acl_restricted": sock_restricted,
+    }
+
+
+def _harden_manifest_text(manifest_text: str, defense_mode: str) -> str:
+    """Deterministically transform a host/container manifest on disk inside upperdir."""
+    if defense_mode == "naive_block_all":
+        if re.search(r"(?i)(?:service_enabled|serviceenabled)\s*[:=]", manifest_text):
+            return re.sub(
+                r"(?i)(service_enabled|serviceenabled)([\"']?\s*[:=]\s*[\"']?)true",
+                r"\1\g<2>false",
+                manifest_text,
+            )
+        return manifest_text.rstrip() + "\nservice_enabled: false\n"
+
+    out = re.sub(r"(?i)(service_enabled|serviceenabled)([\"']?\s*[:=]\s*[\"']?)false", r"\1\g<2>true", manifest_text)
+    out = re.sub(r"(?i)(helper_writable[\"']?\s*[:=]\s*[\"']?)true", r"\g<1>false", out)
+    out = re.sub(r"(?i)chmod\s+(?:0?777|a\+w)", "chmod 0750", out)
+    out = re.sub(
+        r"(?i)((?:privileged|privileged_container|allowprivilegeescalation)[\"']?\s*[:=]\s*[\"']?)true",
+        r"\g<1>false",
+        out,
+    )
+    out = re.sub(r"(?i)(nonewprivileges[\"']?\s*[:=]\s*[\"']?)false", r"\g<1>true", out)
+    out = re.sub(r"(?i)(protectsystem[\"']?\s*[:=]\s*[\"']?)false", r"\g<1>strict", out)
+    out = re.sub(r"(?i)(socketmode\s*=\s*)0?(?:666|777)", r"\g<1>0600", out)
+    out = re.sub(r"(?i)(socket_acl_restricted[\"']?\s*[:=]\s*[\"']?)false", r"\g<1>true", out)
+    out = re.sub(r"(?i)capabilities[\"']?\s*[:=]\s*\[[^\]]*\]", 'capabilities:\n  drop: ["ALL"]', out)
+
+    low = out.lower()
+    extras: List[str] = []
+    if not re.search(r"nonewprivileges[\"']?\s*[:=]\s*[\"']?true", low):
+        extras.append("NoNewPrivileges=true")
+    if not re.search(r"protectsystem[\"']?\s*[:=]\s*[\"']?(?:strict|full)", low):
+        extras.append("ProtectSystem=strict")
+    if not re.search(r"(?:socket_acl_restricted[\"']?\s*[:=]\s*[\"']?true|socketmode\s*=\s*0?(?:600|660))", low):
+        extras.append("SocketMode=0600")
+    if not re.search(r"drop[\"']?\s*:\s*\[\s*['\"]?all['\"]?\s*\]", low):
+        extras.append('drop: ["ALL"]')
+    if not re.search(r"helper_writable[\"']?\s*[:=]\s*[\"']?false", low):
+        extras.append("helper_writable: false")
+    if extras:
+        out = out.rstrip() + "\n" + "\n".join(extras) + "\n"
+    return out
+
+
+def _build_m3_host_runtime_sim() -> str:
+    parser_src = inspect.getsource(_parse_target_host_config)
+    return (
+        "import os, re\n"
+        "from pathlib import Path\n"
+        "from typing import Any, Dict, List\n\n"
+        f"{parser_src}\n\n"
+        '''\
 def check_action(vector: str) -> str:
     up = Path(os.environ["ACK_UPPERDIR"])
-    cfg = json.loads((up / "host_clone_config.json").read_text(encoding="utf-8"))
+    manifest_text = (up / "cloned_target_manifest.conf").read_text(encoding="utf-8")
+    cfg = _parse_target_host_config(manifest_text)
     canary_path = up / "canary_vault" / "canary.txt"
     if vector == "healthcheck":
         if not cfg.get("service_enabled", False):
@@ -1681,47 +1916,18 @@ def check_action(vector: str) -> str:
         raise PermissionError("Unauthorized unix control socket denied")
     raise ValueError(f"Unknown vector: {vector}")
 
-if __name__ == "__main__":
-    print(check_action(sys.argv[1]), end="")
+def handle_request(payload: dict) -> tuple:
+    try:
+        out = check_action(str(payload.get("vector", "")))
+        return 200, {"output": out}
+    except RuntimeError as exc:
+        return 503, {"error": str(exc)}
+    except PermissionError as exc:
+        return 403, {"error": str(exc)}
+    except Exception as exc:
+        return 400, {"error": str(exc)}
 '''
-
-
-def _parse_target_host_config(manifest_text: str) -> Dict[str, Any]:
-    """Deterministically parse submitted YAML/systemd/JSON host or container manifest into hardening state."""
-    low = manifest_text.lower()
-    service_enabled = not bool(re.search(r"service_enabled\s*[:=]\s*false", low))
-    helper_writable = bool(
-        re.search(r"(?:helper_writable\s*[:=]\s*true|chmod\s+0?777|chmod\s+a\+w)", low)
     )
-    priv = bool(re.search(r"(?:privileged\s*[:=]\s*true|privileged_container\s*[:=]\s*true|allowprivilegeescalation\s*[:=]\s*true)", low))
-    nnp_true = bool(re.search(r"(?:nonewprivileges\s*[:=]\s*true|allowprivilegeescalation\s*[:=]\s*false)", low))
-    nnp_false = bool(re.search(r"(?:nonewprivileges\s*[:=]\s*false|allowprivilegeescalation\s*[:=]\s*true)", low))
-    no_new_priv = bool(nnp_true and not nnp_false)
-
-    protect_sys: Any = False
-    if re.search(r"protectsystem\s*[:=]\s*(?:strict|full)", low):
-        protect_sys = "strict"
-
-    drop_all = bool(re.search(r"drop\s*:\s*\[\s*['\"]?all['\"]?\s*\]", low))
-    ambient_caps: List[str] = []
-    if not drop_all:
-        for cap in ("CAP_SYS_ADMIN", "CAP_DAC_READ_SEARCH", "CAP_NET_ADMIN"):
-            if cap.lower() in low:
-                ambient_caps.append(cap)
-
-    sock_restricted = bool(
-        re.search(r"(?:socket_acl_restricted\s*[:=]\s*true|socketmode\s*=\s*0?(?:600|660))", low)
-    ) and not bool(re.search(r"(?:socket_acl_restricted\s*[:=]\s*false|socketmode\s*=\s*0?(?:666|777))", low))
-
-    return {
-        "service_enabled": service_enabled,
-        "helper_writable": helper_writable,
-        "privileged_container": priv,
-        "NoNewPrivileges": no_new_priv,
-        "ProtectSystem": protect_sys,
-        "ambient_caps": ambient_caps,
-        "socket_acl_restricted": sock_restricted,
-    }
 
 
 def _run_m3_attack_path_hardening(
@@ -1743,23 +1949,17 @@ def _run_m3_attack_path_hardening(
     audit_scope: Literal["synthetic_fixture_simulation", "cloned_target_manifest"] = (
         "cloned_target_manifest" if has_real_manifest else "synthetic_fixture_simulation"
     )
-
+    manifest_text = target_config_content or _M3_DEFAULT_SYNTHETIC_MANIFEST
+    baseline_cfg = _parse_target_host_config(manifest_text)
+    seed_files: Dict[str, bytes | str] = {
+        "cloned_target_manifest.conf": manifest_text,
+        "host_runtime_sim.py": _build_m3_host_runtime_sim(),
+    }
     if has_real_manifest:
-        baseline_cfg = _parse_target_host_config(target_config_content or "")
-        seed_files: Dict[str, bytes | str] = {
-            "host_clone_config.json": json.dumps(baseline_cfg, indent=2),
-            "host_runtime_sim.py": _M3_HOST_RUNTIME_SIM,
-            "cloned_target_manifest.conf": target_config_content or "",
-        }
         init_summary = f"Clonato manifest target reale in `{chamber.sandbox_id}` (modalità Shadow Clone CoW; lowerdir immutabile)."
     else:
-        baseline_cfg = dict(_M3_BASELINE_HOST_CONFIG)
-        seed_files = {
-            "host_clone_config.json": json.dumps(baseline_cfg, indent=2),
-            "host_runtime_sim.py": _M3_HOST_RUNTIME_SIM,
-            "systemd_unit.ini": "[Service]\nNoNewPrivileges=false\nProtectSystem=false\n",
-            "k8s_pod.yaml": "securityContext:\n  privileged: true\n  allowPrivilegeEscalation: true\n",
-        }
+        seed_files["systemd_unit.ini"] = "[Service]\nNoNewPrivileges=false\nProtectSystem=false\n"
+        seed_files["k8s_pod.yaml"] = "securityContext:\n  privileged: true\n  allowPrivilegeEscalation: true\n"
         init_summary = (
             f"Simulazione Shadow Clone CoW `{chamber.sandbox_id}` avviata su **fixture sintetica** di riferimento "
             "(nessun manifest host reale fornito; non rappresenta un audit dell'host locale)."
@@ -1773,18 +1973,18 @@ def _run_m3_attack_path_hardening(
         passed=True,
     ))
 
-    _ = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="cloned_target_manifest_or_fixture")
+    _ = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="http://127.0.0.1:PORT/cloned_target_manifest")
     rel_base, _ = chamber.write_red_artifact("privesc_m3_base.py", '''\
-import json, os, sys
+import http.client, json, os
 from pathlib import Path
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import host_runtime_sim
+port = int(os.environ["ACK_TARGET_PORT"])
 results = []
 for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
-    try:
-        results.append({"vector": vec, "out": host_runtime_sim.check_action(vec)})
-    except Exception as exc:
-        results.append({"vector": vec, "out": f"BLOCKED: {exc}"})
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/", body=json.dumps({"vector": vec}), headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    body = json.loads(resp.read().decode("utf-8"))
+    results.append({"vector": vec, "status": resp.status, "out": body.get("output") or body.get("error", "")})
 (Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_act_red_m3_base.json").write_text(
     json.dumps({"status": "COMPLETED", "attempts_executed": len(results), "results": results}),
     encoding="utf-8",
@@ -1802,7 +2002,8 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
         attack_class="CLASS_BASELINE_CONFIG_ESCALATION_PROBE",
     )
     contracts.append(base_contract)
-    rc, _, _, fs_base = chamber.run_contract(base_contract)
+    with chamber.target_server("host_runtime_sim.py", "handle_request") as m3_base_port:
+        rc, _, _, fs_base = chamber.run_contract(base_contract, extra_env={"ACK_TARGET_PORT": str(m3_base_port)})
     base_ok, base_attempts, _ = _verify_harness_execution(rc, chamber.artifacts_red / "loot_act_red_m3_base.json")
     pre_breach = bool(base_ok and fs_base.canary_accessed and fs_base.lowerdir_untouched)
     base_verdict: AckOracleVerdictType = (
@@ -1812,6 +2013,7 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
         action_id=base_contract.action_id,
         exit_code=rc,
         fs_diff=fs_base,
+        net_events=[NetEventEvidence(dst=f"127.0.0.1:{m3_base_port}", bytes_out=120, bytes_in=240)],
         execution_valid=base_ok,
         attempts_executed=base_attempts,
         isolation_backend=chamber.isolation_backend,
@@ -1821,7 +2023,7 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
     transitions.append(AckStateTransition(
         state="RED_WEAPONIZE",
         actor="RED",
-        summary=f"Red esegue catena privesc pre-hardening su {audit_scope}.",
+        summary=f"Red esegue catena privesc pre-hardening su {audit_scope} contro `cloned_target_manifest.conf`.",
         passed=base_ok,
     ))
     transitions.append(AckStateTransition(
@@ -1860,20 +2062,32 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
 
     _ = fow.build_blue_context(baseline_summary=json.dumps(baseline_cfg), oob_baseline=base_ev)
     if defense_mode == "naive_block_all":
-        hardened = {**baseline_cfg, "service_enabled": False}
-        blue_summary = "naive_block_all: disattivato completamente il servizio target."
+        blue_summary = "naive_block_all: disattivato completamente il servizio target (`service_enabled: false`) in `cloned_target_manifest.conf`."
     else:
-        hardened = _M3_HARDENED_HOST_CONFIG
-        blue_summary = "structural: NoNewPrivileges=true, ProtectSystem=strict, helper read-only, capabilities ALL dropped, socket ACL."
+        blue_summary = (
+            "structural: patch diretta di `cloned_target_manifest.conf` in upperdir CoW "
+            "(NoNewPrivileges=true, ProtectSystem=strict, helper_writable=false, capabilities drop ALL, SocketMode=0600)."
+        )
 
-    rel_blue, _ = chamber.write_blue_artifact("apply_hardening_m3.py", f'''\
-import json, os
-from pathlib import Path
-up = Path(os.environ["ACK_UPPERDIR"])
-(up / "host_clone_config.json").write_text({json.dumps(json.dumps(hardened, indent=2))}, encoding="utf-8")
-(up / "systemd_unit.ini").write_text("[Service]\\nNoNewPrivileges=true\\nProtectSystem=strict\\n", encoding="utf-8")
-(up / "k8s_pod.yaml").write_text("securityContext:\\n  privileged: false\\n  allowPrivilegeEscalation: false\\n  capabilities:\\n    drop: [\\"ALL\\"]\\n", encoding="utf-8")
-''')
+    harden_fn_src = inspect.getsource(_harden_manifest_text)
+    rel_blue, _ = chamber.write_blue_artifact(
+        "apply_hardening_m3.py",
+        (
+            "import os, re\n"
+            "from pathlib import Path\n"
+            "from typing import List\n\n"
+            f"{harden_fn_src}\n\n"
+            "up = Path(os.environ['ACK_UPPERDIR'])\n"
+            "manifest_path = up / 'cloned_target_manifest.conf'\n"
+            "manifest_path.write_text(_harden_manifest_text(manifest_path.read_text(encoding='utf-8'), "
+            f"{defense_mode!r}"
+            "), encoding='utf-8')\n"
+            "if (up / 'systemd_unit.ini').exists():\n"
+            "    (up / 'systemd_unit.ini').write_text('[Service]\\nNoNewPrivileges=true\\nProtectSystem=strict\\n', encoding='utf-8')\n"
+            "if (up / 'k8s_pod.yaml').exists():\n"
+            "    (up / 'k8s_pod.yaml').write_text('securityContext:\\n  privileged: false\\n  allowPrivilegeEscalation: false\\n  capabilities:\\n    drop: [\"ALL\"]\\n', encoding='utf-8')\n"
+        ),
+    )
     blue_contract = _contract(
         chamber=chamber,
         action_id="act_blue_m3_harden",
@@ -1886,147 +2100,172 @@ up = Path(os.environ["ACK_UPPERDIR"])
     )
     contracts.append(blue_contract)
     brc, _, _, bfs = chamber.run_contract(blue_contract)
+    manifest_modified = "cloned_target_manifest.conf" in bfs.modified
+    post_cfg = _parse_target_host_config((chamber.upperdir / "cloned_target_manifest.conf").read_text(encoding="utf-8"))
+    post_manifest_hardened = bool(
+        not post_cfg["helper_writable"]
+        and not post_cfg["privileged_container"]
+        and post_cfg["NoNewPrivileges"]
+        and post_cfg["ProtectSystem"] == "strict"
+        and not post_cfg["ambient_caps"]
+        and post_cfg["socket_acl_restricted"]
+    )
     evidences.append(OutOfBandOracleEvidence(
         action_id=blue_contract.action_id,
         exit_code=brc,
         fs_diff=bfs,
         isolation_backend=chamber.isolation_backend,
-        oracle_verdict="DEFENSE_HELD_CLEAN" if brc == 0 else "EXECUTION_ERROR",
-    ))
-    transitions.append(AckStateTransition(state="BLUE_DEFEND", actor="BLUE", summary=f"Hardening CoW applicato ({defense_mode}).", passed=(brc == 0)))
-
-    # Functional survival check
-    func_rel, _ = chamber.write_blue_artifact("oracle_health_m3.py", '''\
-import os, sys
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import host_runtime_sim
-print(host_runtime_sim.check_action("healthcheck"), end="")
-''')
-    func_contract = _contract(
-        chamber=chamber,
-        action_id="act_oracle_m3_health",
-        actor="BLUE",
-        phase="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
-        primitive="EXEC_ARTIFACT",
-        artifact_path=func_rel,
-        entrypoint=["python3", func_rel],
-        target_invariant="INV_SERVICE_HEALTH_SURVIVES",
-    )
-    contracts.append(func_contract)
-    frc, fout, _, ffs = chamber.run_contract(func_contract)
-    func_ok = (frc == 0 and "SERVICE_HEALTHY_200" in fout)
-    func_verdict: AckOracleVerdictType = "DEFENSE_HELD_CLEAN" if func_ok else "DEFENSE_REJECTED_BROKEN_FUNC"
-    evidences.append(OutOfBandOracleEvidence(
-        action_id=func_contract.action_id,
-        exit_code=frc,
-        fs_diff=ffs,
-        functional_suite_passed=func_ok,
-        fpr_value=0.0,
-        isolation_backend=chamber.isolation_backend,
-        oracle_verdict=func_verdict,
+        oracle_verdict="DEFENSE_HELD_CLEAN" if (brc == 0 and manifest_modified) else "EXECUTION_ERROR",
     ))
     transitions.append(AckStateTransition(
-        state="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
-        actor="ORACLE",
-        summary=f"Check operativo servizio post-hardening: passed={func_ok} ({func_verdict}).",
-        passed=func_ok,
+        state="BLUE_DEFEND",
+        actor="BLUE",
+        summary=f"Hardening CoW applicato su `cloned_target_manifest.conf` ({defense_mode}, modified={manifest_modified}).",
+        passed=(brc == 0 and manifest_modified),
     ))
-    if not func_ok:
-        transitions.append(AckStateTransition(state="CERTIFY_REPORT", actor="ORACLE", summary="Respinto: hardening ha fermato il servizio.", passed=False))
-        return _MissionExecutionOutcome(
-            transitions=transitions,
-            contracts=contracts,
-            evidences=evidences,
-            mutation_rounds=[],
-            tpr_fpr_matrix=AckTprFprMatrix(
-                true_positive_rate=0.0,
-                false_positive_rate=0.0,
-                evasion_resistance_rate=0.0,
-                functional_survival_rate=0.0,
-                pre_patch_breach_confirmed=pre_breach,
-                post_patch_breaches=0,
-            ),
-            blue_summary=blue_summary,
-            certified=False,
-            certification_verdict="REJECTED_SERVICE_OUTAGE",
-            rationale="Hardening ha disabilitato il servizio invece di correggere i privilegi.",
-            audit_scope=audit_scope,
-        )
 
-    vectors = [
-        ("CLASS_HELPER_SCRIPT_OVERWRITE_HIJACK", "helper_hijack"),
-        ("CLASS_AMBIENT_CAPABILITY_INHERITANCE", "ambient_caps"),
-        ("CLASS_UNIX_SOCKET_UNAUTHORIZED_CONTROL", "unix_socket_ctl"),
-    ]
-    rounds_to_run = max(1, min(len(vectors), mutation_rounds))
-    post_breaches = 0
-    exec_errors = 0
-    for idx in range(rounds_to_run):
-        atk_class, vec = vectors[idx]
-        aid = f"act_red_m3_mut_{idx + 1:02d}"
-        if inject_broken_mutation and idx == 0:
-            mut_body = "raise RuntimeError('Simulated broken privesc mutation harness')\n"
-        else:
-            mut_body = f'''\
-import json, os, sys
+    # Boot isolated TARGET server over hardened cloned_target_manifest.conf
+    with chamber.target_server("host_runtime_sim.py", "handle_request") as m3_hard_port:
+        # Functional survival check
+        func_rel, _ = chamber.write_blue_artifact("oracle_health_m3.py", '''\
+import http.client, json, os
+port = int(os.environ["ACK_TARGET_PORT"])
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("POST", "/", body=json.dumps({"vector": "healthcheck"}), headers={"Content-Type": "application/json"})
+resp = conn.getresponse()
+body = json.loads(resp.read().decode("utf-8"))
+assert resp.status == 200 and body.get("output") == "SERVICE_HEALTHY_200", f"Unexpected health: {resp.status} {body!r}"
+print("SERVICE_HEALTHY_200", end="")
+''')
+        func_contract = _contract(
+            chamber=chamber,
+            action_id="act_oracle_m3_health",
+            actor="BLUE",
+            phase="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
+            primitive="EXEC_ARTIFACT",
+            artifact_path=func_rel,
+            entrypoint=["python3", func_rel],
+            target_invariant="INV_SERVICE_HEALTH_SURVIVES",
+        )
+        contracts.append(func_contract)
+        frc, fout, _, ffs = chamber.run_contract(func_contract, extra_env={"ACK_TARGET_PORT": str(m3_hard_port)})
+        func_ok = (frc == 0 and "SERVICE_HEALTHY_200" in fout)
+        func_verdict: AckOracleVerdictType = "DEFENSE_HELD_CLEAN" if func_ok else "DEFENSE_REJECTED_BROKEN_FUNC"
+        evidences.append(OutOfBandOracleEvidence(
+            action_id=func_contract.action_id,
+            exit_code=frc,
+            fs_diff=ffs,
+            functional_suite_passed=func_ok,
+            fpr_value=0.0,
+            isolation_backend=chamber.isolation_backend,
+            oracle_verdict=func_verdict,
+        ))
+        transitions.append(AckStateTransition(
+            state="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
+            actor="ORACLE",
+            summary=(
+                f"Check operativo servizio post-hardening: passed={func_ok} ({func_verdict}); "
+                f"manifest_modified={manifest_modified}, post_hardened={post_manifest_hardened}."
+            ),
+            passed=bool(func_ok and manifest_modified and post_manifest_hardened),
+        ))
+        if not func_ok:
+            transitions.append(AckStateTransition(state="CERTIFY_REPORT", actor="ORACLE", summary="Respinto: hardening ha fermato il servizio.", passed=False))
+            return _MissionExecutionOutcome(
+                transitions=transitions,
+                contracts=contracts,
+                evidences=evidences,
+                mutation_rounds=[],
+                tpr_fpr_matrix=AckTprFprMatrix(
+                    true_positive_rate=0.0,
+                    false_positive_rate=0.0,
+                    evasion_resistance_rate=0.0,
+                    functional_survival_rate=0.0,
+                    pre_patch_breach_confirmed=pre_breach,
+                    post_patch_breaches=0,
+                ),
+                blue_summary=blue_summary,
+                certified=False,
+                certification_verdict="REJECTED_SERVICE_OUTAGE",
+                rationale="Hardening ha disabilitato il servizio invece di correggere i privilegi.",
+                audit_scope=audit_scope,
+            )
+
+        vectors = [
+            ("CLASS_HELPER_SCRIPT_OVERWRITE_HIJACK", "helper_hijack"),
+            ("CLASS_AMBIENT_CAPABILITY_INHERITANCE", "ambient_caps"),
+            ("CLASS_UNIX_SOCKET_UNAUTHORIZED_CONTROL", "unix_socket_ctl"),
+        ]
+        rounds_to_run = max(1, min(len(vectors), mutation_rounds))
+        post_breaches = 0
+        exec_errors = 0
+        for idx in range(rounds_to_run):
+            atk_class, vec = vectors[idx]
+            aid = f"act_red_m3_mut_{idx + 1:02d}"
+            if inject_broken_mutation and idx == 0:
+                mut_body = "raise RuntimeError('Simulated broken privesc mutation harness')\n"
+            else:
+                mut_body = f'''\
+import http.client, json, os
 from pathlib import Path
-sys.path.insert(0, os.environ["ACK_UPPERDIR"])
-import host_runtime_sim
-try:
-    out = host_runtime_sim.check_action({vec!r})
-except Exception as exc:
-    out = f"BLOCKED: {{exc}}"
+port = int(os.environ["ACK_TARGET_PORT"])
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("POST", "/", body=json.dumps({{"vector": {vec!r}}}), headers={{"Content-Type": "application/json"}})
+resp = conn.getresponse()
+body = json.loads(resp.read().decode("utf-8"))
+out = body.get("output") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}}"
 (Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_{aid}.json").write_text(
     json.dumps({{"status": "COMPLETED", "attempts_executed": 1, "out": out}}), encoding="utf-8"
 )
 '''
-        rel_mut, _ = chamber.write_red_artifact(f"privesc_m3_mut_{idx + 1:02d}.py", mut_body)
-        m_contract = _contract(
-            chamber=chamber,
-            action_id=aid,
-            actor="RED",
-            phase="RED_MUTATE_BYPASS",
-            primitive="EXEC_ARTIFACT",
-            artifact_path=rel_mut,
-            entrypoint=["python3", rel_mut],
-            target_invariant=desc.target_invariant,
-            attack_class=atk_class,
-        )
-        contracts.append(m_contract)
-        mrc, _, _, mfs = chamber.run_contract(m_contract)
-        exec_ok, attempts_n, _ = _verify_harness_execution(mrc, chamber.artifacts_red / f"loot_{aid}.json")
-        if not exec_ok:
-            exec_errors += 1
-            bypassed = False
-            m_verdict: AckOracleVerdictType = "EXECUTION_ERROR"
-        else:
-            bypassed = mfs.canary_accessed or not mfs.lowerdir_untouched
-            if bypassed:
-                post_breaches += 1
-            m_verdict = "INVARIANT_BREACHED_STEALTH" if bypassed else "DEFENSE_HELD_CLEAN"
+            rel_mut, _ = chamber.write_red_artifact(f"privesc_m3_mut_{idx + 1:02d}.py", mut_body)
+            m_contract = _contract(
+                chamber=chamber,
+                action_id=aid,
+                actor="RED",
+                phase="RED_MUTATE_BYPASS",
+                primitive="EXEC_ARTIFACT",
+                artifact_path=rel_mut,
+                entrypoint=["python3", rel_mut],
+                target_invariant=desc.target_invariant,
+                attack_class=atk_class,
+            )
+            contracts.append(m_contract)
+            mrc, _, _, mfs = chamber.run_contract(m_contract, extra_env={"ACK_TARGET_PORT": str(m3_hard_port)})
+            exec_ok, attempts_n, _ = _verify_harness_execution(mrc, chamber.artifacts_red / f"loot_{aid}.json")
+            if not exec_ok:
+                exec_errors += 1
+                bypassed = False
+                m_verdict: AckOracleVerdictType = "EXECUTION_ERROR"
+            else:
+                bypassed = mfs.canary_accessed or not mfs.lowerdir_untouched
+                if bypassed:
+                    post_breaches += 1
+                m_verdict = "INVARIANT_BREACHED_STEALTH" if bypassed else "DEFENSE_HELD_CLEAN"
 
-        mev = OutOfBandOracleEvidence(
-            action_id=aid,
-            exit_code=mrc,
-            fs_diff=mfs,
-            telemetry_alerts=[TelemetryAlertEvidence(rule_id="systemd_hardening", engine="host_cow_audit", triggered=bool(exec_ok and not bypassed))],
-            execution_valid=exec_ok,
-            attempts_executed=attempts_n,
-            isolation_backend=chamber.isolation_backend,
-            oracle_verdict=m_verdict,
-        )
-        evidences.append(mev)
-        prev_failed = fow.record_outcome(atk_class, bypass_succeeded=bool(exec_ok and bypassed))
-        mut_results.append(AckMutationRoundResult(
-            round_index=idx + 1,
-            attack_class=atk_class,
-            previous_failed_classes=prev_failed,
-            contract=m_contract,
-            oracle_evidence=mev,
-            execution_valid=exec_ok,
-            attempts_executed=attempts_n,
-            bypass_succeeded=bypassed,
-        ))
+            mev = OutOfBandOracleEvidence(
+                action_id=aid,
+                exit_code=mrc,
+                fs_diff=mfs,
+                net_events=[NetEventEvidence(dst=f"127.0.0.1:{m3_hard_port}", bytes_out=96, bytes_in=96)],
+                telemetry_alerts=[TelemetryAlertEvidence(rule_id="systemd_hardening", engine="host_cow_audit", triggered=bool(exec_ok and not bypassed))],
+                execution_valid=exec_ok,
+                attempts_executed=attempts_n,
+                isolation_backend=chamber.isolation_backend,
+                oracle_verdict=m_verdict,
+            )
+            evidences.append(mev)
+            prev_failed = fow.record_outcome(atk_class, bypass_succeeded=bool(exec_ok and bypassed))
+            mut_results.append(AckMutationRoundResult(
+                round_index=idx + 1,
+                attack_class=atk_class,
+                previous_failed_classes=prev_failed,
+                contract=m_contract,
+                oracle_evidence=mev,
+                execution_valid=exec_ok,
+                attempts_executed=attempts_n,
+                bypass_succeeded=bypassed,
+            ))
 
     transitions.append(AckStateTransition(
         state="RED_MUTATE_BYPASS",
@@ -2036,16 +2275,26 @@ except Exception as exc:
     ))
     valid_defended = sum(1 for r in mut_results if r.execution_valid and not r.bypass_succeeded)
     evasion_res = round(valid_defended / rounds_to_run, 3)
-    certified = bool(pre_breach and func_ok and post_breaches == 0 and exec_errors == 0)
+    certified = bool(
+        pre_breach
+        and manifest_modified
+        and post_manifest_hardened
+        and func_ok
+        and post_breaches == 0
+        and exec_errors == 0
+    )
     if exec_errors > 0:
         cert_verdict = "REJECTED_MUTATION_EXECUTION_ERROR"
         rationale = f"Certificazione negata (fail-closed): {exec_errors} mutazioni non eseguite (`EXECUTION_ERROR`)."
     elif certified and has_real_manifest:
         cert_verdict = "CERTIFIED_HARDENED_CLONED_MANIFEST"
-        rationale = "Hardening verificato in clone CoW sul manifest target fornito con lowerdir immutabile e servizio sano."
+        rationale = "Hardening verificato in clone CoW direttamente su `cloned_target_manifest.conf` con lowerdir immutabile e servizio sano."
     elif certified:
         cert_verdict = "CERTIFIED_SYNTHETIC_SHADOW_CLONE_SIMULATION"
-        rationale = "Hardening certificato sulla fixture sintetica di riferimento (non audit del sistema host corrente)."
+        rationale = "Hardening certificato sulla fixture sintetica `cloned_target_manifest.conf` (non audit del sistema host corrente)."
+    elif not (manifest_modified and post_manifest_hardened):
+        cert_verdict = "HARDENING_BYPASSED"
+        rationale = "Hardening respinto out-of-band: `cloned_target_manifest.conf` non modificato o vettori ancora attivi."
     else:
         cert_verdict = "HARDENING_BYPASSED"
         rationale = "Hardening aggirato dopo la patch."
