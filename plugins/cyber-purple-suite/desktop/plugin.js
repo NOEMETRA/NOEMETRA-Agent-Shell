@@ -392,7 +392,11 @@ function CyberPurplePage({ ctx }) {
   const [selectedScenarioId, setSelectedScenarioId] = useState('')
   const [activeCase, setActiveCase] = useState(null)
   const [benchmarkReport, setBenchmarkReport] = useState(null)
-  const [activeTab, setActiveTab] = useState('clash') // 'clash' | 'replay' | 'benchmark'
+  const [ackMissions, setAckMissions] = useState([])
+  const [selectedAckMissionId, setSelectedAckMissionId] = useState('ack-m1-exploit-patch-bypass')
+  const [ackDefenseMode, setAckDefenseMode] = useState('structural')
+  const [ackReport, setAckReport] = useState(null)
+  const [activeTab, setActiveTab] = useState('clash') // 'clash' | 'replay' | 'benchmark' | 'ack'
   const [highlightedEvId, setHighlightedEvId] = useState('')
   const [customTitle, setCustomTitle] = useState('Custom Security Log / Code')
   const [customContent, setCustomContent] = useState('')
@@ -423,6 +427,12 @@ function CyberPurplePage({ ctx }) {
       setVerifyMode(defaultVerifyModeForCase(st.active_case))
     }
     if (st?.last_benchmark) setBenchmarkReport(st.last_benchmark)
+    const missionsList = Array.isArray(st?.ack_missions) ? st.ack_missions : []
+    setAckMissions(missionsList)
+    if (missionsList.length > 0 && !missionsList.some((m) => m.mission_id === selectedAckMissionId)) {
+      setSelectedAckMissionId(missionsList[0].mission_id)
+    }
+    if (st?.last_ack_report) setAckReport(st.last_ack_report)
   }
 
   const syncReplayInputsFromCase = (rep) => {
@@ -564,6 +574,31 @@ function CyberPurplePage({ ctx }) {
       setActiveTab('benchmark')
     } catch (err) {
       host.notifyError(err, 'Errore benchmark Purple Suite')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleRunAckMission = async () => {
+    if (!selectedAckMissionId || busy) return
+    setBusy(true)
+    try {
+      const rep = await ctx.rest('/ack/run', {
+        method: 'POST',
+        body: {
+          mission_id: selectedAckMissionId,
+          mutation_rounds: 3,
+          defense_mode: ackDefenseMode
+        }
+      })
+      setAckReport(rep)
+      setActiveTab('ack')
+      host.notify({
+        kind: rep?.certified ? 'info' : 'warning',
+        message: `ACK ${rep?.mission_id}: ${rep?.certification_verdict}`
+      })
+    } catch (err) {
+      host.notifyError(err, 'Errore esecuzione missione ACK')
     } finally {
       setBusy(false)
     }
@@ -843,10 +878,140 @@ function CyberPurplePage({ ctx }) {
                     className: `cp-tab${activeTab === 'benchmark' ? ' active' : ''}`,
                     onClick: () => setActiveTab('benchmark'),
                     children: 'Benchmark Comparativo'
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: `cp-tab${activeTab === 'ack' ? ' active' : ''}`,
+                    onClick: () => setActiveTab('ack'),
+                    children: 'ACK Detonation Arena (4 Missioni)'
                   })
                 ]
               }),
-              activeTab === 'benchmark' && benchmarkReport
+              activeTab === 'ack'
+                ? jsxs('div', {
+                  style: { display: 'flex', flexDirection: 'column', gap: '12px' },
+                  children: [
+                    jsxs('div', {
+                      className: 'cp-card cp-card-purple',
+                      children: [
+                        jsx('div', { style: { fontWeight: 700, fontSize: '13.5px', marginBottom: '6px' }, children: 'NOEMETRA Adversarial Cyber Kernel (ACK) — CoW Detonation Chamber & Out-of-Band Oracle' }),
+                        jsx('div', { style: { fontSize: '12px', color: 'var(--muted-foreground, #cbd5e1)', marginBottom: '10px' }, children: 'Separazione Control/Detonation Plane, osservabilità out-of-band, Fog of War asimmetrico e cambio forzato di classe offensiva su 4 missioni cyber pure.' }),
+                        jsxs('div', {
+                          style: { display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' },
+                          children: [
+                            jsxs('select', {
+                              className: 'cp-select',
+                              'aria-label': 'Missione ACK',
+                              style: { flex: 1, minWidth: '240px' },
+                              value: selectedAckMissionId,
+                              onChange: (e) => setSelectedAckMissionId(e.target.value),
+                              children: (ackMissions.length > 0 ? ackMissions : [
+                                { mission_id: 'ack-m1-exploit-patch-bypass', title: '1. Exploit-to-Patch & Bypass Loop' },
+                                { mission_id: 'ack-m2-detection-evasion-arena', title: '2. Detection vs. Evasion Arena' },
+                                { mission_id: 'ack-m3-attack-path-hardening', title: '3. Attack-Path Audit & Live Hardening' },
+                                { mission_id: 'ack-m4-fuzz-to-fix-pipeline', title: '4. Fuzz-to-Fix Pipeline' }
+                              ]).map((m) => jsx('option', { value: m.mission_id, children: m.title }, m.mission_id))
+                            }),
+                            jsxs('select', {
+                              className: 'cp-select',
+                              'aria-label': 'Modalita Difesa ACK',
+                              value: ackDefenseMode,
+                              onChange: (e) => setAckDefenseMode(e.target.value),
+                              children: [
+                                jsx('option', { value: 'structural', children: 'Difesa: Structural + Containment (Reale)' }),
+                                jsx('option', { value: 'naive_string_replace', children: 'Anti-Cheat Test: Naive String Replace' }),
+                                jsx('option', { value: 'naive_block_all', children: 'Anti-Cheat Test: Naive Block-All' }),
+                                jsx('option', { value: 'overbroad_alert_all', children: 'Anti-Cheat Test: Overbroad Alert-All' })
+                              ]
+                            }),
+                            jsx('button', {
+                              type: 'button',
+                              className: 'cp-btn cp-btn-primary',
+                              disabled: busy,
+                              onClick: handleRunAckMission,
+                              children: 'Avvia Missione ACK in Detonation Chamber'
+                            })
+                          ]
+                        })
+                      ]
+                    }),
+                    ackReport
+                      ? jsxs('div', {
+                        style: { display: 'flex', flexDirection: 'column', gap: '12px' },
+                        children: [
+                          jsxs('div', {
+                            className: 'cp-card',
+                            children: [
+                              jsxs('div', {
+                                style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '6px' },
+                                children: [
+                                  jsx('span', { className: ackReport.certified ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red', children: ackReport.certified ? 'CERTIFIED' : 'REJECTED' }),
+                                  jsx('span', { className: 'cp-badge cp-b-purple', children: ackReport.certification_verdict }),
+                                  jsx('span', { className: 'cp-badge cp-b-blue', children: `Sandbox: ${ackReport.sandbox_id}` }),
+                                  ackReport.fog_of_war?.enforced ? jsx('span', { className: 'cp-badge cp-b-green', children: 'Fog of War Enforced' }) : null,
+                                  ackReport.shadow_clone_only ? jsx('span', { className: 'cp-badge cp-b-amber', children: 'Shadow Clone Only (Lowerdir Host Untouched)' }) : null
+                                ]
+                              }),
+                              jsx('div', { style: { fontWeight: 700, fontSize: '13.5px', marginBottom: '4px' }, children: ackReport.title }),
+                              jsx('div', { style: { fontSize: '12px', color: 'var(--muted-foreground, #cbd5e1)', marginBottom: '6px' }, children: `Invariante: ${ackReport.target_invariant} | Blue: ${ackReport.blue_patch_or_rules_summary}` }),
+                              jsxs('div', {
+                                style: { display: 'flex', gap: '8px', flexWrap: 'wrap' },
+                                children: [
+                                  jsx('span', { className: 'cp-badge cp-b-green', children: `TPR: ${Math.round((ackReport.tpr_fpr_matrix?.true_positive_rate || 0) * 100)}%` }),
+                                  jsx('span', { className: (ackReport.tpr_fpr_matrix?.false_positive_rate || 0) <= 0.05 ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red', children: `FPR: ${Math.round((ackReport.tpr_fpr_matrix?.false_positive_rate || 0) * 100)}%` }),
+                                  jsx('span', { className: 'cp-badge cp-b-blue', children: `Evasion Resistance: ${Math.round((ackReport.tpr_fpr_matrix?.evasion_resistance_rate || 0) * 100)}%` }),
+                                  jsx('span', { className: 'cp-badge cp-b-purple', children: `Functional Survival: ${Math.round((ackReport.tpr_fpr_matrix?.functional_survival_rate || 0) * 100)}%` }),
+                                  jsx('span', { className: 'cp-badge cp-b-amber', children: `Post-Patch Breaches: ${ackReport.tpr_fpr_matrix?.post_patch_breaches ?? 0}` })
+                                ]
+                              })
+                            ]
+                          }),
+                          jsxs('div', {
+                            className: 'cp-card',
+                            children: [
+                              jsx('div', { style: { fontWeight: 700, fontSize: '12.5px', marginBottom: '6px' }, children: `Macchina a 7 Stati ACK (${(ackReport.state_transitions || []).length} transizioni)` }),
+                              (ackReport.state_transitions || []).map((st, idx) => jsxs('div', {
+                                className: 'cp-ev',
+                                children: [
+                                  jsx('span', { className: st.passed ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red', children: st.state }),
+                                  ' ',
+                                  jsx('span', { className: 'cp-badge cp-b-purple', children: st.actor }),
+                                  ' ',
+                                  jsx('span', { children: st.summary })
+                                ]
+                              }, `${st.state}-${idx}`))
+                            ]
+                          }),
+                          jsxs('div', {
+                            className: 'cp-card cp-card-red',
+                            children: [
+                              jsx('div', { style: { fontWeight: 700, fontSize: '12.5px', marginBottom: '6px' }, children: `Round di Mutazione Red & Oracolo Out-of-Band (${(ackReport.mutation_rounds || []).length} classi distinte)` }),
+                              (ackReport.mutation_rounds || []).length === 0
+                                ? jsx('div', { style: { fontSize: '12px', color: 'var(--muted-foreground, #94a3b8)' }, children: 'Mutazioni non eseguite: difesa respinta dall’oracolo funzionale/FPR prima del ciclo di bypass.' })
+                                : (ackReport.mutation_rounds || []).map((mr) => jsxs('div', {
+                                  className: `cp-claim-card ${mr.bypass_succeeded ? 'supported' : 'refuted'}`,
+                                  children: [
+                                    jsxs('div', {
+                                      style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '4px' },
+                                      children: [
+                                        jsx('strong', { children: `Round ${mr.round_index}` }),
+                                        jsx('span', { className: 'cp-badge cp-b-red', children: mr.attack_class }),
+                                        jsx('span', { className: mr.bypass_succeeded ? 'cp-badge cp-b-red' : 'cp-badge cp-b-green', children: mr.oracle_evidence?.oracle_verdict }),
+                                        jsx('span', { className: 'cp-badge cp-b-blue', children: `canary_accessed=${String(mr.oracle_evidence?.fs_diff?.canary_accessed)}` }),
+                                        jsx('span', { className: 'cp-badge cp-b-purple', children: `lowerdir_untouched=${String(mr.oracle_evidence?.fs_diff?.lowerdir_untouched)}` })
+                                      ]
+                                    }),
+                                    jsx('div', { style: { fontSize: '11.5px', color: 'var(--muted-foreground, #cbd5e1)' }, children: `Contract ${mr.contract?.action_id} [${mr.contract?.primitive}] -> ${mr.contract?.artifact_path} | Classi fallite in memoria: ${(mr.previous_failed_classes || []).join(', ') || 'Nessuna'}` })
+                                  ]
+                                }, mr.round_index))
+                            ]
+                          })
+                        ]
+                      })
+                      : jsx('div', { className: 'cp-card', children: 'Seleziona una delle 4 missioni ACK e clicca "Avvia Missione ACK in Detonation Chamber" per eseguire test CoW reali e certificazione out-of-band.' })
+                  ]
+                })
+                : activeTab === 'benchmark' && benchmarkReport
                 ? jsxs('div', {
                   className: 'cp-card cp-card-purple',
                   children: [

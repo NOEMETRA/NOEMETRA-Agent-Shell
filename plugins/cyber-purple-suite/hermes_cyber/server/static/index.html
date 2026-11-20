@@ -58,6 +58,22 @@
         <select id="scenarioSelect" style="flex:1;"></select>
         <button class="primary" onclick="analyzeSelectedScenario()">Analizza</button>
       </div>
+      <div class="stage-card" style="margin-bottom:10px;">
+        <strong>ACK Detonation Arena (4 Missioni CoW)</strong>
+        <select id="ackMissionSelect" style="width:100%;margin:6px 0;">
+          <option value="ack-m1-exploit-patch-bypass">1. Exploit-to-Patch &amp; Bypass Loop</option>
+          <option value="ack-m2-detection-evasion-arena">2. Detection vs. Evasion Arena</option>
+          <option value="ack-m3-attack-path-hardening">3. Attack-Path Audit &amp; Live Hardening</option>
+          <option value="ack-m4-fuzz-to-fix-pipeline">4. Fuzz-to-Fix Pipeline</option>
+        </select>
+        <select id="ackDefenseSelect" style="width:100%;margin-bottom:6px;">
+          <option value="structural">Difesa: Structural + Containment (Reale)</option>
+          <option value="naive_string_replace">Anti-Cheat: Naive String Replace</option>
+          <option value="naive_block_all">Anti-Cheat: Naive Block-All</option>
+          <option value="overbroad_alert_all">Anti-Cheat: Overbroad Alert-All</option>
+        </select>
+        <button class="primary" onclick="runAckMission()" style="width:100%;">Avvia Missione ACK Out-of-Band</button>
+      </div>
       <details>
         <summary style="cursor:pointer;color:var(--muted);margin-bottom:8px;">Analisi Artefatto Custom (Log / Codice / YAML)</summary>
         <input id="customTitle" placeholder="Titolo caso" style="width:100%;margin-bottom:6px;">
@@ -252,9 +268,52 @@
         <span class="badge b-purple">Astensione Ambigui: ${Math.round(b.abstention_accuracy*100)}%</span></p>
         ${b.results.map(x => `<p><strong>${esc(x.title)}</strong>: Atteso=<code>${esc(x.expected_verdict)}</code> | Single=<code>${esc(x.single_agent_verdict)}</code> | Purple=<code>${esc(x.purple_multi_agent_verdict)}</code></p>`).join('')}`;
     }
+    async function runAckMission() {
+      const rep = await apiFetch('/ack/run', {
+        method: 'POST',
+        body: JSON.stringify({
+          mission_id: document.getElementById('ackMissionSelect').value,
+          mutation_rounds: 3,
+          defense_mode: document.getElementById('ackDefenseSelect').value
+        })
+      });
+      renderAckReport(rep);
+    }
+    function renderAckReport(rep) {
+      const m = rep.tpr_fpr_matrix || {};
+      const fow = rep.fog_of_war || {};
+      document.getElementById('reportPanel').innerHTML = `
+        <div style="border-left:4px solid ${rep.certified ? 'var(--green)' : 'var(--red)'};padding-left:12px;margin-bottom:14px;">
+          <span class="badge ${rep.certified ? 'b-green' : 'b-red'}">${rep.certified ? 'CERTIFIED' : 'REJECTED'}</span>
+          <span class="badge b-purple">${esc(rep.certification_verdict)}</span>
+          <span class="badge b-blue">Sandbox: ${esc(rep.sandbox_id)}</span>
+          ${fow.enforced ? '<span class="badge b-green">Fog of War Enforced</span>' : ''}
+          ${rep.shadow_clone_only ? '<span class="badge b-amber">Shadow Clone CoW</span>' : ''}
+          <h3 style="margin:6px 0;">${esc(rep.title)}</h3>
+          <p style="color:var(--muted);margin:4px 0;"><strong>Invariante:</strong> ${esc(rep.target_invariant)} — ${esc(rep.blue_patch_or_rules_summary)}</p>
+          <p>
+            <span class="badge b-green">TPR: ${Math.round((m.true_positive_rate || 0)*100)}%</span>
+            <span class="badge ${(m.false_positive_rate || 0) <= 0.05 ? 'b-green' : 'b-red'}">FPR: ${Math.round((m.false_positive_rate || 0)*100)}%</span>
+            <span class="badge b-blue">Evasion Resistance: ${Math.round((m.evasion_resistance_rate || 0)*100)}%</span>
+            <span class="badge b-purple">Functional Survival: ${Math.round((m.functional_survival_rate || 0)*100)}%</span>
+          </p>
+        </div>
+        <h4>Macchina a 7 Stati (${(rep.state_transitions || []).length} transizioni)</h4>
+        ${(rep.state_transitions || []).map(st => `<p><span class="badge ${st.passed ? 'b-green' : 'b-red'}">${esc(st.state)}</span> <span class="badge b-purple">${esc(st.actor)}</span> ${esc(st.summary)}</p>`).join('')}
+        <h4>Round di Mutazione Red & Oracolo Out-of-Band (${(rep.mutation_rounds || []).length})</h4>
+        ${(rep.mutation_rounds || []).map(mr => `<div class="claim-card ${mr.bypass_succeeded ? 'supported' : 'refuted'}">
+          <strong>Round ${esc(mr.round_index)}</strong> <span class="badge b-red">${esc(mr.attack_class)}</span>
+          <span class="badge ${mr.bypass_succeeded ? 'b-red' : 'b-green'}">${esc(mr.oracle_evidence?.oracle_verdict)}</span>
+          <span class="badge b-blue">canary_accessed=${esc(mr.oracle_evidence?.fs_diff?.canary_accessed)}</span>
+          <span class="badge b-purple">lowerdir_untouched=${esc(mr.oracle_evidence?.fs_diff?.lowerdir_untouched)}</span>
+        </div>`).join('')}
+      `;
+    }
     (async () => {
-      const [{ scenarios }, models, status] = await Promise.all([apiFetch('/scenarios'), apiFetch('/models'), apiFetch('/status')]);
+      const [{ scenarios }, models, status, ackData] = await Promise.all([apiFetch('/scenarios'), apiFetch('/models'), apiFetch('/status'), apiFetch('/ack/missions')]);
       document.getElementById('scenarioSelect').innerHTML = scenarios.map(s => `<option value="${esc(s.scenario_id)}">${esc(s.title)} [${esc(s.expected_verdict)}]</option>`).join('');
+      const ackList = ackData.missions || status.ack_missions || [];
+      document.getElementById('ackMissionSelect').innerHTML = ackList.map(m => `<option value="${esc(m.mission_id)}">${esc(m.title)}</option>`).join('');
       populateModelSelects(models);
       document.getElementById('useLlmChk').checked = Boolean(status.use_llm);
       if (status.active_case) renderReport(status.active_case);

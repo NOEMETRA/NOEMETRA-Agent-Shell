@@ -77,6 +77,17 @@ class ArenaConfigRequest(BaseModel):
     use_llm: Optional[bool] = None
 
 
+class AckMissionRunRequest(BaseModel):
+    mission_id: str
+    mutation_rounds: int = 3
+    defense_mode: Literal[
+        "structural",
+        "naive_string_replace",
+        "naive_block_all",
+        "overbroad_alert_all",
+    ] = "structural"
+
+
 @router.get("/status")
 async def get_cyber_status(request: Request):
     return _req_assistant(request).get_status()
@@ -167,6 +178,31 @@ async def run_cyber_benchmark(request: Request):
     assistant = _req_assistant(request)
     bench = await asyncio.to_thread(assistant.run_benchmark)
     return bench.model_dump(mode="json")
+
+
+@router.get("/ack/missions")
+async def list_ack_missions(request: Request):
+    assistant = _req_assistant(request)
+    return {"missions": [m.model_dump(mode="json") for m in assistant.list_ack_missions()]}
+
+
+@router.post("/ack/run")
+async def run_ack_mission(req: AckMissionRunRequest, request: Request):
+    assistant = _req_assistant(request)
+    try:
+        report = await asyncio.to_thread(
+            assistant.run_ack_mission,
+            req.mission_id,
+            mutation_rounds=req.mutation_rounds,
+            defense_mode=req.defense_mode,
+        )
+        return report.model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.get("/models")

@@ -75,6 +75,22 @@ def cyber_verify_case(args: Any = None, **kwargs) -> str:
         return json.dumps({"error": str(exc)})
 
 
+def cyber_run_ack_mission(args: Any = None, **kwargs) -> str:
+    """Esegue una delle 4 missioni pure Adversarial Cyber Kernel (ACK) nella DetonationChamber CoW."""
+    mission_id = str(_extract_arg(args, kwargs, "mission_id", "ack-m1-exploit-patch-bypass") or "")
+    mutation_rounds = int(_extract_arg(args, kwargs, "mutation_rounds", 3) or 3)
+    defense_mode = str(_extract_arg(args, kwargs, "defense_mode", "structural") or "structural")
+    try:
+        report = _get_cyber_assistant().run_ack_mission(
+            mission_id=mission_id,
+            mutation_rounds=mutation_rounds,
+            defense_mode=defense_mode,
+        )
+        return json.dumps(report.model_dump(mode="json"), indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
 TOOLS = [
     {
         "name": "cyber_analyze_scenario",
@@ -145,6 +161,30 @@ TOOLS = [
                     "mode": {"type": "string", "description": "verify_patch | append_evidence"},
                 },
                 "required": ["case_id", "content"],
+            },
+        },
+    },
+    {
+        "name": "cyber_run_ack_mission",
+        "description": "Esegue una delle 4 missioni Adversarial Cyber Kernel (ACK) con DetonationChamber CoW, Fog of War e Oracolo Out-of-Band.",
+        "handler": cyber_run_ack_mission,
+        "schema": {
+            "name": "cyber_run_ack_mission",
+            "description": "Avvia Exploit-to-Patch, Detection vs Evasion, Shadow Clone Hardening o Fuzz-to-Fix nell'arena ACK.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mission_id": {
+                        "type": "string",
+                        "description": "ack-m1-exploit-patch-bypass | ack-m2-detection-evasion-arena | ack-m3-attack-path-hardening | ack-m4-fuzz-to-fix-pipeline",
+                    },
+                    "mutation_rounds": {"type": "integer", "description": "Round di mutazione Red con cambio classe (1..3)"},
+                    "defense_mode": {
+                        "type": "string",
+                        "description": "structural | naive_string_replace | naive_block_all | overbroad_alert_all",
+                    },
+                },
+                "required": ["mission_id"],
             },
         },
     },

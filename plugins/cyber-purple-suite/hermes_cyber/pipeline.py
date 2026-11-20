@@ -9,8 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
+from hermes_cyber.ack_arena import AdversarialCyberKernel
 from hermes_cyber.blue_agent import BlueInvestigatorAgent, _build_sigma_yaml
 from hermes_cyber.models import (
+    AckCertificationReport,
+    AckMissionDescriptor,
     AnalyticalClaim,
     ArtifactIngestionResult,
     BenchmarkCaseResult,
@@ -388,6 +391,7 @@ class CyberPurpleAssistant:
         self.red_agent = RedOperatorAgent()
         self.blue_agent = BlueInvestigatorAgent()
         self.verifier = PurpleVerifier()
+        self.ack_kernel = AdversarialCyberKernel()
 
         # Dual independent ModelRouter instances for Red vs Blue multi-model dialectics
         self.red_router = ModelRouter(
@@ -404,6 +408,7 @@ class CyberPurpleAssistant:
         self._cases: Dict[str, CyberAnalysisReport] = {}
         self._active_case_id: Optional[str] = None
         self._last_benchmark: Optional[BenchmarkComparisonReport] = None
+        self._last_ack_report: Optional[AckCertificationReport] = None
         self._load_cases()
 
     def _check_profile_storage_live(self) -> None:
@@ -1019,6 +1024,27 @@ class CyberPurpleAssistant:
         self._last_benchmark = summary
         return summary
 
+    def list_ack_missions(self) -> List[AckMissionDescriptor]:
+        """List the 4 pure-cyber Adversarial Cyber Kernel missions."""
+        return self.ack_kernel.list_missions()
+
+    def run_ack_mission(
+        self,
+        mission_id: str,
+        *,
+        mutation_rounds: int = 3,
+        defense_mode: str = "structural",
+    ) -> AckCertificationReport:
+        """Execute an isolated CoW DetonationChamber ACK mission and store the latest certified report."""
+        self._check_profile_storage_live()
+        report = self.ack_kernel.run_mission(
+            mission_id,
+            mutation_rounds=mutation_rounds,
+            defense_mode=defense_mode,
+        )
+        self._last_ack_report = report
+        return report
+
     def get_status(self) -> Dict[str, Any]:
         active = self._cases.get(self._active_case_id) if self._active_case_id else None
         return {
@@ -1037,4 +1063,6 @@ class CyberPurpleAssistant:
             "active_case_id": self._active_case_id,
             "active_case": active.model_dump(mode="json") if active else None,
             "last_benchmark": self._last_benchmark.model_dump(mode="json") if self._last_benchmark else None,
+            "ack_missions": [m.model_dump(mode="json") for m in self.list_ack_missions()],
+            "last_ack_report": self._last_ack_report.model_dump(mode="json") if self._last_ack_report else None,
         }

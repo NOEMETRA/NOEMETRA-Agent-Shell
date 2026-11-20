@@ -14,7 +14,9 @@ from cyber_hermes_plugin.cyber_plugin import (
     cyber_analyze_artifact,
     cyber_analyze_scenario,
     cyber_get_status,
+    cyber_run_ack_mission,
     cyber_run_purple_benchmark,
+    cyber_verify_case,
     register,
 )
 
@@ -23,6 +25,8 @@ __all__ = [
     "cyber_analyze_artifact",
     "cyber_analyze_scenario",
     "cyber_get_status",
+    "cyber_run_ack_mission",
     "cyber_run_purple_benchmark",
+    "cyber_verify_case",
     "register",
 ]
