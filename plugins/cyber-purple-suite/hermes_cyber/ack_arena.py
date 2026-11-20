@@ -1900,6 +1900,11 @@ def _yaml_safe_load_compat(text: str) -> Any:
             "v": "\v",
             "e": "\x1b",
             " ": " ",
+            "\t": "\t",
+            "N": "\x85",
+            "_": "\xa0",
+            "L": "\u2028",
+            "P": "\u2029",
         }
         out = []
         i = 0
@@ -2183,7 +2188,11 @@ def _yaml_safe_dump_compat(data: Any) -> str:
             or ": " in s
             or s.endswith(":")
         ):
-            return json.dumps(s, ensure_ascii=False)
+            return re.sub(
+                "[\x7f-\x9f\u2028\u2029\ufeff\ufffe\uffff]",
+                lambda m: f"\\u{ord(m.group(0)):04x}",
+                json.dumps(s, ensure_ascii=False),
+            )
         return s
 
     lines: List[str] = []

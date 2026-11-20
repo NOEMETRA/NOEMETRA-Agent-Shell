@@ -309,6 +309,7 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest(monk
         "    single_esc: 'it''s'",
         '    multiline_esc: "line1\\nline2"',
         '    emoji_esc: "\\ud83d\\ude00"',
+        '    linesep_esc: "a\\u2028b\\u2029c\\u0085d\\Le\\Nf"',
         "spec:",
         "  containers:",
         "    - name: worker",
@@ -327,6 +328,7 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest(monk
     assert ann["single_esc"] == "it's"
     assert ann["multiline_esc"] == "line1\nline2"
     assert ann["emoji_esc"] == "\U0001f600"
+    assert ann["linesep_esc"] == "a\u2028b\u2029c\u0085d\u2028e\u0085f"
     assert "securityContext" not in stdlib_parsed
     assert _parse_target_host_config(stdlib_hardened)["all_containers_hardened"] is True
     assert _parse_target_host_config(vuln_unprefixed_cap_yaml)["ambient_caps"] == ["CAP_SYS_ADMIN"]
