@@ -297,14 +297,46 @@ def test_ack_m3_distinguishes_synthetic_fixture_from_cloned_target_manifest(monk
         assert "ALL" in c_doc["securityContext"]["capabilities"]["drop"]
 
     # Also verify pure-stdlib YAML fallback (simulating clean Python 3.11-3.13 without ruamel.yaml/PyYAML)
+    quoted_yaml = "\n".join([
+        "apiVersion: v1",
+        "kind: Pod",
+        "metadata:",
+        "  name: quoted-test",
+        "  annotations:",
+        '    bool_str: "true"',
+        '    num_str: "123"',
+        '    null_str: "null"',
+        "    single_esc: 'it''s'",
+        '    multiline_esc: "line1\\nline2"',
+        "spec:",
+        "  containers:",
+        "    - name: worker",
+        "      image: python:3.12-slim",
+    ])
+    multi_doc_yaml = "apiVersion: v1\nkind: Pod\n---\napiVersion: v1\nkind: Service\n"
+
     monkeypatch.setenv("ACK_FORCE_STDLIB_YAML", "1")
-    stdlib_hardened = _harden_manifest_text(vuln_yaml_manifest, "structural")
+    stdlib_hardened = _harden_manifest_text(quoted_yaml, "structural")
     stdlib_parsed = _yaml_safe_load_compat(stdlib_hardened)
+    ann = stdlib_parsed["metadata"]["annotations"]
+    assert ann["bool_str"] == "true" and isinstance(ann["bool_str"], str)
+    assert ann["num_str"] == "123" and isinstance(ann["num_str"], str)
+    assert ann["null_str"] == "null" and isinstance(ann["null_str"], str)
+    assert ann["single_esc"] == "it's"
+    assert ann["multiline_esc"] == "line1\nline2"
     assert "securityContext" not in stdlib_parsed
-    assert len(stdlib_parsed["spec"]["containers"]) == 2
     assert _parse_target_host_config(stdlib_hardened)["all_containers_hardened"] is True
     assert _parse_target_host_config(vuln_unprefixed_cap_yaml)["ambient_caps"] == ["CAP_SYS_ADMIN"]
     assert _parse_target_host_config("apiVersion: v1\nkind: Pod\nmetadata: [unclosed\n")["format_valid"] is False
+    assert _parse_target_host_config(multi_doc_yaml)["format_valid"] is False
+    rep_multi_stdlib = kernel.run_mission(
+        "ack-m3-attack-path-hardening",
+        mutation_rounds=3,
+        defense_mode="structural",
+        target_config_content=multi_doc_yaml,
+    )
+    assert rep_multi_stdlib.certified is False
+    assert rep_multi_stdlib.certification_verdict == "INVALID_MANIFEST_FORMAT"
     monkeypatch.delenv("ACK_FORCE_STDLIB_YAML", raising=False)
 
     hardened_ini_out = _harden_manifest_text(vuln_ini_manifest, "structural")

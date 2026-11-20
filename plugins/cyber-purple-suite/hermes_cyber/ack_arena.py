@@ -1831,7 +1831,7 @@ SocketMode=0666
 
 
 def _yaml_safe_load_compat(text: str) -> Any:
-    """Load YAML preferring ruamel.yaml/PyYAML when present, with strict pure-stdlib fallback for Python 3.11-3.13."""
+    """Load single-document YAML preferring ruamel.yaml/PyYAML, with strict pure-stdlib fallback for Python 3.11-3.13."""
     if os.environ.get("ACK_FORCE_STDLIB_YAML") != "1":
         try:
             from ruamel.yaml import YAML  # type: ignore[import-untyped]
@@ -1845,54 +1845,131 @@ def _yaml_safe_load_compat(text: str) -> Any:
             except ImportError:
                 pass
 
+    def _scan_quote_end(s: str, start_idx: int) -> int:
+        q = s[start_idx]
+        j = start_idx + 1
+        n = len(s)
+        while j < n:
+            if q == "'":
+                if s[j] == "'":
+                    if j + 1 < n and s[j + 1] == "'":
+                        j += 2
+                        continue
+                    return j
+                j += 1
+            else:
+                if s[j] == "\\":
+                    if j + 1 >= n:
+                        break
+                    j += 2
+                    continue
+                if s[j] == '"':
+                    return j
+                j += 1
+        raise ValueError("Unclosed quoted string in YAML")
+
+    def _decode_quoted(vs: str) -> str:
+        if len(vs) < 2 or vs[0] not in ("'", '"') or _scan_quote_end(vs, 0) != len(vs) - 1:
+            raise ValueError(f"Invalid quoted YAML scalar: {vs!r}")
+        inner = vs[1:-1]
+        if vs[0] == "'":
+            out: List[str] = []
+            i = 0
+            while i < len(inner):
+                if inner[i] == "'":
+                    if i + 1 >= len(inner) or inner[i + 1] != "'":
+                        raise ValueError("Invalid unescaped quote in single-quoted YAML scalar")
+                    out.append("'")
+                    i += 2
+                else:
+                    out.append(inner[i])
+                    i += 1
+            return "".join(out)
+
+        escape_map = {
+            "\\": "\\",
+            '"': '"',
+            "/": "/",
+            "n": "\n",
+            "r": "\r",
+            "t": "\t",
+            "b": "\b",
+            "f": "\f",
+            "0": "\0",
+            "a": "\a",
+            "v": "\v",
+            "e": "\x1b",
+            " ": " ",
+        }
+        out = []
+        i = 0
+        while i < len(inner):
+            ch = inner[i]
+            if ch != "\\":
+                if ch == '"':
+                    raise ValueError("Unescaped quote in double-quoted YAML scalar")
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= len(inner):
+                raise ValueError("Truncated escape in double-quoted YAML scalar")
+            esc = inner[i + 1]
+            if esc in escape_map:
+                out.append(escape_map[esc])
+                i += 2
+            elif esc in ("x", "u", "U"):
+                hex_len = {"x": 2, "u": 4, "U": 8}[esc]
+                hex_part = inner[i + 2 : i + 2 + hex_len]
+                if len(hex_part) != hex_len:
+                    raise ValueError(f"Truncated \\{esc} escape in YAML scalar")
+                out.append(chr(int(hex_part, 16)))
+                i += 2 + hex_len
+            else:
+                raise ValueError(f"Unsupported YAML escape sequence: \\{esc}")
+        return "".join(out)
+
     def _split_csv_top(s: str) -> List[str]:
         items: List[str] = []
-        buf: List[str] = []
+        start = 0
         depth = 0
-        quote: Optional[str] = None
-        for ch in s:
-            if quote is not None:
-                buf.append(ch)
-                if ch == quote:
-                    quote = None
-                continue
+        idx = 0
+        while idx < len(s):
+            ch = s[idx]
             if ch in ("'", '"'):
-                quote = ch
-                buf.append(ch)
-            elif ch in ("[", "{"):
+                idx = _scan_quote_end(s, idx) + 1
+                continue
+            if ch in ("[", "{"):
                 depth += 1
-                buf.append(ch)
             elif ch in ("]", "}"):
                 depth -= 1
                 if depth < 0:
                     raise ValueError("Unmatched closing bracket in YAML flow collection")
-                buf.append(ch)
             elif ch == "," and depth == 0:
-                items.append("".join(buf).strip())
-                buf = []
-            else:
-                buf.append(ch)
-        if quote is not None or depth != 0:
-            raise ValueError("Unclosed quote or bracket in YAML flow collection")
-        tail = "".join(buf).strip()
+                items.append(s[start:idx].strip())
+                start = idx + 1
+            idx += 1
+        if depth != 0:
+            raise ValueError("Unclosed bracket in YAML flow collection")
+        tail = s[start:].strip()
         if tail:
             items.append(tail)
         return items
 
     def _split_kv(line_s: str) -> Tuple[str, str]:
-        quote: Optional[str] = None
-        for idx, ch in enumerate(line_s):
-            if quote is not None:
-                if ch == quote:
-                    quote = None
-                continue
+        idx = 0
+        while idx < len(line_s):
+            ch = line_s[idx]
             if ch in ("'", '"'):
-                quote = ch
-            elif ch == ":" and (idx + 1 == len(line_s) or line_s[idx + 1] in (" ", "\t")):
+                idx = _scan_quote_end(line_s, idx) + 1
+                continue
+            if ch == ":" and (idx + 1 == len(line_s) or line_s[idx + 1] in (" ", "\t")):
                 k_raw = line_s[:idx].strip()
-                if len(k_raw) >= 2 and k_raw[0] == k_raw[-1] and k_raw[0] in ("'", '"'):
-                    k_raw = k_raw[1:-1]
+                if not k_raw:
+                    raise ValueError(f"Empty YAML mapping key: {line_s!r}")
+                if k_raw[0] in ("'", '"'):
+                    k_raw = _decode_quoted(k_raw)
                 return k_raw, line_s[idx + 1 :].strip()
+            idx += 1
         raise ValueError(f"Invalid YAML mapping line: {line_s!r}")
 
     def _parse_scalar(val_s: str) -> Any:
@@ -1910,14 +1987,16 @@ def _yaml_safe_load_compat(text: str) -> Any:
             if inner:
                 for entry in _split_csv_top(inner):
                     ek, ev = _split_kv(entry)
+                    if ek in out_d:
+                        raise ValueError(f"Duplicate key in YAML flow mapping: {ek}")
                     out_d[ek] = _parse_scalar(ev)
             return out_d
-        if len(vs) >= 1 and vs[0] in ("'", '"'):
-            if len(vs) < 2 or vs[-1] != vs[0]:
-                raise ValueError("Unclosed quoted string in YAML")
-            return vs[1:-1]
+        if vs and vs[0] in ("'", '"'):
+            return _decode_quoted(vs)
         if any(ch in vs for ch in ("[", "]", "{", "}")):
             raise ValueError("Unbalanced bracket in YAML scalar")
+        if vs.startswith(("!", "&", "*", "|", ">")):
+            raise ValueError(f"Unsupported YAML tag/anchor/block scalar: {vs!r}")
         low_v = vs.lower()
         if low_v == "true":
             return True
@@ -1927,33 +2006,48 @@ def _yaml_safe_load_compat(text: str) -> Any:
             return None
         if re.match(r"^-?\d+$", vs) and not (len(vs) > 1 and vs.startswith("0")):
             return int(vs)
+        if re.match(r"^[+-]?(?:\d+\.\d*|\.\d+|\d+(?:[eE][+-]?\d+))$", vs):
+            return float(vs)
         return vs
 
     tokens: List[Tuple[int, str]] = []
+    seen_content = False
+    seen_start_marker = False
+    doc_ended = False
     for raw_ln in text.splitlines():
-        in_q: Optional[str] = None
+        ci = 0
         cut_idx = len(raw_ln)
-        for ci, cch in enumerate(raw_ln):
-            if in_q is not None:
-                if cch == in_q:
-                    in_q = None
-                continue
+        while ci < len(raw_ln):
+            cch = raw_ln[ci]
             if cch in ("'", '"'):
-                in_q = cch
-            elif cch == "#" and (ci == 0 or raw_ln[ci - 1] in (" ", "\t")):
+                ci = _scan_quote_end(raw_ln, ci) + 1
+                continue
+            if cch == "#" and (ci == 0 or raw_ln[ci - 1] in (" ", "\t")):
                 cut_idx = ci
                 break
-        if in_q is not None:
-            raise ValueError("Unclosed quote on YAML line")
+            ci += 1
         clean = raw_ln[:cut_idx]
         s = clean.strip()
-        if not s or s in ("---", "..."):
+        if not s:
             continue
+        if s == "---" or s.startswith("--- "):
+            if s != "---" or seen_content or seen_start_marker or doc_ended:
+                raise ValueError("Multiple YAML documents or inline document headers are not supported")
+            seen_start_marker = True
+            continue
+        if s == "..." or s.startswith("... "):
+            if s != "..." or doc_ended:
+                raise ValueError("Invalid YAML document end marker")
+            doc_ended = True
+            continue
+        if doc_ended:
+            raise ValueError("Unexpected YAML content after document end marker")
         if re.match(r"^\[[A-Za-z0-9_.-]+\]$", s):
             raise ValueError("INI section header inside YAML")
         indent = len(clean) - len(clean.lstrip(" "))
         if "\t" in clean[:indent]:
             raise ValueError("Tab indentation not allowed in YAML")
+        seen_content = True
         tokens.append((indent, s))
 
     if not tokens:
@@ -1990,6 +2084,8 @@ def _yaml_safe_load_compat(text: str) -> Any:
                     sibling_ind = seq_ind + 2
                     while item_pos < len(tokens) and tokens[item_pos][0] == sibling_ind and not _is_seq_line(tokens[item_pos][1]):
                         sk, sv = _split_kv(tokens[item_pos][1])
+                        if sk in item_dict:
+                            raise ValueError(f"Duplicate YAML mapping key: {sk}")
                         item_pos += 1
                         if sv:
                             item_dict[sk] = _parse_scalar(sv)
@@ -2011,6 +2107,8 @@ def _yaml_safe_load_compat(text: str) -> Any:
         mapping: Dict[str, Any] = {}
         while pos < len(tokens) and tokens[pos][0] == expected_indent and not _is_seq_line(tokens[pos][1]):
             mk, mv = _split_kv(tokens[pos][1])
+            if mk in mapping:
+                raise ValueError(f"Duplicate YAML mapping key: {mk}")
             pos += 1
             if mv:
                 mapping[mk] = _parse_scalar(mv)
@@ -2031,7 +2129,7 @@ def _yaml_safe_load_compat(text: str) -> Any:
 
 
 def _yaml_safe_dump_compat(data: Any) -> str:
-    """Dump YAML preferring ruamel.yaml/PyYAML when present, with pure-stdlib fallback for Python 3.11-3.13."""
+    """Dump single-document YAML preferring ruamel.yaml/PyYAML, with type-preserving pure-stdlib fallback."""
     if os.environ.get("ACK_FORCE_STDLIB_YAML") != "1":
         try:
             from ruamel.yaml import YAML  # type: ignore[import-untyped]
@@ -2050,6 +2148,11 @@ def _yaml_safe_dump_compat(data: Any) -> str:
             except ImportError:
                 pass
 
+    _reserved_yaml_words = frozenset({
+        "true", "false", "null", "yes", "no", "on", "off", "y", "n",
+        "nan", "inf", "-inf", "+inf", ".nan", ".inf", "-.inf", "+.inf", "~",
+    })
+
     def _fmt_scalar(v: Any) -> str:
         if v is None:
             return "null"
@@ -2058,7 +2161,14 @@ def _yaml_safe_dump_compat(data: Any) -> str:
         if isinstance(v, (int, float)):
             return str(v)
         s = str(v)
-        if not s or any(c in s for c in (":", "#", "{", "}", "[", "]", "\n")) or s.startswith(("0", "-")):
+        if (
+            not s
+            or s != s.strip()
+            or s.lower() in _reserved_yaml_words
+            or not re.match(r"^[A-Za-z_][A-Za-z0-9_./:-]*$", s)
+            or ": " in s
+            or s.endswith(":")
+        ):
             return json.dumps(s)
         return s
 
@@ -2071,18 +2181,19 @@ def _yaml_safe_dump_compat(data: Any) -> str:
                 lines.append(f"{pad}{{}}")
                 return
             for k, v in node.items():
+                ks = _fmt_scalar(str(k))
                 if isinstance(v, dict) and v:
-                    lines.append(f"{pad}{k}:")
+                    lines.append(f"{pad}{ks}:")
                     _emit(v, ind + 2)
                 elif isinstance(v, list) and v:
-                    lines.append(f"{pad}{k}:")
+                    lines.append(f"{pad}{ks}:")
                     _emit(v, ind + 2)
                 elif isinstance(v, dict):
-                    lines.append(f"{pad}{k}: {{}}")
+                    lines.append(f"{pad}{ks}: {{}}")
                 elif isinstance(v, list):
-                    lines.append(f"{pad}{k}: []")
+                    lines.append(f"{pad}{ks}: []")
                 else:
-                    lines.append(f"{pad}{k}: {_fmt_scalar(v)}")
+                    lines.append(f"{pad}{ks}: {_fmt_scalar(v)}")
         elif isinstance(node, list):
             for item in node:
                 if isinstance(item, dict) and item:
@@ -2090,15 +2201,16 @@ def _yaml_safe_dump_compat(data: Any) -> str:
                     for k, v in item.items():
                         prefix = f"{pad}- " if first else f"{pad}  "
                         first = False
+                        ks = _fmt_scalar(str(k))
                         if isinstance(v, (dict, list)) and v:
-                            lines.append(f"{prefix}{k}:")
+                            lines.append(f"{prefix}{ks}:")
                             _emit(v, ind + 4)
                         elif isinstance(v, dict):
-                            lines.append(f"{prefix}{k}: {{}}")
+                            lines.append(f"{prefix}{ks}: {{}}")
                         elif isinstance(v, list):
-                            lines.append(f"{prefix}{k}: []")
+                            lines.append(f"{prefix}{ks}: []")
                         else:
-                            lines.append(f"{prefix}{k}: {_fmt_scalar(v)}")
+                            lines.append(f"{prefix}{ks}: {_fmt_scalar(v)}")
                 elif isinstance(item, (dict, list)) and item:
                     lines.append(f"{pad}-")
                     _emit(item, ind + 2)
