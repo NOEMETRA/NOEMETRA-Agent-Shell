@@ -46,6 +46,19 @@ AckMissionKind = Literal[
     "fuzz_to_fix_pipeline",
 ]
 
+AckVerificationTierType = Literal[
+    "lab_fixture_verification",
+    "workspace_target_verification",
+    "runtime_sandbox_certified",
+]
+
+AckSecurityBoundaryType = Literal[
+    "process_confinement_not_untrusted_sandbox",
+    "container_sandbox",
+]
+
+AckWorkspaceModeType = Literal["isolated_copy", "git_worktree"]
+
 
 class ActionExecutionLimits(BaseModel):
     """Strict resource and network confinement bounds inside the Detonation Chamber."""
@@ -94,7 +107,7 @@ class TelemetryAlertEvidence(BaseModel):
     """Independent out-of-band rule/telemetry trigger observation."""
 
     rule_id: str
-    engine: str = "ebpf_sigma_yara"
+    engine: str = "python_rule_engine"
     triggered: bool = False
     matched_pattern: str = ""
 
@@ -137,6 +150,9 @@ class AckTprFprMatrix(BaseModel):
     functional_survival_rate: float = 0.0
     pre_patch_breach_confirmed: bool = False
     post_patch_breaches: int = 0
+    fpr_measured: bool = False
+    benign_corpus_size: int = 0
+    attack_variants_tested: int = 0
 
 
 class AckMutationRoundResult(BaseModel):
@@ -161,6 +177,32 @@ class AckStateTransition(BaseModel):
     passed: bool = True
 
 
+class AckSubAgentTrace(BaseModel):
+    """Trace record emitted by an independent Red or Blue sub-agent role under Fog of War."""
+
+    team: Literal["RED", "BLUE"]
+    role: str
+    phase: AckStateType
+    model_used: str = "deterministic"
+    visible_context_keys: List[str] = Field(default_factory=list)
+    summary: str
+    artifacts: List[str] = Field(default_factory=list)
+
+
+class AckWorkspaceTargetInfo(BaseModel):
+    """Provenance and drift-verification metadata for an ACK Workspace Mode target file."""
+
+    target_file_path: str
+    target_function: str
+    target_rel_path: Optional[str] = None
+    workspace_mode: AckWorkspaceModeType = "isolated_copy"
+    original_sha256: str
+    original_untouched: bool = True
+    valid_corpus_count: int = 0
+    patch_applied: bool = False
+    applied_at: Optional[str] = None
+
+
 class AckMissionDescriptor(BaseModel):
     """Catalog metadata for the 4 pure-cyber Adversarial Cyber Kernel missions."""
 
@@ -174,7 +216,7 @@ class AckMissionDescriptor(BaseModel):
 
 
 class AckCertificationReport(BaseModel):
-    """Complete out-of-band certified Adversarial Cyber Kernel mission report."""
+    """Complete out-of-band verified Adversarial Cyber Kernel mission report."""
 
     run_id: str
     mission_id: str
@@ -183,13 +225,26 @@ class AckCertificationReport(BaseModel):
     sandbox_id: str
     tier_used: str = "tier1_cow_arena"
     shadow_clone_only: bool = False
-    audit_scope: Literal["synthetic_fixture_simulation", "cloned_target_manifest"] = "synthetic_fixture_simulation"
+    audit_scope: Literal[
+        "synthetic_fixture_simulation",
+        "cloned_target_manifest",
+        "workspace_target_file",
+    ] = "synthetic_fixture_simulation"
+    verification_tier: AckVerificationTierType = "lab_fixture_verification"
+    security_boundary_level: AckSecurityBoundaryType = "process_confinement_not_untrusted_sandbox"
+    untrusted_llm_code_warning: str = (
+        "Process confinement + Python audit hooks protect controlled lab harnesses only; "
+        "do not rely on this boundary to run arbitrary untrusted LLM code on the host."
+    )
     isolation_backend: str = "confined_supervisor_audit_hook"
     defense_mode: str = "structural"
     target_invariant: str
     certified: bool
     certification_verdict: str
+    executed_checks: List[str] = Field(default_factory=list)
+    not_executed_checks: List[str] = Field(default_factory=list)
     state_transitions: List[AckStateTransition] = Field(default_factory=list)
+    subagent_traces: List[AckSubAgentTrace] = Field(default_factory=list)
     action_contracts: List[ConstrainedActionContract] = Field(default_factory=list)
     oracle_evidences: List[OutOfBandOracleEvidence] = Field(default_factory=list)
     mutation_rounds: List[AckMutationRoundResult] = Field(default_factory=list)
@@ -197,3 +252,7 @@ class AckCertificationReport(BaseModel):
     fog_of_war: FogOfWarAudit
     blue_patch_or_rules_summary: str = ""
     rationale: str = ""
+    deliverable_dir: Optional[str] = None
+    deliverable_files: List[str] = Field(default_factory=list)
+    patch_diff: str = ""
+    workspace_target: Optional[AckWorkspaceTargetInfo] = None

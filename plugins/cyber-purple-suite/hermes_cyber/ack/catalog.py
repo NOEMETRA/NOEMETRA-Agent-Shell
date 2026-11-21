@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 from hermes_cyber.models import (
     AckMissionDescriptor,
     AckMutationRoundResult,
     AckStateTransition,
+    AckSubAgentTrace,
     AckTprFprMatrix,
+    AckVerificationTierType,
+    AckWorkspaceTargetInfo,
     ActionExecutionLimits,
     ConstrainedActionContract,
     OutOfBandOracleEvidence,
@@ -28,22 +31,22 @@ ACK_MISSIONS: Tuple[AckMissionDescriptor, ...] = (
         title="1. Exploit-to-Patch & Bypass Loop (AppSec / Servizio Locale)",
         target_invariant="INV_NO_READ_OUTSIDE_UPLOAD_ROOT",
         description=(
-            "Red esegue un PoC reale di path/symlink traversal contro un servizio target in upperdir CoW, "
-            "Blue applica patch canonica + contenimento, l'Oracolo verifica funzionalità e Red muta classe d'attacco."
+            "Red esegue un PoC HTTP contro un servizio Python predisposto in copia temporanea CoW, "
+            "Blue applica patch canonica, l'Oracolo verifica funzionalità e i sub-agenti Red mutano classe d'attacco."
         ),
-        default_tier="tier1_cow_arena",
+        default_tier="lab_fixture_verification",
         shadow_clone_only=False,
     ),
     AckMissionDescriptor(
         mission_id="ack-m2-detection-evasion-arena",
         mission_kind="detection_vs_evasion_arena",
-        title="2. Detection vs. Evasion Arena (Telemetria & Matrice TPR/FPR)",
+        title="2. Detection vs. Evasion Arena (Rule Engine Python & FPR)",
         target_invariant="INV_DETECT_STEALTH_TTPS_LOW_FPR",
         description=(
-            "Red esegue TTP fileless/LotL/beacon tramite workload target con tecniche di evasione progressive, "
-            "Blue distribuisce regole comportamentali out-of-band e l'Oracolo calcola TPR reale vs FPR su telemetria benigna."
+            "Red genera eventi TTP verso un workload Python locale con varianti progressive; "
+            "un rule engine JSON Python valuta TPR vs FPR su 10 eventi benigni sintetici (non eBPF kernel)."
         ),
-        default_tier="tier1_cow_arena",
+        default_tier="lab_fixture_verification",
         shadow_clone_only=False,
     ),
     AckMissionDescriptor(
@@ -52,22 +55,22 @@ ACK_MISSIONS: Tuple[AckMissionDescriptor, ...] = (
         title="3. Attack-Path Audit & Live Hardening (Shadow Clone CoW)",
         target_invariant="INV_NO_UNPRIVILEGED_ESCALATION_PATH",
         description=(
-            "Clona in sola lettura un manifest target fornito (o una fixture sintetica di riferimento se omesso) "
-            "in lowerdir -> upperdir CoW, dimostra escalation pre-patch e verifica diff minimo di hardening."
+            "Clona un manifest fornito dall'utente (o fixture sintetica se omesso) in copia di lavoro CoW, "
+            "verifica escalation via simulatore Python e produce un diff di hardening validato sintatticamente."
         ),
-        default_tier="tier1_cow_arena",
+        default_tier="lab_fixture_verification",
         shadow_clone_only=True,
     ),
     AckMissionDescriptor(
         mission_id="ack-m4-fuzz-to-fix-pipeline",
         mission_kind="fuzz_to_fix_pipeline",
-        title="4. Fuzz-to-Fix Pipeline (Binary TLV Protocol Parser)",
+        title="4. Fuzz-to-Fix Pipeline (Lab TLV o Python Parser Reale)",
         target_invariant="INV_ZERO_PARSER_CRASH_OR_OVERFLOW",
         description=(
-            "Red genera un fuzzer deterministico su frame binari TLV, minimizza il crash PoC, "
-            "Blue corregge la root cause e integra il regression corpus contro fuzzing differenziale multi-classe."
+            "In modalità Lab o Workspace (file Python reale su PC), i sub-agenti Red riproducono e minimizzano "
+            "crash reali, i sub-agenti Blue sintetizzano patch + test pytest di regressione ed esportano artefatti persistenti."
         ),
-        default_tier="tier1_cow_arena",
+        default_tier="lab_fixture_verification",
         shadow_clone_only=False,
     ),
 )
@@ -142,4 +145,17 @@ class _MissionExecutionOutcome:
     certified: bool
     certification_verdict: str
     rationale: str
-    audit_scope: Literal["synthetic_fixture_simulation", "cloned_target_manifest"] = "synthetic_fixture_simulation"
+    audit_scope: Literal[
+        "synthetic_fixture_simulation",
+        "cloned_target_manifest",
+        "workspace_target_file",
+    ] = "synthetic_fixture_simulation"
+    verification_tier: AckVerificationTierType = "lab_fixture_verification"
+    executed_checks: List[str] = field(default_factory=list)
+    not_executed_checks: List[str] = field(default_factory=list)
+    subagent_traces: List[AckSubAgentTrace] = field(default_factory=list)
+    patch_diff: str = ""
+    regression_test_code: str = ""
+    execution_logs: List[Dict[str, Any]] = field(default_factory=list)
+    repro_artifacts: Dict[str, bytes] = field(default_factory=dict)
+    workspace_target: Optional[AckWorkspaceTargetInfo] = None

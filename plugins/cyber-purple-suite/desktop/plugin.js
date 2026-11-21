@@ -395,6 +395,13 @@ function CyberPurplePage({ ctx }) {
   const [ackMissions, setAckMissions] = useState([])
   const [selectedAckMissionId, setSelectedAckMissionId] = useState('ack-m1-exploit-patch-bypass')
   const [ackDefenseMode, setAckDefenseMode] = useState('structural')
+  const [ackTargetConfig, setAckTargetConfig] = useState('')
+  const [ackTargetFilePath, setAckTargetFilePath] = useState('')
+  const [ackTargetFunction, setAckTargetFunction] = useState('')
+  const [ackValidCorpusDir, setAckValidCorpusDir] = useState('')
+  const [ackWorkspaceMode, setAckWorkspaceMode] = useState('isolated_copy')
+  const [ackConfirmApply, setAckConfirmApply] = useState(false)
+  const [ackApplyResult, setAckApplyResult] = useState(null)
   const [ackReport, setAckReport] = useState(null)
   const [activeTab, setActiveTab] = useState('clash') // 'clash' | 'replay' | 'benchmark' | 'ack'
   const [highlightedEvId, setHighlightedEvId] = useState('')
@@ -582,14 +589,26 @@ function CyberPurplePage({ ctx }) {
   const handleRunAckMission = async () => {
     if (!selectedAckMissionId || busy) return
     setBusy(true)
+    setAckConfirmApply(false)
+    setAckApplyResult(null)
     try {
+      const body = {
+        mission_id: selectedAckMissionId,
+        mutation_rounds: 3,
+        defense_mode: ackDefenseMode
+      }
+      if (selectedAckMissionId === 'ack-m3-attack-path-hardening' && ackTargetConfig.trim()) {
+        body.target_config_content = ackTargetConfig
+      }
+      if (selectedAckMissionId === 'ack-m4-fuzz-to-fix-pipeline' && ackTargetFilePath.trim()) {
+        body.target_file_path = ackTargetFilePath.trim()
+        if (ackTargetFunction.trim()) body.target_function = ackTargetFunction.trim()
+        if (ackValidCorpusDir.trim()) body.valid_corpus_dir = ackValidCorpusDir.trim()
+        body.workspace_mode = ackWorkspaceMode || 'isolated_copy'
+      }
       const rep = await ctx.rest('/ack/run', {
         method: 'POST',
-        body: {
-          mission_id: selectedAckMissionId,
-          mutation_rounds: 3,
-          defense_mode: ackDefenseMode
-        }
+        body
       })
       setAckReport(rep)
       setActiveTab('ack')
@@ -599,6 +618,35 @@ function CyberPurplePage({ ctx }) {
       })
     } catch (err) {
       host.notifyError(err, 'Errore esecuzione missione ACK')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleApplyAckPatch = async () => {
+    if (!ackReport?.run_id || !ackConfirmApply || busy) return
+    setBusy(true)
+    try {
+      const res = await ctx.rest('/ack/apply-patch', {
+        method: 'POST',
+        body: {
+          run_id: ackReport.run_id,
+          confirm_apply: true
+        }
+      })
+      setAckApplyResult(res)
+      setAckReport((prev) => prev ? {
+        ...prev,
+        workspace_target: prev.workspace_target
+          ? { ...prev.workspace_target, patch_applied: true, applied_at: res?.applied_at }
+          : prev.workspace_target
+      } : prev)
+      host.notify({
+        kind: 'info',
+        message: `Patch applicata su ${res?.target_file_path || ackReport.workspace_target?.target_file_path}`
+      })
+    } catch (err) {
+      host.notifyError(err, 'Errore applicazione patch ACK')
     } finally {
       setBusy(false)
     }
@@ -932,7 +980,58 @@ function CyberPurplePage({ ctx }) {
                               children: 'Avvia Missione ACK in Detonation Chamber'
                             })
                           ]
-                        })
+                        }),
+                        selectedAckMissionId === 'ack-m3-attack-path-hardening'
+                          ? jsxs('div', {
+                            style: { marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '4px' },
+                            children: [
+                              jsx('label', { style: { fontSize: '11.5px', fontWeight: 600 }, children: 'target_config_content (Manifest reale systemd / YAML Kubernetes opzionale clonato in CoW):' }),
+                              jsx('textarea', {
+                                className: 'cp-textarea',
+                                rows: 4,
+                                style: { width: '100%' },
+                                placeholder: 'Incolla manifest [Service] o YAML Kubernetes reale (opzionale)...',
+                                value: ackTargetConfig,
+                                onChange: (e) => setAckTargetConfig(e.target.value)
+                              })
+                            ]
+                          })
+                          : null,
+                        selectedAckMissionId === 'ack-m4-fuzz-to-fix-pipeline'
+                          ? jsxs('div', {
+                            style: { marginTop: '10px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '6px' },
+                            children: [
+                              jsx('input', {
+                                className: 'cp-input',
+                                placeholder: 'target_file_path (parser Python sul PC, es. /path/parser.py)',
+                                value: ackTargetFilePath,
+                                onChange: (e) => setAckTargetFilePath(e.target.value)
+                              }),
+                              jsx('input', {
+                                className: 'cp-input',
+                                placeholder: 'target_function (es. parse_packet)',
+                                value: ackTargetFunction,
+                                onChange: (e) => setAckTargetFunction(e.target.value)
+                              }),
+                              jsx('input', {
+                                className: 'cp-input',
+                                placeholder: 'valid_corpus_dir (dir input validi opzionale)',
+                                value: ackValidCorpusDir,
+                                onChange: (e) => setAckValidCorpusDir(e.target.value)
+                              }),
+                              jsxs('select', {
+                                className: 'cp-select',
+                                'aria-label': 'workspace_mode',
+                                value: ackWorkspaceMode,
+                                onChange: (e) => setAckWorkspaceMode(e.target.value),
+                                children: [
+                                  jsx('option', { value: 'isolated_copy', children: 'Workspace Mode: isolated_copy' }),
+                                  jsx('option', { value: 'git_worktree', children: 'Workspace Mode: git_worktree' })
+                                ]
+                              })
+                            ]
+                          })
+                          : null
                       ]
                     }),
                     ackReport
@@ -947,20 +1046,35 @@ function CyberPurplePage({ ctx }) {
                                 children: [
                                   jsx('span', { className: ackReport.certified ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red', children: ackReport.certified ? 'CERTIFIED' : 'REJECTED' }),
                                   jsx('span', { className: 'cp-badge cp-b-purple', children: ackReport.certification_verdict }),
+                                  ackReport.verification_tier ? jsx('span', { className: ackReport.verification_tier === 'workspace_target_verification' ? 'cp-badge cp-b-green' : 'cp-badge cp-b-blue', children: ackReport.verification_tier }) : null,
                                   jsx('span', { className: 'cp-badge cp-b-blue', children: `Sandbox: ${ackReport.sandbox_id}` }),
+                                  ackReport.security_boundary_level ? jsx('span', { className: 'cp-badge cp-b-amber', children: ackReport.security_boundary_level }) : null,
                                   ackReport.isolation_backend ? jsx('span', { className: 'cp-badge cp-b-purple', children: ackReport.isolation_backend }) : null,
-                                  ackReport.audit_scope ? jsx('span', { className: ackReport.audit_scope === 'cloned_target_manifest' ? 'cp-badge cp-b-green' : 'cp-badge cp-b-amber', children: ackReport.audit_scope }) : null,
+                                  ackReport.audit_scope ? jsx('span', { className: (ackReport.audit_scope === 'cloned_target_manifest' || ackReport.audit_scope === 'workspace_target_file') ? 'cp-badge cp-b-green' : 'cp-badge cp-b-amber', children: ackReport.audit_scope }) : null,
                                   ackReport.fog_of_war?.enforced ? jsx('span', { className: 'cp-badge cp-b-green', children: 'Fog of War Enforced' }) : null,
                                   ackReport.shadow_clone_only ? jsx('span', { className: 'cp-badge cp-b-amber', children: 'Shadow Clone CoW' }) : null
                                 ]
                               }),
+                              ackReport.untrusted_llm_code_warning
+                                ? jsx('div', {
+                                  style: { fontSize: '11.5px', padding: '6px 8px', borderRadius: '6px', background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', color: '#fde68a', marginBottom: '6px' },
+                                  children: ackReport.untrusted_llm_code_warning
+                                })
+                                : null,
                               jsx('div', { style: { fontWeight: 700, fontSize: '13.5px', marginBottom: '4px' }, children: ackReport.title }),
                               jsx('div', { style: { fontSize: '12px', color: 'var(--muted-foreground, #cbd5e1)', marginBottom: '6px' }, children: `Invariante: ${ackReport.target_invariant} | Blue: ${ackReport.blue_patch_or_rules_summary}` }),
                               jsxs('div', {
                                 style: { display: 'flex', gap: '8px', flexWrap: 'wrap' },
                                 children: [
                                   jsx('span', { className: 'cp-badge cp-b-green', children: `TPR: ${Math.round((ackReport.tpr_fpr_matrix?.true_positive_rate || 0) * 100)}%` }),
-                                  jsx('span', { className: (ackReport.tpr_fpr_matrix?.false_positive_rate || 0) <= 0.05 ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red', children: `FPR: ${Math.round((ackReport.tpr_fpr_matrix?.false_positive_rate || 0) * 100)}%` }),
+                                  jsx('span', {
+                                    className: ackReport.tpr_fpr_matrix?.fpr_measured
+                                      ? ((ackReport.tpr_fpr_matrix?.false_positive_rate || 0) <= 0.05 ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red')
+                                      : 'cp-badge cp-b-amber',
+                                    children: ackReport.tpr_fpr_matrix?.fpr_measured
+                                      ? `FPR: ${Math.round((ackReport.tpr_fpr_matrix?.false_positive_rate || 0) * 100)}% (n=${ackReport.tpr_fpr_matrix?.benign_corpus_size ?? 0})`
+                                      : 'FPR: N/A (non misurato)'
+                                  }),
                                   jsx('span', { className: 'cp-badge cp-b-blue', children: `Evasion Resistance: ${Math.round((ackReport.tpr_fpr_matrix?.evasion_resistance_rate || 0) * 100)}%` }),
                                   jsx('span', { className: 'cp-badge cp-b-purple', children: `Functional Survival: ${Math.round((ackReport.tpr_fpr_matrix?.functional_survival_rate || 0) * 100)}%` }),
                                   jsx('span', { className: 'cp-badge cp-b-amber', children: `Post-Patch Breaches: ${ackReport.tpr_fpr_matrix?.post_patch_breaches ?? 0}` })
@@ -968,6 +1082,96 @@ function CyberPurplePage({ ctx }) {
                               })
                             ]
                           }),
+                          jsxs('div', {
+                            className: 'cp-card',
+                            children: [
+                              jsx('div', { style: { fontWeight: 700, fontSize: '12.5px', marginBottom: '6px' }, children: 'Controlli Eseguiti vs Non Eseguiti' }),
+                              jsxs('div', { style: { fontSize: '12px', marginBottom: '4px' }, children: [jsx('strong', { children: 'Eseguiti: ' }), (ackReport.executed_checks || []).join(', ') || 'Nessuno'] }),
+                              jsxs('div', { style: { fontSize: '12px', color: 'var(--muted-foreground, #94a3b8)' }, children: [jsx('strong', { children: 'Non eseguiti: ' }), (ackReport.not_executed_checks || []).join(', ') || 'Nessuno'] })
+                            ]
+                          }),
+                          (ackReport.subagent_traces || []).length > 0
+                            ? jsxs('div', {
+                              className: 'cp-card cp-card-purple',
+                              children: [
+                                jsx('div', { style: { fontWeight: 700, fontSize: '12.5px', marginBottom: '6px' }, children: `Sub-Agent Fleet (${ackReport.subagent_traces.length} tracce Fog of War)` }),
+                                ackReport.subagent_traces.map((tr, idx) => jsxs('div', {
+                                  className: 'cp-ev',
+                                  children: [
+                                    jsx('span', { className: tr.team === 'RED' ? 'cp-badge cp-b-red' : 'cp-badge cp-b-blue', children: `${tr.team} ${tr.role}` }),
+                                    ' ',
+                                    jsx('span', { className: 'cp-badge cp-b-purple', children: tr.phase }),
+                                    ' ',
+                                    jsx('span', { className: 'cp-badge cp-b-amber', children: tr.model_used }),
+                                    ' ',
+                                    jsx('span', { style: { fontSize: '11px', color: 'var(--muted-foreground, #94a3b8)' }, children: `[keys: ${(tr.visible_context_keys || []).join(', ')}] ` }),
+                                    jsx('span', { children: tr.summary })
+                                  ]
+                                }, `${tr.team}-${tr.role}-${idx}`))
+                              ]
+                            })
+                            : null,
+                          (ackReport.deliverable_dir || ackReport.patch_diff || ackReport.workspace_target)
+                            ? jsxs('div', {
+                              className: 'cp-card',
+                              children: [
+                                jsx('div', { style: { fontWeight: 700, fontSize: '12.5px', marginBottom: '6px' }, children: 'Artefatti Persistenti (deliverable_dir) & Patch Diff' }),
+                                ackReport.deliverable_dir
+                                  ? jsxs('div', { style: { fontSize: '12px', marginBottom: '4px' }, children: [jsx('strong', { children: 'Directory: ' }), jsx('code', { children: ackReport.deliverable_dir }), ` (${(ackReport.deliverable_files || []).length} file)`] })
+                                  : null,
+                                (ackReport.deliverable_files || []).length > 0
+                                  ? jsx('div', { style: { fontSize: '11px', color: 'var(--muted-foreground, #94a3b8)', marginBottom: '6px' }, children: ackReport.deliverable_files.join(' · ') })
+                                  : null,
+                                ackReport.patch_diff
+                                  ? jsx('pre', { style: { background: '#050911', padding: '8px', borderRadius: '6px', overflowX: 'auto', fontSize: '11.5px', maxHeight: '220px' }, children: ackReport.patch_diff })
+                                  : null,
+                                ackReport.workspace_target
+                                  ? jsxs('div', {
+                                    style: { marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(148, 163, 184, 0.2)', display: 'flex', flexDirection: 'column', gap: '6px' },
+                                    children: [
+                                      jsxs('div', {
+                                        style: { fontSize: '12px' },
+                                        children: [
+                                          jsx('strong', { children: 'Workspace Target: ' }),
+                                          `${ackReport.workspace_target.target_file_path} (${ackReport.workspace_target.target_function}) · `,
+                                          `untouched=${String(ackReport.workspace_target.original_untouched)} · `,
+                                          `patch_applied=${String(ackReport.workspace_target.patch_applied)}`
+                                        ]
+                                      }),
+                                      ackReport.certified && !ackReport.workspace_target.patch_applied
+                                        ? jsxs('div', {
+                                          style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' },
+                                          children: [
+                                            jsxs('label', {
+                                              style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '12px' },
+                                              children: [
+                                                jsx('input', {
+                                                  type: 'checkbox',
+                                                  checked: ackConfirmApply,
+                                                  onChange: (e) => setAckConfirmApply(Boolean(e.target.checked))
+                                                }),
+                                                'Confermo applicazione patch sul file target originale (crea backup .orig)'
+                                              ]
+                                            }),
+                                            jsx('button', {
+                                              type: 'button',
+                                              className: 'cp-btn cp-btn-primary',
+                                              disabled: busy || !ackConfirmApply,
+                                              onClick: handleApplyAckPatch,
+                                              children: 'Applica Patch al Progetto'
+                                            })
+                                          ]
+                                        })
+                                        : null,
+                                      ackApplyResult
+                                        ? jsx('div', { style: { fontSize: '11.5px', color: '#6ee7b7' }, children: `Applicata con backup: ${ackApplyResult.backup_path}` })
+                                        : null
+                                    ]
+                                  })
+                                  : null
+                              ]
+                            })
+                            : null,
                           jsxs('div', {
                             className: 'cp-card',
                             children: [

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
+from hermes_cyber.ack.blue_subagents import record_blue_mission_traces
 from hermes_cyber.ack.catalog import (
     _MissionExecutionOutcome,
     _contract,
@@ -11,6 +12,8 @@ from hermes_cyber.ack.catalog import (
 )
 from hermes_cyber.ack.chamber import DetonationChamber
 from hermes_cyber.ack.fog_of_war import FogOfWarController
+from hermes_cyber.ack.red_subagents import record_red_mission_traces
+from hermes_cyber.ack.workspace import compute_unified_diff
 from hermes_cyber.models import (
     AckMissionDescriptor,
     AckMutationRoundResult,
@@ -22,6 +25,7 @@ from hermes_cyber.models import (
     OutOfBandOracleEvidence,
     TelemetryAlertEvidence,
 )
+from hermes_cyber.router_bridge import ModelRouter
 
 _M1_HTTP_HANDLER_TAIL = '''\
 
@@ -112,6 +116,9 @@ def _run_m1_exploit_to_patch(
     defense_mode: str,
     target_config_content: Optional[str] = None,
     inject_broken_mutation: bool = False,
+    red_router: Optional[ModelRouter] = None,
+    blue_router: Optional[ModelRouter] = None,
+    **_: Any,
 ) -> _MissionExecutionOutcome:
     del target_config_content
     transitions: List[AckStateTransition] = []
@@ -168,7 +175,7 @@ loot_path.write_text(json.dumps({"status": "COMPLETED", "attempts_executed": 1, 
         exit_code=rc,
         fs_diff=fs_base,
         net_events=[NetEventEvidence(dst=f"127.0.0.1:{base_port}", bytes_out=128, bytes_in=256)],
-        telemetry_alerts=[TelemetryAlertEvidence(rule_id="baseline_waf", engine="ebpf_sigma_yara", triggered=False)],
+        telemetry_alerts=[TelemetryAlertEvidence(rule_id="baseline_path_filter", engine="python_http_oracle", triggered=False)],
         execution_valid=base_ok,
         attempts_executed=base_attempts,
         isolation_backend=chamber.isolation_backend,
@@ -189,7 +196,7 @@ loot_path.write_text(json.dumps({"status": "COMPLETED", "attempts_executed": 1, 
     ))
 
     # BLUE_DEFEND
-    _ = fow.build_blue_context(baseline_summary="target_service.py read_upload naive os.path.join", oob_baseline=base_ev)
+    blue_ctx = fow.build_blue_context(baseline_summary="target_service.py read_upload naive os.path.join", oob_baseline=base_ev)
     if defense_mode == "naive_block_all":
         patched_src = _M1_NAIVE_BLOCK_ALL_SERVICE
         blue_summary = "naive_block_all: disabilitate tutte le letture file senza eccezioni."
@@ -199,8 +206,8 @@ loot_path.write_text(json.dumps({"status": "COMPLETED", "attempts_executed": 1, 
     else:
         patched_src = _M1_STRUCTURAL_PATCH_SERVICE
         blue_summary = (
-            "structural: decodifica iterativa, blocco `..` & null-byte, controllo symlink lungo il path, "
-            "`Path.resolve().is_relative_to(UPLOAD_ROOT)` + profilo `seccomp_contain.json`."
+            "structural: decodifica iterativa, blocco `..` & null-byte, controllo symlink lungo il path e "
+            "`Path.resolve().is_relative_to(UPLOAD_ROOT)` su copia CoW `target_service.py`."
         )
 
     rel_blue_script, _ = chamber.write_blue_artifact("apply_patch_m1.py", f'''\
@@ -208,7 +215,6 @@ import os
 from pathlib import Path
 up = Path(os.environ["ACK_UPPERDIR"])
 (up / "target_service.py").write_text({patched_src!r}, encoding="utf-8")
-(up / "seccomp_contain.json").write_text('{{"defaultAction":"SCMP_ACT_ERRNO","blocked":["symlink","symlinkat","mount"]}}', encoding="utf-8")
 ''')
     blue_contract = _contract(
         chamber=chamber,
@@ -261,48 +267,69 @@ print("FUNC_OK")
         )
         contracts.append(func_contract)
         frc, fout, _, ffs = chamber.run_contract(func_contract, extra_env={"ACK_TARGET_PORT": str(patched_port)})
+        _m1_not_executed = [
+            "linux_kernel_seccomp_or_overlayfs_sandbox",
+            "statistically_significant_benign_fpr_corpus",
+            "target_app_workspace_patch",
+        ]
+        _m1_base_checks = [
+            "http_localhost_exploit_repro_on_copied_fixture",
+            "functional_smoke_request_on_patched_service",
+            "python_subproc_confinement_and_fs_snapshot_diff",
+        ]
+        patch_diff = compute_unified_diff(_M1_VULNERABLE_SERVICE, patched_src, "target_service.py")
+
+        def _m1_traces(phase_mut: str, verify_msg: str):
+            return [
+                *record_red_mission_traces(
+                    phase_base_summary=f"M1 exploit baseline eseguito (pre_breach={pre_breach}).",
+                    phase_mut_summary=phase_mut,
+                    red_ctx=red_ctx,
+                    attack_classes=["path_traversal", "ssrf", "encoding_bypass"],
+                    router=red_router,
+                ),
+                *record_blue_mission_traces(
+                    triage_summary="Analisi difetto canonicalizzazione path e allowlist SSRF su fixture HTTP.",
+                    patch_summary=blue_summary,
+                    verify_summary=verify_msg,
+                    blue_ctx=blue_ctx,
+                    router=blue_router,
+                ),
+            ]
+
         func_ok = (frc == 0 and "FUNC_OK" in fout)
         func_verdict: AckOracleVerdictType = "DEFENSE_HELD_CLEAN" if func_ok else "DEFENSE_REJECTED_BROKEN_FUNC"
         evidences.append(OutOfBandOracleEvidence(
-            action_id=func_contract.action_id,
-            exit_code=frc,
-            fs_diff=ffs,
-            functional_suite_passed=func_ok,
-            fpr_value=0.0,
-            isolation_backend=chamber.isolation_backend,
-            oracle_verdict=func_verdict,
+            action_id=func_contract.action_id, exit_code=frc, fs_diff=ffs,
+            functional_suite_passed=func_ok, fpr_value=None,
+            isolation_backend=chamber.isolation_backend, oracle_verdict=func_verdict,
         ))
         transitions.append(AckStateTransition(
-            state="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
-            actor="ORACLE",
-            summary=f"Test funzionale servizio target: passed={func_ok} ({func_verdict}).",
-            passed=func_ok,
+            state="ORACLE_FUNCTIONAL_AND_FPR_CHECK", actor="ORACLE",
+            summary=f"Test funzionale servizio target: passed={func_ok} ({func_verdict}).", passed=func_ok,
         ))
 
         if not func_ok:
             transitions.append(AckStateTransition(
-                state="CERTIFY_REPORT",
-                actor="ORACLE",
-                summary="Certificazione respinta: la difesa ha rotto la funzionalità legittima del servizio.",
-                passed=False,
+                state="CERTIFY_REPORT", actor="ORACLE",
+                summary="Certificazione respinta: la difesa ha rotto la funzionalità legittima del servizio.", passed=False,
             ))
             return _MissionExecutionOutcome(
-                transitions=transitions,
-                contracts=contracts,
-                evidences=evidences,
-                mutation_rounds=[],
+                transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
                 tpr_fpr_matrix=AckTprFprMatrix(
-                    true_positive_rate=0.0,
-                    false_positive_rate=0.0,
-                    evasion_resistance_rate=0.0,
-                    functional_survival_rate=0.0,
-                    pre_patch_breach_confirmed=pre_breach,
-                    post_patch_breaches=0,
+                    true_positive_rate=0.0, false_positive_rate=0.0, fpr_measured=False,
+                    benign_corpus_size=0, attack_variants_tested=0, evasion_resistance_rate=0.0,
+                    functional_survival_rate=0.0, pre_patch_breach_confirmed=pre_breach, post_patch_breaches=0,
                 ),
-                blue_summary=blue_summary,
-                certified=False,
-                certification_verdict="REJECTED_BROKEN_FUNCTIONALITY",
+                blue_summary=blue_summary, certified=False, certification_verdict="REJECTED_BROKEN_FUNCTIONALITY",
                 rationale="Oracolo anti-cheat: la difesa naive ha bloccato le richieste legittime invece di correggere l'invariante.",
+                verification_tier="lab_fixture_verification", executed_checks=_m1_base_checks,
+                not_executed_checks=_m1_not_executed,
+                subagent_traces=_m1_traces(
+                    "Mutazione interrotta: difesa respinta su regressione funzionale.",
+                    "Verifica funzionale fallita: richiesta legittima bloccata.",
+                ),
+                patch_diff=patch_diff,
             )
 
         # RED_MUTATE_BYPASS (distinct attack classes forced by FogOfWarController, strictly over HTTP)
@@ -417,8 +444,8 @@ loot_path.write_text(json.dumps({{"status": "COMPLETED", "attempts_executed": le
                 net_events=[NetEventEvidence(dst=f"127.0.0.1:{patched_port}", bytes_out=160, bytes_in=128)],
                 telemetry_alerts=[
                     TelemetryAlertEvidence(
-                        rule_id="seccomp_contain",
-                        engine="seccomp_kernel",
+                        rule_id="canonical_path_guard",
+                        engine="python_path_guard",
                         triggered=bool(exec_ok and not bypassed),
                     )
                 ],
@@ -465,21 +492,21 @@ loot_path.write_text(json.dumps({{"status": "COMPLETED", "attempts_executed": le
         summary=rationale,
         passed=certified,
     ))
+    traces = _m1_traces(
+        f"M1 mutation bypass loop completato su {len(mut_results)} varianti HTTP (breach={post_breaches}, exec_errors={exec_errors}).",
+        f"Verifica post-patch su {len(mut_results)} varianti: evasion_resistance={evasion_res:.2f}, verdetto={cert_verdict}.",
+    )
     return _MissionExecutionOutcome(
-        transitions=transitions,
-        contracts=contracts,
-        evidences=evidences,
-        mutation_rounds=mut_results,
+        transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=mut_results,
         tpr_fpr_matrix=AckTprFprMatrix(
-            true_positive_rate=evasion_res,
-            false_positive_rate=0.0,
-            evasion_resistance_rate=evasion_res,
-            functional_survival_rate=1.0,
-            pre_patch_breach_confirmed=pre_breach,
+            true_positive_rate=evasion_res, false_positive_rate=0.0, fpr_measured=False,
+            benign_corpus_size=0, attack_variants_tested=len(mut_results), evasion_resistance_rate=evasion_res,
+            functional_survival_rate=1.0, pre_patch_breach_confirmed=pre_breach,
             post_patch_breaches=post_breaches + exec_errors,
         ),
-        blue_summary=blue_summary,
-        certified=certified,
-        certification_verdict=cert_verdict,
-        rationale=rationale,
+        blue_summary=blue_summary, certified=certified, certification_verdict=cert_verdict, rationale=rationale,
+        verification_tier="lab_fixture_verification",
+        executed_checks=[*_m1_base_checks, "http_bypass_mutation_loop_on_patched_service"],
+        not_executed_checks=_m1_not_executed,
+        subagent_traces=traces, patch_diff=patch_diff,
     )

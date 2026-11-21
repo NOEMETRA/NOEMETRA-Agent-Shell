@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
+from hermes_cyber.ack.blue_subagents import record_blue_mission_traces
 from hermes_cyber.ack.catalog import (
     _MissionExecutionOutcome,
     _contract,
@@ -15,6 +16,8 @@ from hermes_cyber.ack.chamber import DetonationChamber
 from hermes_cyber.ack.fog_of_war import FogOfWarController
 from hermes_cyber.ack.manifest_parser import _parse_target_host_config
 from hermes_cyber.ack.manifest_patcher import _harden_manifest_text, _validate_hardened_manifest_syntax
+from hermes_cyber.ack.red_subagents import record_red_mission_traces
+from hermes_cyber.ack.workspace import compute_unified_diff
 from hermes_cyber.ack.yaml_compat import _yaml_safe_dump_compat, _yaml_safe_load_compat
 from hermes_cyber.models import (
     AckMissionDescriptor,
@@ -27,6 +30,7 @@ from hermes_cyber.models import (
     OutOfBandOracleEvidence,
     TelemetryAlertEvidence,
 )
+from hermes_cyber.router_bridge import ModelRouter
 
 _M3_DEFAULT_SYNTHETIC_MANIFEST = """\
 [Unit]
@@ -102,11 +106,20 @@ def _run_m3_attack_path_hardening(
     defense_mode: str,
     target_config_content: Optional[str] = None,
     inject_broken_mutation: bool = False,
+    red_router: Optional[ModelRouter] = None,
+    blue_router: Optional[ModelRouter] = None,
+    **_: Any,
 ) -> _MissionExecutionOutcome:
     transitions: List[AckStateTransition] = []
     contracts: List[ConstrainedActionContract] = []
     evidences: List[OutOfBandOracleEvidence] = []
     mut_results: List[AckMutationRoundResult] = []
+    _m3_not_executed = [
+        "systemd_or_k8s_live_runtime_check",
+        "linux_kernel_seccomp_or_overlayfs_sandbox",
+        "statistically_significant_benign_fpr_corpus",
+        "target_host_live_apply",
+    ]
 
     has_real_manifest = bool(target_config_content and target_config_content.strip())
     audit_scope: Literal["synthetic_fixture_simulation", "cloned_target_manifest"] = (
@@ -137,34 +150,27 @@ def _run_m3_attack_path_hardening(
         passed=bool(baseline_cfg["format_valid"]),
     ))
 
+    ver_tier = "workspace_target_verification" if has_real_manifest else "lab_fixture_verification"
     if not baseline_cfg["format_valid"]:
         transitions.append(AckStateTransition(
-            state="CERTIFY_REPORT",
-            actor="ORACLE",
-            summary=f"Manifest rifiutato: sintassi `{baseline_cfg['format']}` non valida o formato misto.",
-            passed=False,
+            state="CERTIFY_REPORT", actor="ORACLE",
+            summary=f"Manifest rifiutato: sintassi `{baseline_cfg['format']}` non valida o formato misto.", passed=False,
         ))
         return _MissionExecutionOutcome(
-            transitions=transitions,
-            contracts=contracts,
-            evidences=evidences,
-            mutation_rounds=[],
+            transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
             tpr_fpr_matrix=AckTprFprMatrix(
-                true_positive_rate=0.0,
-                false_positive_rate=0.0,
-                evasion_resistance_rate=0.0,
-                functional_survival_rate=0.0,
-                pre_patch_breach_confirmed=False,
-                post_patch_breaches=0,
+                true_positive_rate=0.0, false_positive_rate=0.0, fpr_measured=False,
+                benign_corpus_size=0, attack_variants_tested=0, evasion_resistance_rate=0.0,
+                functional_survival_rate=0.0, pre_patch_breach_confirmed=False, post_patch_breaches=0,
             ),
             blue_summary="Nessuna patch applicata: manifest non valido.",
-            certified=False,
-            certification_verdict="INVALID_MANIFEST_FORMAT",
+            certified=False, certification_verdict="INVALID_MANIFEST_FORMAT",
             rationale="Il manifest fornito ha formato misto o sintassi non valida e non può essere certificato.",
-            audit_scope=audit_scope,
+            audit_scope=audit_scope, verification_tier=ver_tier,
+            executed_checks=["manifest_syntax_validation"], not_executed_checks=_m3_not_executed,
         )
 
-    _ = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="http://127.0.0.1:PORT/cloned_target_manifest")
+    red_ctx = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="http://127.0.0.1:PORT/cloned_target_manifest")
     rel_base, _ = chamber.write_red_artifact("privesc_m3_base.py", '''\
 import http.client, json, os
 from pathlib import Path
@@ -226,32 +232,31 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
 
     if not pre_breach:
         transitions.append(AckStateTransition(
-            state="CERTIFY_REPORT",
-            actor="ORACLE",
-            summary="Nessuna catena privesc riprodotta pre-patch sul manifest fornito.",
-            passed=False,
+            state="CERTIFY_REPORT", actor="ORACLE",
+            summary="Nessuna catena privesc riprodotta pre-patch sul manifest fornito.", passed=False,
         ))
         return _MissionExecutionOutcome(
-            transitions=transitions,
-            contracts=contracts,
-            evidences=evidences,
-            mutation_rounds=[],
+            transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
             tpr_fpr_matrix=AckTprFprMatrix(
-                true_positive_rate=0.0,
-                false_positive_rate=0.0,
-                evasion_resistance_rate=0.0,
-                functional_survival_rate=1.0,
-                pre_patch_breach_confirmed=False,
-                post_patch_breaches=0,
+                true_positive_rate=0.0, false_positive_rate=0.0, fpr_measured=False,
+                benign_corpus_size=0, attack_variants_tested=0, evasion_resistance_rate=0.0,
+                functional_survival_rate=1.0, pre_patch_breach_confirmed=False, post_patch_breaches=0,
             ),
             blue_summary="Nessun diff necessario: il manifest clonato non esponeva vettori di escalation attivi pre-patch.",
             certified=False,
             certification_verdict="NO_BASELINE_PRIVESC_IN_CLONED_MANIFEST" if has_real_manifest else "NO_BASELINE_PRIVESC_FOUND",
             rationale="ORACLE_BASELINE_CHECK non ha rilevato escalation pre-patch: impossibile certificare un loop Exploit-to-Patch su superficie già chiusa o manifest non vulnerabile.",
-            audit_scope=audit_scope,
+            audit_scope=audit_scope, verification_tier=ver_tier,
+            executed_checks=["manifest_syntax_validation", "python_manifest_policy_simulator_baseline_probe", "python_subproc_confinement_and_fs_snapshot_diff"],
+            not_executed_checks=_m3_not_executed,
+            subagent_traces=record_red_mission_traces(
+                phase_base_summary=f"M3 probe privesc baseline completata (pre_breach=False, scope={audit_scope}).",
+                phase_mut_summary="Mutazione non avviata: nessun vettore privesc attivo nel manifest baseline.",
+                red_ctx=red_ctx, attack_classes=["helper_hijack", "ambient_caps", "unix_socket_ctl"], router=red_router,
+            ),
         )
 
-    _ = fow.build_blue_context(baseline_summary=json.dumps(baseline_cfg), oob_baseline=base_ev)
+    blue_ctx = fow.build_blue_context(baseline_summary=json.dumps(baseline_cfg), oob_baseline=base_ev)
     if defense_mode == "naive_block_all":
         blue_summary = f"naive_block_all ({baseline_cfg['format']}): disattivato il servizio nel manifest clonato."
     else:
@@ -295,6 +300,22 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
     brc, _, _, bfs = chamber.run_contract(blue_contract)
     manifest_modified = "cloned_target_manifest.conf" in bfs.modified
     post_manifest_text = (chamber.upperdir / "cloned_target_manifest.conf").read_text(encoding="utf-8")
+    patch_diff = compute_unified_diff(manifest_text, post_manifest_text, "cloned_target_manifest.conf")
+
+    def _m3_traces(phase_mut: str, verify_msg: str):
+        return [
+            *record_red_mission_traces(
+                phase_base_summary=f"M3 probe privesc baseline (pre_breach={pre_breach}, scope={audit_scope}).",
+                phase_mut_summary=phase_mut,
+                red_ctx=red_ctx,
+                attack_classes=["helper_hijack", "ambient_caps", "unix_socket_ctl"],
+                router=red_router,
+            ),
+            *record_blue_mission_traces(
+                triage_summary=f"Analisi configurazione `{baseline_cfg['format']}` per privilegi helper/capabilities/socket.",
+                patch_summary=blue_summary, verify_summary=verify_msg, blue_ctx=blue_ctx, router=blue_router,
+            ),
+        ]
     post_cfg = _parse_target_host_config(post_manifest_text)
     post_syntax_ok = _validate_hardened_manifest_syntax(
         post_manifest_text,
@@ -355,17 +376,12 @@ print("SERVICE_HEALTHY_200", end="")
         func_ok = (frc == 0 and "SERVICE_HEALTHY_200" in fout)
         func_verdict: AckOracleVerdictType = "DEFENSE_HELD_CLEAN" if func_ok else "DEFENSE_REJECTED_BROKEN_FUNC"
         evidences.append(OutOfBandOracleEvidence(
-            action_id=func_contract.action_id,
-            exit_code=frc,
-            fs_diff=ffs,
-            functional_suite_passed=func_ok,
-            fpr_value=0.0,
-            isolation_backend=chamber.isolation_backend,
-            oracle_verdict=func_verdict,
+            action_id=func_contract.action_id, exit_code=frc, fs_diff=ffs,
+            functional_suite_passed=func_ok, fpr_value=None,
+            isolation_backend=chamber.isolation_backend, oracle_verdict=func_verdict,
         ))
         transitions.append(AckStateTransition(
-            state="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
-            actor="ORACLE",
+            state="ORACLE_FUNCTIONAL_AND_FPR_CHECK", actor="ORACLE",
             summary=(
                 f"Check operativo servizio post-hardening: passed={func_ok} ({func_verdict}); "
                 f"format={baseline_cfg['format']} valid={post_syntax_ok}, modified={manifest_modified}, hardened={post_manifest_hardened}."
@@ -375,23 +391,19 @@ print("SERVICE_HEALTHY_200", end="")
         if not func_ok:
             transitions.append(AckStateTransition(state="CERTIFY_REPORT", actor="ORACLE", summary="Respinto: hardening ha fermato il servizio.", passed=False))
             return _MissionExecutionOutcome(
-                transitions=transitions,
-                contracts=contracts,
-                evidences=evidences,
-                mutation_rounds=[],
+                transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
                 tpr_fpr_matrix=AckTprFprMatrix(
-                    true_positive_rate=0.0,
-                    false_positive_rate=0.0,
-                    evasion_resistance_rate=0.0,
-                    functional_survival_rate=0.0,
-                    pre_patch_breach_confirmed=pre_breach,
-                    post_patch_breaches=0,
+                    true_positive_rate=0.0, false_positive_rate=0.0, fpr_measured=False,
+                    benign_corpus_size=0, attack_variants_tested=0, evasion_resistance_rate=0.0,
+                    functional_survival_rate=0.0, pre_patch_breach_confirmed=pre_breach, post_patch_breaches=0,
                 ),
-                blue_summary=blue_summary,
-                certified=False,
-                certification_verdict="REJECTED_SERVICE_OUTAGE",
+                blue_summary=blue_summary, certified=False, certification_verdict="REJECTED_SERVICE_OUTAGE",
                 rationale="Hardening ha disabilitato il servizio invece di correggere i privilegi.",
-                audit_scope=audit_scope,
+                audit_scope=audit_scope, verification_tier=ver_tier,
+                executed_checks=["manifest_syntax_validation", "python_manifest_policy_simulator_baseline_probe", "manifest_diff_and_healthcheck", "python_subproc_confinement_and_fs_snapshot_diff"],
+                not_executed_checks=_m3_not_executed,
+                subagent_traces=_m3_traces("Mutazione interrotta: outage servizio post-hardening.", "Healthcheck fallito: servizio non attivo."),
+                patch_diff=patch_diff,
             )
 
         vectors = [
@@ -451,7 +463,7 @@ out = body.get("output") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}
                 exit_code=mrc,
                 fs_diff=mfs,
                 net_events=[NetEventEvidence(dst=f"127.0.0.1:{m3_hard_port}", bytes_out=96, bytes_in=96)],
-                telemetry_alerts=[TelemetryAlertEvidence(rule_id="systemd_hardening", engine="host_cow_audit", triggered=bool(exec_ok and not bypassed))],
+                telemetry_alerts=[TelemetryAlertEvidence(rule_id="manifest_hardening_policy", engine="python_manifest_policy_simulator", triggered=bool(exec_ok and not bypassed))],
                 execution_valid=exec_ok,
                 attempts_executed=attempts_n,
                 isolation_backend=chamber.isolation_backend,
@@ -509,21 +521,20 @@ out = body.get("output") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}
         passed=certified,
     ))
     return _MissionExecutionOutcome(
-        transitions=transitions,
-        contracts=contracts,
-        evidences=evidences,
-        mutation_rounds=mut_results,
+        transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=mut_results,
         tpr_fpr_matrix=AckTprFprMatrix(
-            true_positive_rate=evasion_res,
-            false_positive_rate=0.0,
-            evasion_resistance_rate=evasion_res,
-            functional_survival_rate=1.0,
-            pre_patch_breach_confirmed=pre_breach,
+            true_positive_rate=evasion_res, false_positive_rate=0.0, fpr_measured=False,
+            benign_corpus_size=0, attack_variants_tested=rounds_to_run, evasion_resistance_rate=evasion_res,
+            functional_survival_rate=1.0, pre_patch_breach_confirmed=pre_breach,
             post_patch_breaches=post_breaches + exec_errors,
         ),
-        blue_summary=blue_summary,
-        certified=certified,
-        certification_verdict=cert_verdict,
-        rationale=rationale,
-        audit_scope=audit_scope,
+        blue_summary=blue_summary, certified=certified, certification_verdict=cert_verdict,
+        rationale=rationale, audit_scope=audit_scope, verification_tier=ver_tier,
+        executed_checks=["manifest_syntax_validation", "python_manifest_policy_simulator_baseline_probe", "manifest_diff_and_healthcheck", "privesc_vector_simulation_rounds", "python_subproc_confinement_and_fs_snapshot_diff"],
+        not_executed_checks=_m3_not_executed,
+        subagent_traces=_m3_traces(
+            f"Testati {rounds_to_run} vettori privesc simulati (bypass={post_breaches}, errors={exec_errors}).",
+            f"Hardening verificato sul simulatore: verdetto={cert_verdict}, evasion_resistance={evasion_res:.2f}.",
+        ),
+        patch_diff=patch_diff,
     )

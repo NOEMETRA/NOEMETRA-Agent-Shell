@@ -538,6 +538,11 @@ def test_hermes_cyber_modular_architecture_no_monoliths():
         "hermes_cyber.ack.mission_m2_evasion",
         "hermes_cyber.ack.mission_m3_hardening",
         "hermes_cyber.ack.mission_m4_fuzzing",
+        "hermes_cyber.ack.mission_m4_templates",
+        "hermes_cyber.ack.workspace",
+        "hermes_cyber.ack.deliverables",
+        "hermes_cyber.ack.red_subagents",
+        "hermes_cyber.ack.blue_subagents",
         "hermes_cyber.ack.kernel",
     ):
         assert importlib.import_module(mod_name) is not None

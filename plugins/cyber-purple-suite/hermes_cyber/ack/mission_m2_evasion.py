@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+from hermes_cyber.ack.blue_subagents import record_blue_mission_traces
 from hermes_cyber.ack.catalog import (
     _MissionExecutionOutcome,
     _contract,
@@ -12,6 +13,8 @@ from hermes_cyber.ack.catalog import (
 )
 from hermes_cyber.ack.chamber import DetonationChamber
 from hermes_cyber.ack.fog_of_war import FogOfWarController
+from hermes_cyber.ack.red_subagents import record_red_mission_traces
+from hermes_cyber.ack.workspace import compute_unified_diff
 from hermes_cyber.models import (
     AckMissionDescriptor,
     AckMutationRoundResult,
@@ -23,6 +26,7 @@ from hermes_cyber.models import (
     OutOfBandOracleEvidence,
     TelemetryAlertEvidence,
 )
+from hermes_cyber.router_bridge import ModelRouter
 
 _M2_TARGET_WORKLOAD = '''\
 import json
@@ -46,7 +50,7 @@ def handle_request(payload: dict) -> tuple:
 _M2_BASELINE_RULES = {
     "mode": "baseline",
     "rules": [
-        {"rule_id": "naive_bash_devtcp", "engine": "static_sig", "patterns": ["bash -i >& /dev/tcp/"], "excludes": []}
+        {"rule_id": "naive_bash_devtcp", "engine": "python_json_rule_engine", "patterns": ["bash -i >& /dev/tcp/"], "excludes": []}
     ],
 }
 
@@ -54,20 +58,20 @@ _M2_STRUCTURAL_RULES = {
     "mode": "structural",
     "rules": [
         {
-            "rule_id": "blue_ebpf_memfd_exec",
-            "engine": "ebpf_syscall",
+            "rule_id": "blue_rule_memfd_exec",
+            "engine": "python_json_rule_engine",
             "patterns": ["memfd_create", "/proc/self/fd/", "execveat("],
             "excludes": ["signed_package_manager=true", "benign=true"],
         },
         {
             "rule_id": "blue_lotl_lineage_obf",
-            "engine": "auditd_lineage",
+            "engine": "python_json_rule_engine",
             "patterns": ["parent=python3 child=sh", "${IFS}", "LD_PRELOAD=", "base64 -d"],
             "excludes": ["pytest_worker=true", "benign=true"],
         },
         {
-            "rule_id": "blue_ebpf_egress_entropy",
-            "engine": "net_veth_ebpf",
+            "rule_id": "blue_egress_entropy_beacon",
+            "engine": "python_json_rule_engine",
             "patterns": ["qtype=TXT", "beacon_jitter="],
             "min_entropy": 4.2,
             "excludes": ["ntp.ubuntu.com", "healthcheck=200 ok", "proc=postfix", "proc=certbot", "benign=true"],
@@ -77,7 +81,7 @@ _M2_STRUCTURAL_RULES = {
 
 _M2_OVERBROAD_RULES = {
     "mode": "overbroad_alert_all",
-    "rules": [{"rule_id": "ban_all_wildcard", "engine": "naive_wildcard", "patterns": [""], "excludes": []}],
+    "rules": [{"rule_id": "ban_all_wildcard", "engine": "python_json_rule_engine", "patterns": [""], "excludes": []}],
 }
 
 _M2_DETECTOR_ENGINE = '''\
@@ -138,6 +142,9 @@ def _run_m2_detection_evasion(
     defense_mode: str,
     target_config_content: Optional[str] = None,
     inject_broken_mutation: bool = False,
+    red_router: Optional[ModelRouter] = None,
+    blue_router: Optional[ModelRouter] = None,
+    **_: Any,
 ) -> _MissionExecutionOutcome:
     del target_config_content
     transitions: List[AckStateTransition] = []
@@ -175,7 +182,7 @@ def _run_m2_detection_evasion(
         return json.loads(eval_out)
 
     # RED_WEAPONIZE + ORACLE_BASELINE_CHECK over isolated TARGET loopback HTTP boundary
-    _ = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="http://127.0.0.1:PORT/telemetry_workload")
+    red_ctx = fow.build_red_context(target_invariant=desc.target_invariant, attack_surface="http://127.0.0.1:PORT/telemetry_workload")
     base_ttp_code = '''\
 import http.client, json, os
 from pathlib import Path
@@ -218,7 +225,7 @@ res = json.loads(resp.read().decode("utf-8"))
         exit_code=rc,
         fs_diff=fs_base,
         telemetry_alerts=[
-            TelemetryAlertEvidence(rule_id="naive_bash_devtcp", engine="static_sig", triggered=base_triggered)
+            TelemetryAlertEvidence(rule_id="naive_bash_devtcp", engine="python_json_rule_engine", triggered=base_triggered)
         ],
         execution_valid=base_ok,
         attempts_executed=base_attempts,
@@ -241,7 +248,7 @@ res = json.loads(resp.read().decode("utf-8"))
     ))
 
     # BLUE_DEFEND
-    _ = fow.build_blue_context(baseline_summary="naive_bash_devtcp missed memfd_create", oob_baseline=base_ev)
+    blue_ctx = fow.build_blue_context(baseline_summary="naive_bash_devtcp missed memfd_create", oob_baseline=base_ev)
     if defense_mode == "overbroad_alert_all":
         chosen_rules = _M2_OVERBROAD_RULES
         blue_summary = "overbroad_alert_all: regola wildcard che genera allarme su qualsiasi evento."
@@ -331,30 +338,64 @@ fpr = fps / max(1, len(benign))
         passed=fpr_ok,
     ))
 
+    _m2_not_executed = [
+        "live_ebpf_or_auditd_kernel_telemetry_capture",
+        "real_fileless_memfd_exec_detonation",
+        "production_endpoint_telemetry_replay",
+    ]
+    _m2_base_checks = [
+        "python_json_rule_engine_against_synthetic_events",
+        "benign_corpus_fpr_evaluation",
+        "python_subproc_confinement_and_fs_snapshot_diff",
+    ]
+    patch_diff = compute_unified_diff(
+        json.dumps(_M2_BASELINE_RULES, indent=2),
+        json.dumps(chosen_rules, indent=2),
+        "blue_rules.json",
+    )
+
+    def _m2_traces(phase_mut: str, verify_msg: str):
+        return [
+            *record_red_mission_traces(
+                phase_base_summary=f"M2 baseline event replay completato (pre_breach={pre_breach}).",
+                phase_mut_summary=phase_mut,
+                red_ctx=red_ctx,
+                attack_classes=["cli_arg_spoofing", "fileless_memfd", "jitter_dns_beacon"],
+                router=red_router,
+            ),
+            *record_blue_mission_traces(
+                triage_summary="Analisi copertura regole JSON su telemetria sintetica ed esclusioni benigne.",
+                patch_summary=blue_summary,
+                verify_summary=verify_msg,
+                blue_ctx=blue_ctx,
+                router=blue_router,
+            ),
+        ]
+
     if not fpr_ok:
         transitions.append(AckStateTransition(
-            state="CERTIFY_REPORT",
-            actor="ORACLE",
+            state="CERTIFY_REPORT", actor="ORACLE",
             summary=f"Certificazione respinta: FPR={fpr_val:.3f} supera soglia massima 0.050 (regola ban-all).",
             passed=False,
         ))
         return _MissionExecutionOutcome(
-            transitions=transitions,
-            contracts=contracts,
-            evidences=evidences,
-            mutation_rounds=[],
+            transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
             tpr_fpr_matrix=AckTprFprMatrix(
-                true_positive_rate=0.0,
-                false_positive_rate=fpr_val,
-                evasion_resistance_rate=0.0,
-                functional_survival_rate=0.0,
-                pre_patch_breach_confirmed=pre_breach,
-                post_patch_breaches=0,
+                true_positive_rate=0.0, false_positive_rate=fpr_val, fpr_measured=True,
+                benign_corpus_size=len(_M2_BENIGN_CORPUS), attack_variants_tested=0,
+                evasion_resistance_rate=0.0, functional_survival_rate=0.0,
+                pre_patch_breach_confirmed=pre_breach, post_patch_breaches=0,
             ),
-            blue_summary=blue_summary,
-            certified=False,
+            blue_summary=blue_summary, certified=False,
             certification_verdict="REJECTED_HIGH_FALSE_POSITIVE_RATE",
             rationale="Oracolo anti-cheat: la regola wildcard genera falsi positivi continui sulla telemetria benigna dell'host.",
+            verification_tier="lab_fixture_verification", executed_checks=_m2_base_checks,
+            not_executed_checks=_m2_not_executed,
+            subagent_traces=_m2_traces(
+                "Mutazione non avviata: regole respinte per FPR elevato sul corpus benigno.",
+                f"Check FPR respinto ({fpr_val:.3f} > 0.050) su {len(_M2_BENIGN_CORPUS)} eventi benigni.",
+            ),
+            patch_diff=patch_diff,
         )
 
     # RED_MUTATE_BYPASS (3 distinct evasion attack classes)
@@ -436,7 +477,7 @@ res = json.loads(resp.read().decode("utf-8"))
                 telemetry_alerts=[
                     TelemetryAlertEvidence(
                         rule_id=rule_str,
-                        engine="ebpf_sigma_yara",
+                        engine="python_json_rule_engine",
                         triggered=triggered,
                         matched_pattern=atk_class if triggered else "",
                     )
@@ -484,20 +525,20 @@ res = json.loads(resp.read().decode("utf-8"))
         passed=certified,
     ))
     return _MissionExecutionOutcome(
-        transitions=transitions,
-        contracts=contracts,
-        evidences=evidences,
-        mutation_rounds=mut_results,
+        transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=mut_results,
         tpr_fpr_matrix=AckTprFprMatrix(
-            true_positive_rate=tpr,
-            false_positive_rate=fpr_val,
-            evasion_resistance_rate=tpr,
-            functional_survival_rate=1.0,
-            pre_patch_breach_confirmed=pre_breach,
-            post_patch_breaches=stealth_cnt + exec_errors,
+            true_positive_rate=tpr, false_positive_rate=fpr_val, fpr_measured=True,
+            benign_corpus_size=len(_M2_BENIGN_CORPUS), attack_variants_tested=rounds_to_run,
+            evasion_resistance_rate=tpr, functional_survival_rate=1.0,
+            pre_patch_breach_confirmed=pre_breach, post_patch_breaches=stealth_cnt + exec_errors,
         ),
-        blue_summary=blue_summary,
-        certified=certified,
-        certification_verdict=cert_verdict,
-        rationale=rationale,
+        blue_summary=blue_summary, certified=certified, certification_verdict=cert_verdict, rationale=rationale,
+        verification_tier="lab_fixture_verification",
+        executed_checks=[*_m2_base_checks, "evasion_mutation_loop_against_blue_rules"],
+        not_executed_checks=_m2_not_executed,
+        subagent_traces=_m2_traces(
+            f"Evaluate {rounds_to_run} varianti di evasione sintetiche (stealth={stealth_cnt}, errors={exec_errors}).",
+            f"Matrice empirica su corpus sintetico: TPR={tpr:.2f}, FPR={fpr_val:.3f} (n={len(_M2_BENIGN_CORPUS)}).",
+        ),
+        patch_diff=patch_diff,
     )

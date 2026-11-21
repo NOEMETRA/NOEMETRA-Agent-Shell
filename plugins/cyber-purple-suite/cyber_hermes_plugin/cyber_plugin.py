@@ -81,14 +81,43 @@ def cyber_run_ack_mission(args: Any = None, **kwargs) -> str:
     mutation_rounds = int(_extract_arg(args, kwargs, "mutation_rounds", 3) or 3)
     defense_mode = str(_extract_arg(args, kwargs, "defense_mode", "structural") or "structural")
     target_config = _extract_arg(args, kwargs, "target_config_content", None)
+    target_file_path = _extract_arg(args, kwargs, "target_file_path", None)
+    target_function = _extract_arg(args, kwargs, "target_function", None)
+    valid_corpus_dir = _extract_arg(args, kwargs, "valid_corpus_dir", None)
+    raw_valid_inputs = _extract_arg(args, kwargs, "valid_inputs", None)
+    valid_inputs = list(raw_valid_inputs) if isinstance(raw_valid_inputs, list) else None
+    workspace_mode = str(_extract_arg(args, kwargs, "workspace_mode", "isolated_copy") or "isolated_copy")
     try:
         report = _get_cyber_assistant().run_ack_mission(
             mission_id=mission_id,
             mutation_rounds=mutation_rounds,
             defense_mode=defense_mode,
             target_config_content=str(target_config) if target_config is not None else None,
+            target_file_path=str(target_file_path) if target_file_path is not None else None,
+            target_function=str(target_function) if target_function is not None else None,
+            valid_corpus_dir=str(valid_corpus_dir) if valid_corpus_dir is not None else None,
+            valid_inputs=valid_inputs,
+            workspace_mode=workspace_mode,  # type: ignore[arg-type]
         )
         return json.dumps(report.model_dump(mode="json"), indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def cyber_apply_ack_patch(args: Any = None, **kwargs) -> str:
+    """Applica esplicitamente una patch certificata ACK sul file target originale dopo conferma e check SHA-256."""
+    run_id = str(_extract_arg(args, kwargs, "run_id", "") or "").strip()
+    confirm_raw = _extract_arg(args, kwargs, "confirm_apply", False)
+    confirm_apply = (
+        confirm_raw
+        if isinstance(confirm_raw, bool)
+        else str(confirm_raw).strip().lower() in ("true", "1", "yes")
+    )
+    if not run_id:
+        return json.dumps({"error": "Parametro 'run_id' obbligatorio."})
+    try:
+        result = _get_cyber_assistant().apply_ack_patch(run_id, confirm_apply=confirm_apply)
+        return json.dumps(result, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
@@ -189,8 +218,46 @@ TOOLS = [
                         "type": "string",
                         "description": "Manifest/config reale opzionale clonato in lowerdir per ack-m3-attack-path-hardening",
                     },
+                    "target_file_path": {
+                        "type": "string",
+                        "description": "Percorso file parser Python reale sul PC per ack-m4-fuzz-to-fix-pipeline (Workspace Mode)",
+                    },
+                    "target_function": {
+                        "type": "string",
+                        "description": "Nome funzione parser target in Workspace Mode (es. parse_packet)",
+                    },
+                    "valid_corpus_dir": {
+                        "type": "string",
+                        "description": "Directory opzionale di input validi per baseline e regression test in Workspace Mode",
+                    },
+                    "valid_inputs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Lista opzionale di input validi inline per Workspace Mode",
+                    },
+                    "workspace_mode": {
+                        "type": "string",
+                        "description": "isolated_copy | git_worktree",
+                    },
                 },
                 "required": ["mission_id"],
+            },
+        },
+    },
+    {
+        "name": "cyber_apply_ack_patch",
+        "description": "Applica su disco una patch certificata da ack-m4-fuzz-to-fix-pipeline solo con conferma esplicita e verifica drift SHA-256.",
+        "handler": cyber_apply_ack_patch,
+        "schema": {
+            "name": "cyber_apply_ack_patch",
+            "description": "Applica patch certificata ACK sul file target originale previa conferma e backup .orig.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string", "description": "ID della run ACK salvata in NOEMETRA/runs/<run_id>"},
+                    "confirm_apply": {"type": "boolean", "description": "Deve essere true per autorizzare la scrittura sul file originale"},
+                },
+                "required": ["run_id", "confirm_apply"],
             },
         },
     },

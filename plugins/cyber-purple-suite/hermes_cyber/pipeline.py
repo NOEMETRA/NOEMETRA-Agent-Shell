@@ -384,20 +384,57 @@ class CyberPurpleAssistant:
         mutation_rounds: int = 3,
         defense_mode: str = "structural",
         target_config_content: Optional[str] = None,
+        target_file_path: Optional[str] = None,
+        target_function: Optional[str] = None,
+        valid_corpus_dir: Optional[str] = None,
+        valid_inputs: Optional[List[str]] = None,
+        workspace_mode: Literal["isolated_copy", "git_worktree"] = "isolated_copy",
     ) -> AckCertificationReport:
-        """Execute an isolated CoW DetonationChamber ACK mission and store the latest certified report."""
+        """Execute an isolated CoW DetonationChamber ACK mission and export persistent deliverables."""
         self._check_profile_storage_live()
+        runs_dir = self.storage_dir / "NOEMETRA" / "runs"
         report = self.ack_kernel.run_mission(
             mission_id,
             mutation_rounds=mutation_rounds,
             defense_mode=defense_mode,
             target_config_content=target_config_content,
+            target_file_path=target_file_path,
+            target_function=target_function,
+            valid_corpus_dir=valid_corpus_dir,
+            valid_inputs=valid_inputs,
+            workspace_mode=workspace_mode,
+            red_router=self.red_router if self.use_llm else None,
+            blue_router=self.blue_router if self.use_llm else None,
+            runs_dir=runs_dir,
         )
         self._last_ack_report = report
         return report
 
+    def list_ack_runs(self) -> List[Dict[str, Any]]:
+        """List persisted ACK deliverable run manifests inside the active profile."""
+        self._check_profile_storage_live()
+        return self.ack_kernel.list_runs(runs_dir=self.storage_dir / "NOEMETRA" / "runs")
+
+    def apply_ack_patch(self, run_id: str, *, confirm_apply: bool = False) -> Dict[str, Any]:
+        """Explicitly apply a verified ACK workspace patch after user confirmation and drift checks."""
+        self._check_profile_storage_live()
+        result = self.ack_kernel.apply_patch(
+            run_id,
+            confirm_apply=confirm_apply,
+            runs_dir=self.storage_dir / "NOEMETRA" / "runs",
+        )
+        if (
+            self._last_ack_report is not None
+            and self._last_ack_report.run_id == run_id
+            and self._last_ack_report.workspace_target is not None
+        ):
+            self._last_ack_report.workspace_target.patch_applied = True
+            self._last_ack_report.workspace_target.applied_at = result.get("applied_at")
+        return result
+
     def get_status(self) -> Dict[str, Any]:
         active = self._cases.get(self._active_case_id) if self._active_case_id else None
+        runs_dir = self.storage_dir / "NOEMETRA" / "runs"
         return {
             "status": "ready",
             "profile": self.profile,
@@ -416,6 +453,7 @@ class CyberPurpleAssistant:
             "last_benchmark": self._last_benchmark.model_dump(mode="json") if self._last_benchmark else None,
             "ack_missions": [m.model_dump(mode="json") for m in self.list_ack_missions()],
             "last_ack_report": self._last_ack_report.model_dump(mode="json") if self._last_ack_report else None,
+            "ack_runs": self.ack_kernel.list_runs(runs_dir=runs_dir),
         }
 
 

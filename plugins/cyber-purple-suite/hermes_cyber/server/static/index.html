@@ -60,7 +60,7 @@
       </div>
       <div class="stage-card" style="margin-bottom:10px;">
         <strong>ACK Detonation Arena (4 Missioni CoW)</strong>
-        <select id="ackMissionSelect" style="width:100%;margin:6px 0;">
+        <select id="ackMissionSelect" onchange="toggleAckMissionInputs()" style="width:100%;margin:6px 0;">
           <option value="ack-m1-exploit-patch-bypass">1. Exploit-to-Patch &amp; Bypass Loop</option>
           <option value="ack-m2-detection-evasion-arena">2. Detection vs. Evasion Arena</option>
           <option value="ack-m3-attack-path-hardening">3. Attack-Path Audit &amp; Live Hardening</option>
@@ -72,6 +72,18 @@
           <option value="naive_block_all">Anti-Cheat: Naive Block-All</option>
           <option value="overbroad_alert_all">Anti-Cheat: Overbroad Alert-All</option>
         </select>
+        <div id="ackM3Box" style="display:none;margin-bottom:6px;">
+          <textarea id="ackTargetConfig" rows="3" placeholder="target_config_content (manifest systemd/K8s opzionale)" style="width:100%;"></textarea>
+        </div>
+        <div id="ackM4WorkspaceBox" style="display:none;margin-bottom:6px;">
+          <input id="ackTargetFilePath" placeholder="target_file_path (file parser Python sul PC)" style="width:100%;margin-bottom:4px;">
+          <input id="ackTargetFunction" placeholder="target_function (es. parse_packet)" style="width:100%;margin-bottom:4px;">
+          <input id="ackValidCorpusDir" placeholder="valid_corpus_dir (dir input validi opzionale)" style="width:100%;margin-bottom:4px;">
+          <select id="ackWorkspaceMode" style="width:100%;">
+            <option value="isolated_copy">workspace_mode: isolated_copy</option>
+            <option value="git_worktree">workspace_mode: git_worktree</option>
+          </select>
+        </div>
         <button class="primary" onclick="runAckMission()" style="width:100%;">Avvia Missione ACK Out-of-Band</button>
       </div>
       <details>
@@ -268,38 +280,100 @@
         <span class="badge b-purple">Astensione Ambigui: ${Math.round(b.abstention_accuracy*100)}%</span></p>
         ${b.results.map(x => `<p><strong>${esc(x.title)}</strong>: Atteso=<code>${esc(x.expected_verdict)}</code> | Single=<code>${esc(x.single_agent_verdict)}</code> | Purple=<code>${esc(x.purple_multi_agent_verdict)}</code></p>`).join('')}`;
     }
+    let currentAckReport = null;
+    function toggleAckMissionInputs() {
+      const mId = document.getElementById('ackMissionSelect').value;
+      document.getElementById('ackM3Box').style.display = mId === 'ack-m3-attack-path-hardening' ? 'block' : 'none';
+      document.getElementById('ackM4WorkspaceBox').style.display = mId === 'ack-m4-fuzz-to-fix-pipeline' ? 'block' : 'none';
+    }
     async function runAckMission() {
-      const rep = await apiFetch('/ack/run', {
-        method: 'POST',
-        body: JSON.stringify({
-          mission_id: document.getElementById('ackMissionSelect').value,
-          mutation_rounds: 3,
-          defense_mode: document.getElementById('ackDefenseSelect').value
-        })
-      });
+      const mId = document.getElementById('ackMissionSelect').value;
+      const body = {
+        mission_id: mId,
+        mutation_rounds: 3,
+        defense_mode: document.getElementById('ackDefenseSelect').value
+      };
+      if (mId === 'ack-m3-attack-path-hardening') {
+        const cfg = document.getElementById('ackTargetConfig').value;
+        if (cfg && cfg.trim()) body.target_config_content = cfg;
+      }
+      if (mId === 'ack-m4-fuzz-to-fix-pipeline') {
+        const fp = document.getElementById('ackTargetFilePath').value.trim();
+        if (fp) {
+          body.target_file_path = fp;
+          const fn = document.getElementById('ackTargetFunction').value.trim();
+          const cdir = document.getElementById('ackValidCorpusDir').value.trim();
+          if (fn) body.target_function = fn;
+          if (cdir) body.valid_corpus_dir = cdir;
+          body.workspace_mode = document.getElementById('ackWorkspaceMode').value || 'isolated_copy';
+        }
+      }
+      const rep = await apiFetch('/ack/run', { method: 'POST', body: JSON.stringify(body) });
       renderAckReport(rep);
     }
+    async function applyAckPatch(runId) {
+      const chk = document.getElementById('ackConfirmApplyChk');
+      if (!chk || !chk.checked) return;
+      const res = await apiFetch('/ack/apply-patch', {
+        method: 'POST',
+        body: JSON.stringify({ run_id: runId, confirm_apply: true })
+      });
+      if (currentAckReport && currentAckReport.workspace_target) {
+        currentAckReport.workspace_target.patch_applied = true;
+        currentAckReport.workspace_target.applied_at = res.applied_at;
+        renderAckReport(currentAckReport);
+      }
+    }
     function renderAckReport(rep) {
+      currentAckReport = rep;
       const m = rep.tpr_fpr_matrix || {};
       const fow = rep.fog_of_war || {};
+      const ws = rep.workspace_target || null;
+      const fprLabel = m.fpr_measured
+        ? `FPR: ${Math.round((m.false_positive_rate || 0)*100)}% (n=${esc(m.benign_corpus_size ?? 0)})`
+        : 'FPR: N/A (non misurato)';
+      const fprBadgeClass = m.fpr_measured ? ((m.false_positive_rate || 0) <= 0.05 ? 'b-green' : 'b-red') : 'b-amber';
       document.getElementById('reportPanel').innerHTML = `
         <div style="border-left:4px solid ${rep.certified ? 'var(--green)' : 'var(--red)'};padding-left:12px;margin-bottom:14px;">
           <span class="badge ${rep.certified ? 'b-green' : 'b-red'}">${rep.certified ? 'CERTIFIED' : 'REJECTED'}</span>
           <span class="badge b-purple">${esc(rep.certification_verdict)}</span>
+          ${rep.verification_tier ? `<span class="badge ${rep.verification_tier === 'workspace_target_verification' ? 'b-green' : 'b-blue'}">${esc(rep.verification_tier)}</span>` : ''}
           <span class="badge b-blue">Sandbox: ${esc(rep.sandbox_id)}</span>
+          ${rep.security_boundary_level ? `<span class="badge b-amber">${esc(rep.security_boundary_level)}</span>` : ''}
           ${rep.isolation_backend ? `<span class="badge b-purple">${esc(rep.isolation_backend)}</span>` : ''}
-          ${rep.audit_scope ? `<span class="badge ${rep.audit_scope === 'cloned_target_manifest' ? 'b-green' : 'b-amber'}">${esc(rep.audit_scope)}</span>` : ''}
+          ${rep.audit_scope ? `<span class="badge ${(rep.audit_scope === 'cloned_target_manifest' || rep.audit_scope === 'workspace_target_file') ? 'b-green' : 'b-amber'}">${esc(rep.audit_scope)}</span>` : ''}
           ${fow.enforced ? '<span class="badge b-green">Fog of War Enforced</span>' : ''}
           ${rep.shadow_clone_only ? '<span class="badge b-amber">Shadow Clone CoW</span>' : ''}
+          ${rep.untrusted_llm_code_warning ? `<div class="note-box">${esc(rep.untrusted_llm_code_warning)}</div>` : ''}
           <h3 style="margin:6px 0;">${esc(rep.title)}</h3>
           <p style="color:var(--muted);margin:4px 0;"><strong>Invariante:</strong> ${esc(rep.target_invariant)} — ${esc(rep.blue_patch_or_rules_summary)}</p>
           <p>
             <span class="badge b-green">TPR: ${Math.round((m.true_positive_rate || 0)*100)}%</span>
-            <span class="badge ${(m.false_positive_rate || 0) <= 0.05 ? 'b-green' : 'b-red'}">FPR: ${Math.round((m.false_positive_rate || 0)*100)}%</span>
+            <span class="badge ${fprBadgeClass}">${fprLabel}</span>
             <span class="badge b-blue">Evasion Resistance: ${Math.round((m.evasion_resistance_rate || 0)*100)}%</span>
             <span class="badge b-purple">Functional Survival: ${Math.round((m.functional_survival_rate || 0)*100)}%</span>
           </p>
         </div>
+        <div class="stage-card" style="margin-bottom:10px;">
+          <strong>Controlli Eseguiti vs Non Eseguiti</strong>
+          <div><strong>executed_checks:</strong> ${esc((rep.executed_checks || []).join(', ') || 'Nessuno')}</div>
+          <div style="color:var(--muted);"><strong>not_executed_checks:</strong> ${esc((rep.not_executed_checks || []).join(', ') || 'Nessuno')}</div>
+        </div>
+        ${(rep.subagent_traces || []).length ? `<h4>Sub-Agent Fleet (Fog of War: ${rep.subagent_traces.length})</h4>` +
+          rep.subagent_traces.map(tr => `<div class="ev-item"><span class="badge ${tr.team === 'RED' ? 'b-red' : 'b-blue'}">${esc(tr.team)} ${esc(tr.role)}</span><span class="badge b-purple">${esc(tr.phase)}</span><span class="badge b-amber">${esc(tr.model_used)}</span><span style="color:var(--muted);">[keys: ${esc((tr.visible_context_keys || []).join(', '))}]</span> ${esc(tr.summary)}</div>`).join('') : ''}
+        ${(rep.deliverable_dir || rep.patch_diff || ws) ? `<div class="stage-card" style="margin:10px 0;">
+          <strong>Artefatti Persistenti (deliverable_dir) &amp; Patch Diff</strong>
+          ${rep.deliverable_dir ? `<div><strong>deliverable_dir:</strong> <code>${esc(rep.deliverable_dir)}</code> (${esc((rep.deliverable_files || []).length)} file)</div>` : ''}
+          ${(rep.deliverable_files || []).length ? `<div style="color:var(--muted);font-size:11px;">${esc(rep.deliverable_files.join(' · '))}</div>` : ''}
+          ${rep.patch_diff ? `<pre>${esc(rep.patch_diff)}</pre>` : ''}
+          ${ws ? `<div style="margin-top:8px;">
+            <div><strong>Workspace Target:</strong> <code>${esc(ws.target_file_path)}</code> (${esc(ws.target_function)}) | untouched=${esc(ws.original_untouched)} | patch_applied=${esc(ws.patch_applied)}</div>
+            ${rep.certified && !ws.patch_applied ? `<div class="row" style="margin-top:6px;">
+              <label class="row"><input type="checkbox" id="ackConfirmApplyChk"> Confermo applicazione patch (crea .orig)</label>
+              <button type="button" class="primary" onclick="applyAckPatch('${esc(rep.run_id)}')">Applica Patch al Progetto</button>
+            </div>` : ''}
+          </div>` : ''}
+        </div>` : ''}
         <h4>Macchina a 7 Stati (${(rep.state_transitions || []).length} transizioni)</h4>
         ${(rep.state_transitions || []).map(st => `<p><span class="badge ${st.passed ? 'b-green' : 'b-red'}">${esc(st.state)}</span> <span class="badge b-purple">${esc(st.actor)}</span> ${esc(st.summary)}</p>`).join('')}
         <h4>Round di Mutazione Red & Oracolo Out-of-Band (${(rep.mutation_rounds || []).length})</h4>
@@ -311,6 +385,7 @@
         </div>`).join('')}
       `;
     }
+    toggleAckMissionInputs();
     (async () => {
       const [{ scenarios }, models, status, ackData] = await Promise.all([apiFetch('/scenarios'), apiFetch('/models'), apiFetch('/status'), apiFetch('/ack/missions')]);
       document.getElementById('scenarioSelect').innerHTML = scenarios.map(s => `<option value="${esc(s.scenario_id)}">${esc(s.title)} [${esc(s.expected_verdict)}]</option>`).join('');

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import uuid
-from typing import Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cyber.ack.catalog import (
     ACK_MISSION_MAP,
@@ -11,12 +12,24 @@ from hermes_cyber.ack.catalog import (
     list_ack_mission_descriptors,
 )
 from hermes_cyber.ack.chamber import DetonationChamber
+from hermes_cyber.ack.deliverables import (
+    export_ack_deliverables,
+    list_ack_runs,
+    resolve_ack_runs_dir,
+)
 from hermes_cyber.ack.fog_of_war import FogOfWarController
 from hermes_cyber.ack.mission_m1_appsec import _run_m1_exploit_to_patch
 from hermes_cyber.ack.mission_m2_evasion import _run_m2_detection_evasion
 from hermes_cyber.ack.mission_m3_hardening import _run_m3_attack_path_hardening
 from hermes_cyber.ack.mission_m4_fuzzing import _run_m4_fuzz_to_fix
-from hermes_cyber.models import AckCertificationReport, AckMissionDescriptor
+from hermes_cyber.ack.workspace import apply_ack_run_patch
+from hermes_cyber.models import (
+    AckCertificationReport,
+    AckMissionDescriptor,
+    AckStateTransition,
+    AckWorkspaceModeType,
+)
+from hermes_cyber.router_bridge import ModelRouter
 
 _MISSION_RUNNERS: Dict[
     str,
@@ -43,6 +56,14 @@ class AdversarialCyberKernel:
         defense_mode: str = "structural",
         target_config_content: Optional[str] = None,
         inject_broken_mutation: bool = False,
+        target_file_path: Optional[str] = None,
+        target_function: Optional[str] = None,
+        valid_corpus_dir: Optional[str] = None,
+        valid_inputs: Optional[List[str]] = None,
+        workspace_mode: AckWorkspaceModeType = "isolated_copy",
+        red_router: Optional[ModelRouter] = None,
+        blue_router: Optional[ModelRouter] = None,
+        runs_dir: Optional[Path] = None,
     ) -> AckCertificationReport:
         desc = ACK_MISSION_MAP.get(mission_id)
         if desc is None:
@@ -60,8 +81,35 @@ class AdversarialCyberKernel:
                 defense_mode=defense_mode,
                 target_config_content=target_config_content,
                 inject_broken_mutation=inject_broken_mutation,
+                target_file_path=target_file_path,
+                target_function=target_function,
+                valid_corpus_dir=valid_corpus_dir,
+                valid_inputs=valid_inputs,
+                workspace_mode=workspace_mode,
+                red_router=red_router,
+                blue_router=blue_router,
             )
-            return AckCertificationReport(
+            isolation_ok = fow.verify_trace_isolation(outcome.subagent_traces)
+            fow_audit = fow.audit()
+            certified = outcome.certified
+            cert_verdict = outcome.certification_verdict
+            rationale = outcome.rationale
+            transitions = list(outcome.transitions)
+            if not isolation_ok:
+                fow_audit = fow_audit.model_copy(update={"enforced": False})
+                certified = False
+                cert_verdict = "REJECTED_FOG_OF_WAR_VIOLATION"
+                rationale = "Violazione Fog of War rilevata nelle tracce dei sub-agent Red/Blue."
+                transitions.append(
+                    AckStateTransition(
+                        state="CERTIFY_REPORT",
+                        actor="ORACLE",
+                        summary=rationale,
+                        passed=False,
+                    )
+                )
+
+            report = AckCertificationReport(
                 run_id=f"ack-run-{uuid.uuid4().hex[:8]}",
                 mission_id=desc.mission_id,
                 mission_kind=desc.mission_kind,
@@ -70,19 +118,49 @@ class AdversarialCyberKernel:
                 tier_used=desc.default_tier,
                 shadow_clone_only=desc.shadow_clone_only,
                 audit_scope=outcome.audit_scope,
+                verification_tier=outcome.verification_tier,
                 isolation_backend=chamber.isolation_backend,
                 defense_mode=defense_mode,
                 target_invariant=desc.target_invariant,
-                certified=outcome.certified,
-                certification_verdict=outcome.certification_verdict,
-                state_transitions=outcome.transitions,
+                certified=certified,
+                certification_verdict=cert_verdict,
+                executed_checks=outcome.executed_checks,
+                not_executed_checks=outcome.not_executed_checks,
+                state_transitions=transitions,
+                subagent_traces=outcome.subagent_traces,
                 action_contracts=outcome.contracts,
                 oracle_evidences=outcome.evidences,
                 mutation_rounds=outcome.mutation_rounds,
                 tpr_fpr_matrix=outcome.tpr_fpr_matrix,
-                fog_of_war=fow.audit(),
+                fog_of_war=fow_audit,
                 blue_patch_or_rules_summary=outcome.blue_summary,
-                rationale=outcome.rationale,
+                rationale=rationale,
+                patch_diff=outcome.patch_diff,
+                workspace_target=outcome.workspace_target,
+            )
+            runs_root = resolve_ack_runs_dir(runs_dir)
+            deliv_dir, deliv_files = export_ack_deliverables(runs_root, report, chamber, outcome)
+            return report.model_copy(
+                update={
+                    "deliverable_dir": str(deliv_dir),
+                    "deliverable_files": deliv_files,
+                }
             )
         finally:
             chamber.cleanup()
+
+    def list_runs(self, *, runs_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+        return list_ack_runs(resolve_ack_runs_dir(runs_dir))
+
+    def apply_patch(
+        self,
+        run_id: str,
+        *,
+        confirm_apply: bool = False,
+        runs_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        return apply_ack_run_patch(
+            resolve_ack_runs_dir(runs_dir),
+            run_id,
+            confirm_apply=confirm_apply,
+        )

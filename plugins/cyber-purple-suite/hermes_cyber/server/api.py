@@ -87,6 +87,16 @@ class AckMissionRunRequest(BaseModel):
         "overbroad_alert_all",
     ] = "structural"
     target_config_content: Optional[str] = None
+    target_file_path: Optional[str] = None
+    target_function: Optional[str] = None
+    valid_corpus_dir: Optional[str] = None
+    valid_inputs: Optional[List[str]] = None
+    workspace_mode: Literal["isolated_copy", "git_worktree"] = "isolated_copy"
+
+
+class AckApplyPatchRequest(BaseModel):
+    run_id: str
+    confirm_apply: bool = False
 
 
 @router.get("/status")
@@ -187,6 +197,12 @@ async def list_ack_missions(request: Request):
     return {"missions": [m.model_dump(mode="json") for m in assistant.list_ack_missions()]}
 
 
+@router.get("/ack/runs")
+async def list_ack_runs_endpoint(request: Request):
+    assistant = _req_assistant(request)
+    return {"runs": assistant.list_ack_runs()}
+
+
 @router.post("/ack/run")
 async def run_ack_mission(req: AckMissionRunRequest, request: Request):
     assistant = _req_assistant(request)
@@ -197,9 +213,31 @@ async def run_ack_mission(req: AckMissionRunRequest, request: Request):
             mutation_rounds=req.mutation_rounds,
             defense_mode=req.defense_mode,
             target_config_content=req.target_config_content,
+            target_file_path=req.target_file_path,
+            target_function=req.target_function,
+            valid_corpus_dir=req.valid_corpus_dir,
+            valid_inputs=req.valid_inputs,
+            workspace_mode=req.workspace_mode,
         )
         return report.model_dump(mode="json")
     except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/ack/apply-patch")
+async def apply_ack_patch_endpoint(req: AckApplyPatchRequest, request: Request):
+    assistant = _req_assistant(request)
+    try:
+        return await asyncio.to_thread(
+            assistant.apply_ack_patch,
+            req.run_id,
+            confirm_apply=req.confirm_apply,
+        )
+    except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
