@@ -495,3 +495,49 @@ def test_ack_rest_api_hermes_tool_and_ui_sync(tmp_path, monkeypatch):
     for marker in ("/ack/run", "ack-m1-exploit-patch-bypass", "tpr_fpr_matrix", "fog_of_war", "mutation_rounds"):
         assert marker in desk
         assert marker in web_html
+
+
+def test_hermes_cyber_modular_architecture_no_monoliths():
+    import importlib
+
+    pkg_dir = Path(__file__).resolve().parents[1] / "hermes_cyber"
+    py_files = sorted(pkg_dir.rglob("*.py"))
+    assert len(py_files) >= 35
+    oversized = []
+    for pf in py_files:
+        line_count = len(pf.read_text(encoding="utf-8").splitlines())
+        if line_count > 550:
+            oversized.append(f"{pf.relative_to(pkg_dir).as_posix()}:{line_count}")
+    assert not oversized, f"Monolithic python modules exceed 550 lines: {oversized}"
+
+    for mod_name in (
+        "hermes_cyber.models_claims",
+        "hermes_cyber.models_verdict",
+        "hermes_cyber.models_ack",
+        "hermes_cyber.scrubber",
+        "hermes_cyber.dns_correlation",
+        "hermes_cyber.replay_engine",
+        "hermes_cyber.verdict_policy",
+        "hermes_cyber.red_claims",
+        "hermes_cyber.red_tracks_appsec",
+        "hermes_cyber.red_tracks_host",
+        "hermes_cyber.blue_rules",
+        "hermes_cyber.blue_cases_controls",
+        "hermes_cyber.blue_cases_threats",
+        "hermes_cyber.patch_analysis",
+        "hermes_cyber.case_verification",
+        "hermes_cyber.ack",
+        "hermes_cyber.ack.catalog",
+        "hermes_cyber.ack.runner_templates",
+        "hermes_cyber.ack.chamber",
+        "hermes_cyber.ack.fog_of_war",
+        "hermes_cyber.ack.yaml_compat",
+        "hermes_cyber.ack.manifest_parser",
+        "hermes_cyber.ack.manifest_patcher",
+        "hermes_cyber.ack.mission_m1_appsec",
+        "hermes_cyber.ack.mission_m2_evasion",
+        "hermes_cyber.ack.mission_m3_hardening",
+        "hermes_cyber.ack.mission_m4_fuzzing",
+        "hermes_cyber.ack.kernel",
+    ):
+        assert importlib.import_module(mod_name) is not None

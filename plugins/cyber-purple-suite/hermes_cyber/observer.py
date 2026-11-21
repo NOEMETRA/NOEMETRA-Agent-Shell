@@ -1,40 +1,23 @@
-"""Deterministic forensic evidence ingestion and reversible Cloud Privacy Scrubber."""
+"""Deterministic forensic evidence ingestion and entity extraction."""
 
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import re
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_cyber.dns_correlation import (
+    _TIMESTAMP_RE,
+    _parse_record_timestamp,
+    _timestamps_within_window,
+    is_record_correlated_with_any,
+    is_routine_dns_txt_record,
+)
 from hermes_cyber.models import ArtifactIngestionResult, EvidenceRecord
-
-# Sensitive pattern detectors for outbound cloud prompt scrubbing
-_IPV4_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3})\b")
-_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}\.[A-Za-z0-9._-]{4,}\b")
-_BEARER_OR_KEY_RE = re.compile(
-    r"\b(?:Bearer\s+[A-Za-z0-9._~+/=-]{12,}|sk-(?:ant-|proj-|or-v1-)?[A-Za-z0-9_-]{12,}|"
-    r"ghp_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,})\b",
-    re.IGNORECASE,
-)
-_SECRET_DQUOTED_RE = re.compile(
-    r'''(?i)(['"]?(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)['"]?\s*[=:]\s*)"((?:[^"\\\r\n]|\\.){4,})"'''
-)
-_SECRET_SQUOTED_RE = re.compile(
-    r"""(?i)(['"]?(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)['"]?\s*[=:]\s*)'((?:[^'\\\r\n]|\\.){4,})'"""
-)
-_SECRET_ASSIGN_RE = re.compile(
-    r"""(?i)(\b(?:password|passwd|pwd|secret|api_key|apikey|token|auth_token|private_key)\s*[=:]\s*)([^\s'"`,;{}]{4,})"""
-)
-_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+from hermes_cyber.scrubber import PrivacyScrubber, _IPV4_RE
 
 # Forensic entity extraction regexes
-_TIMESTAMP_RE = re.compile(
-    r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?|"
-    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\b"
-)
 _HOST_RE = re.compile(
     r"(?i)\b(?:host|cmdb_host|server|node|pod)[=:\s]+([A-Za-z0-9_.-]{2,64})\b|\b((?:srv|db|ws|web|app)-[A-Za-z0-9-]+)\b"
 )
@@ -70,86 +53,6 @@ _CONTROL_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("privilege_dropped", re.compile(r"(?i)(?:privileged\s*:\s*false|allowPrivilegeEscalation\s*:\s*false|drop\s*:\s*\[?\s*['\"]ALL['\"])")),
     ("routine_dns_txt", re.compile(r"(?i)(?:\bv=spf1\b|\bv=DKIM1\b|\bv=DMARC1\b|_dmarc\.|_domainkey\.|_acme-challenge\.|google-site-verification=|ms=ms\d+|apple-domain-verification=|spf\.protection\.outlook\.com|_spf\.google\.com)")),
 )
-
-
-class PrivacyScrubber:
-    """Reversible local scrubber masking internal IPs, credentials, tokens, and emails for cloud calls."""
-
-    def __init__(self) -> None:
-        self._forward: Dict[str, str] = {}
-        self._reverse: Dict[str, str] = {}
-        self._counters: Dict[str, int] = {"private_ips": 0, "secrets": 0, "emails": 0}
-
-    def _token_for(self, category: str, prefix: str, original: str) -> str:
-        if original in self._forward:
-            return self._forward[original]
-        self._counters[category] = self._counters.get(category, 0) + 1
-        alias = f"<{prefix}_{self._counters[category]:02d}>"
-        self._forward[original] = alias
-        self._reverse[alias] = original
-        return alias
-
-    def scrub(self, text: str) -> Tuple[str, Dict[str, int]]:
-        """Replace private IPs, secrets/JWTs, and emails with deterministic placeholders."""
-        if not text:
-            return "", dict(self._counters)
-
-        def _repl_secret(m: re.Match[str]) -> str:
-            return self._token_for("secrets", "REDACTED_SECRET", m.group(0))
-
-        s = _JWT_RE.sub(_repl_secret, text)
-        s = _BEARER_OR_KEY_RE.sub(_repl_secret, s)
-
-        for quote_char, pattern in (('"', _SECRET_DQUOTED_RE), ("'", _SECRET_SQUOTED_RE)):
-            def _repl_quoted(m: re.Match[str], q: str = quote_char) -> str:
-                val = m.group(2)
-                if "<REDACTED_SECRET_" in val:
-                    return m.group(0)
-                alias = self._token_for("secrets", "REDACTED_SECRET", val)
-                return f"{m.group(1)}{q}{alias}{q}"
-
-            s = pattern.sub(_repl_quoted, s)
-
-        def _repl_assign(m: re.Match[str]) -> str:
-            val = m.group(2)
-            if "<REDACTED_SECRET_" in val:
-                return m.group(0)
-            alias = self._token_for("secrets", "REDACTED_SECRET", val)
-            return f"{m.group(1)}{alias}"
-
-        s = _SECRET_ASSIGN_RE.sub(_repl_assign, s)
-
-        def _repl_email(m: re.Match[str]) -> str:
-            return self._token_for("emails", "EMAIL", m.group(0))
-
-        s = _EMAIL_RE.sub(_repl_email, s)
-
-        def _repl_ip(m: re.Match[str]) -> str:
-            raw_ip = m.group(1)
-            try:
-                ip_obj = ipaddress.ip_address(raw_ip)
-                if ip_obj.is_private and not ip_obj.is_loopback and not ip_obj.is_link_local:
-                    return self._token_for("private_ips", "INT_IP", raw_ip)
-            except ValueError:
-                pass
-            return raw_ip
-
-        s = _IPV4_RE.sub(_repl_ip, s)
-        return s, dict(self._counters)
-
-    def unscrub(self, text: str) -> str:
-        """Restore masked placeholders back to original local values inside local UI outputs."""
-        if not text or not self._reverse:
-            return text
-        out = text
-        # Replace longest tokens first to avoid partial collisions
-        for alias in sorted(self._reverse.keys(), key=len, reverse=True):
-            out = out.replace(alias, self._reverse[alias])
-        return out
-
-    @property
-    def stats(self) -> Dict[str, int]:
-        return dict(self._counters)
 
 
 def _extract_entities(raw: str, source_type: str) -> Tuple[Optional[str], Dict[str, List[str]]]:
@@ -239,150 +142,6 @@ def _detect_source_kind(content: str, hint: str) -> str:
     if any("HTTP/1." in ln or "HTTP/2" in ln or "GET /" in ln or "POST /" in ln for ln in lines):
         return "http"
     return "log"
-
-
-_HOSTILE_DNS_CONTEXT_RE = re.compile(
-    r"(?i)(?:c2-sync|exfil|token_leak|dns_txt_authorized\s*=\s*false|maintenance_window\s*=\s*false|"
-    r"-enc\b|-encodedcommand\b|powershell|pwsh\b|child_of\s*=|\balert\s*=)"
-)
-_DNS_ENTROPY_RE = re.compile(r"(?i)\bentropy\s*=\s*([0-9]+(?:\.[0-9]+)?)")
-_DNS_BYTES_RE = re.compile(r"(?i)\bbytes(?:_out)?\s*=\s*([0-9]+)")
-_DNS_RATE_RE = re.compile(r"(?i)\b(?:rate|qps)\s*=\s*([0-9]+(?:\.[0-9]+)?)")
-_PREFIXED_ROUTINE_SUBDOMAIN_RE = re.compile(r"(?i)[A-Za-z0-9_-]+\.(?:_dmarc|_acme-challenge)\.")
-_LONG_DKIM_SELECTOR_RE = re.compile(r"(?i)[A-Za-z0-9_-]{24,}\._domainkey\.")
-_ROUTINE_DNS_DAEMONS = frozenset({
-    "postfix",
-    "sendmail",
-    "exim",
-    "dovecot",
-    "opendkim",
-    "opendmarc",
-    "rspamd",
-    "certbot",
-    "acme.sh",
-    "named",
-    "unbound",
-    "systemd-resolved",
-    "coredns",
-    "dnsmasq",
-    "bind",
-})
-
-
-def is_routine_dns_txt_record(ev: EvidenceRecord) -> bool:
-    """Return True only for low-anomaly standard DNS TXT records (SPF/DMARC/DKIM/ACME)."""
-    controls = ev.entities.get("controls", [])
-    if "routine_dns_txt" not in controls:
-        return False
-    raw = ev.raw_content
-    if _HOSTILE_DNS_CONTEXT_RE.search(raw):
-        return False
-    if _PREFIXED_ROUTINE_SUBDOMAIN_RE.search(raw) or _LONG_DKIM_SELECTOR_RE.search(raw):
-        return False
-    for m in _DNS_ENTROPY_RE.finditer(raw):
-        if float(m.group(1)) >= 3.5:
-            return False
-    for m in _DNS_BYTES_RE.finditer(raw):
-        if int(m.group(1)) >= 400:
-            return False
-    for m in _DNS_RATE_RE.finditer(raw):
-        if float(m.group(1)) >= 10.0:
-            return False
-    for proc in ev.entities.get("processes", []):
-        norm_proc = proc.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
-        if norm_proc.endswith(".exe"):
-            norm_proc = norm_proc[:-4]
-        if norm_proc and norm_proc not in _ROUTINE_DNS_DAEMONS:
-            return False
-    return True
-
-
-def _parse_record_timestamp(ts: Optional[str]) -> Optional[Tuple[datetime, bool]]:
-    """Parse ISO-8601 (is_yearless=False) or syslog month/day timestamp (is_yearless=True)."""
-    if not ts:
-        return None
-    s = ts.strip()
-    try:
-        dt = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s)
-        norm = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-        return norm, False
-    except ValueError:
-        pass
-    try:
-        normalized = " ".join(s.split())
-        # Anchor yearless syslog to leap year 2000 explicitly before strptime so Feb 29 parses cleanly without warnings
-        return datetime.strptime(f"2000 {normalized}", "%Y %b %d %H:%M:%S").replace(tzinfo=timezone.utc), True
-    except ValueError:
-        return None
-
-
-def _timestamps_within_window(
-    r_parsed: Tuple[datetime, bool],
-    c_parsed: Tuple[datetime, bool],
-    window_seconds: int,
-) -> bool:
-    """Return True when two parsed timestamps fall within `window_seconds`, allowing year rollover on syslog dates."""
-    r_dt, r_yearless = r_parsed
-    c_dt, c_yearless = c_parsed
-    if not r_yearless and not c_yearless:
-        return abs((r_dt - c_dt).total_seconds()) <= window_seconds
-    fixed_dt, yl_dt = (c_dt, r_dt) if r_yearless else (r_dt, c_dt)
-    for target_year in (fixed_dt.year - 1, fixed_dt.year, fixed_dt.year + 1):
-        try:
-            candidate_dt = yl_dt.replace(year=target_year)
-        except ValueError:
-            continue
-        if abs((fixed_dt - candidate_dt).total_seconds()) <= window_seconds:
-            return True
-    return False
-
-
-def is_record_correlated_with_any(
-    record: EvidenceRecord,
-    candidates: List[EvidenceRecord],
-    all_records: Optional[List[EvidenceRecord]] = None,
-    window_seconds: int = 900,
-) -> bool:
-    """Return True if `record` shares host/IP/user identity and time window with any candidate record."""
-    if not candidates:
-        return False
-
-    bridge_pool = all_records if all_records is not None else [record, *candidates]
-    ip_to_hosts: Dict[str, set[str]] = {}
-    for ev in bridge_pool:
-        hs = {h.lower() for h in ev.entities.get("hosts", []) if h}
-        if hs:
-            for ip in ev.entities.get("ips", []):
-                if ip:
-                    ip_to_hosts.setdefault(ip.lower(), set()).update(hs)
-
-    def _expanded_entities(ev: EvidenceRecord) -> Tuple[set[str], set[str], set[str]]:
-        hosts = {h.lower() for h in ev.entities.get("hosts", []) if h}
-        ips = {ip.lower() for ip in ev.entities.get("ips", []) if ip}
-        users = {u.lower() for u in ev.entities.get("users", []) if u}
-        for ip in ips:
-            hosts.update(ip_to_hosts.get(ip, set()))
-        return hosts, ips, users
-
-    r_hosts, r_ips, r_users = _expanded_entities(record)
-    r_parsed = _parse_record_timestamp(record.timestamp)
-
-    for cand in candidates:
-        # Same single record containing multiple indicators/fields corroborates itself immediately
-        if cand is record or (bool(record.evidence_id) and cand.evidence_id == record.evidence_id):
-            return True
-        c_hosts, c_ips, c_users = _expanded_entities(cand)
-        if r_hosts and c_hosts and r_hosts.isdisjoint(c_hosts):
-            continue
-        if not ((r_hosts & c_hosts) or (r_ips & c_ips) or (r_users & c_users)):
-            continue
-        c_parsed = _parse_record_timestamp(cand.timestamp)
-        if r_parsed is None or c_parsed is None:
-            continue
-        if not _timestamps_within_window(r_parsed, c_parsed, window_seconds):
-            continue
-        return True
-    return False
 
 
 class CyberObserver:
@@ -487,3 +246,13 @@ class CyberObserver:
                 "benign_baseline_records": sum(1 for e in evidences if e.is_benign_baseline),
             },
         )
+
+
+__all__ = [
+    "CyberObserver",
+    "PrivacyScrubber",
+    "_parse_record_timestamp",
+    "_timestamps_within_window",
+    "is_record_correlated_with_any",
+    "is_routine_dns_txt_record",
+]

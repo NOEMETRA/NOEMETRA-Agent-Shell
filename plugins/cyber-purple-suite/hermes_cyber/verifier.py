@@ -1,8 +1,8 @@
-"""Deterministic Purple Verifier: Citation Grounding, Entity Coherence, Claim Evaluation, Replay, and Verdict Arbiter."""
+"""Deterministic Purple Verifier: Citation Grounding, Entity Coherence, Claim Evaluation, and Verdict Arbiter."""
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Set, Tuple
 
 from hermes_cyber.models import (
     AnalyticalClaim,
@@ -10,304 +10,20 @@ from hermes_cyber.models import (
     BlueInvestigationReport,
     ContradictionItem,
     DiagnosisSummary,
-    EvidenceRecord,
-    PurpleReplayReport,
     PurpleVerdict,
     RedOperationPlan,
     RemediationVerificationSummary,
-    ReplayEventResult,
-    SigmaRuleSpec,
-    SimulationSummary,
     VerdictType,
-    YaraRuleSpec,
 )
-
-
-def _match_sigma(raw_text: str, sigma: SigmaRuleSpec) -> Tuple[bool, List[str]]:
-    low = raw_text.lower()
-    for exc_vals in sigma.exclude_fields.values():
-        for val in exc_vals:
-            if val and val.lower() in low:
-                return False, []
-
-    matched_kws: List[str] = []
-    for kw in sigma.detection_keywords:
-        if kw and kw.lower() in low:
-            matched_kws.append(kw)
-
-    field_match = False
-    for vals in sigma.detection_fields.values():
-        if vals and all(v.lower() in low for v in vals):
-            field_match = True
-
-    return (bool(matched_kws) or field_match), matched_kws
-
-
-def _match_yara(raw_text: str, yara: YaraRuleSpec) -> bool:
-    low = raw_text.lower()
-    hits = [s for s in yara.strings if s and s.lower() in low]
-    if not yara.strings:
-        return False
-    if "all" in (yara.condition or "").lower():
-        return len(hits) == len(yara.strings)
-    return len(hits) > 0
-
-
-def run_purple_replay(
-    ingestion: ArtifactIngestionResult,
-    red_report: RedOperationPlan,
-    blue_report: BlueInvestigationReport,
-    *,
-    custom_keywords: Optional[List[str]] = None,
-    custom_excludes: Optional[List[str]] = None,
-    skip_claim_ids: Optional[Set[str]] = None,
-) -> PurpleReplayReport:
-    """Execute Blue Team Sigma + YARA rules against Red simulated attacks, evasion probes, and benign baseline."""
-    sigma = blue_report.sigma_rule.model_copy(deep=True)
-    if custom_keywords is not None:
-        sigma.detection_keywords = [k.strip() for k in custom_keywords if k.strip()]
-    if custom_excludes is not None:
-        sigma.exclude_fields = {"custom_filter": [x.strip() for x in custom_excludes if x.strip()]}
-
-    yara = blue_report.yara_rule
-    eval_yara = custom_keywords is None
-    results: List[ReplayEventResult] = []
-    gaps: List[str] = []
-
-    atk_total = 0
-    atk_det = 0
-    eva_total = 0
-    eva_det = 0
-    ben_total = 0
-    fp_count = 0
-
-    for sim in red_report.simulated_events:
-        if skip_claim_ids and sim.claim_id and sim.claim_id in skip_claim_ids:
-            continue
-        m_sig, kws = _match_sigma(sim.log_line, sigma)
-        m_yar = _match_yara(sim.log_line, yara) if eval_yara else False
-        detected = m_sig or m_yar
-        results.append(ReplayEventResult(
-            event_id=sim.event_id,
-            variant=sim.variant,
-            matched_sigma=m_sig,
-            matched_yara=m_yar,
-            matched_keywords=kws,
-        ))
-        atk_total += 1
-        if detected:
-            atk_det += 1
-        else:
-            gaps.append(f"Missed Red simulation `{sim.event_id}` ({sim.variant}): {sim.log_line[:90]}")
-
-        if sim.variant == "evasion_variant":
-            eva_total += 1
-            if detected:
-                eva_det += 1
-
-    for ev in ingestion.evidences:
-        if ev.is_benign_baseline:
-            ben_total += 1
-            m_sig, kws = _match_sigma(ev.raw_content, sigma)
-            m_yar = _match_yara(ev.raw_content, yara) if eval_yara else False
-            if m_sig or m_yar:
-                fp_count += 1
-                gaps.append(f"False positive triggered on baseline `{ev.evidence_id}`.")
-            results.append(ReplayEventResult(
-                event_id=ev.evidence_id,
-                variant="benign_baseline",
-                matched_sigma=m_sig,
-                matched_yara=m_yar,
-                matched_keywords=kws,
-            ))
-
-    coverage = round(atk_det / atk_total, 3) if atk_total > 0 else 1.0
-    evasion_rate = round(eva_det / eva_total, 3) if eva_total > 0 else coverage
-    fpr = round(fp_count / ben_total, 3) if ben_total > 0 else 0.0
-
-    return PurpleReplayReport(
-        attack_events_total=atk_total,
-        attack_events_detected=atk_det,
-        evasion_events_total=eva_total,
-        evasion_events_detected=eva_det,
-        benign_events_tested=ben_total,
-        false_positives_count=fp_count,
-        detection_coverage=coverage,
-        evasion_caught_rate=evasion_rate,
-        false_positive_rate=fpr,
-        event_results=results,
-        defense_gaps=gaps,
-    )
-
-
-def _collect_entity_sets(eids: List[str], ev_by_id: Dict[str, EvidenceRecord]) -> Dict[str, Set[str]]:
-    keys = ("hosts", "ips", "users", "processes", "endpoints")
-    out: Dict[str, Set[str]] = {k: set() for k in keys}
-    for eid in eids:
-        ev = ev_by_id.get(eid)
-        if not ev:
-            continue
-        for k in keys:
-            for val in ev.entities.get(k, []):
-                if val:
-                    out[k].add(val.lower())
-    return out
-
-
-def _is_contradiction_entity_coherent(
-    contra: ContradictionItem,
-    target_claims: List[AnalyticalClaim],
-    ev_by_id: Dict[str, EvidenceRecord],
-) -> bool:
-    if not contra.contradicting_evidence_ids:
-        return False
-
-    c_ents = _collect_entity_sets(contra.contradicting_evidence_ids, ev_by_id)
-    target_eids: List[str] = list(contra.target_evidence_ids)
-    for tc in target_claims:
-        target_eids.extend(tc.evidence_ids)
-    t_ents = _collect_entity_sets(target_eids, ev_by_id)
-    # Include subject_entities attached directly on claims in case custom claims supply entities directly
-    for tc in target_claims:
-        for k in ("hosts", "ips", "users", "processes", "endpoints"):
-            for val in tc.subject_entities.get(k, []):
-                if val:
-                    t_ents[k].add(val.lower())
-
-    # Strict cross-host rejection: evidence from Host A cannot refute/weaken a claim on distinct Host B,
-    # even if both hosts happen to use the same service account or IP address.
-    if c_ents["hosts"] and t_ents["hosts"] and c_ents["hosts"].isdisjoint(t_ents["hosts"]):
-        return False
-
-    shared_user = bool(c_ents["users"] and t_ents["users"] and (c_ents["users"] & t_ents["users"]))
-
-    # Reject refutations/weakenings between disjoint IPs or disjoint user accounts when hosts do not bridge them
-    if contra.impact_on_hypothesis in ("refutes", "weakens") and not (c_ents["hosts"] & t_ents["hosts"]):
-        if c_ents["ips"] and t_ents["ips"] and c_ents["ips"].isdisjoint(t_ents["ips"]) and not shared_user:
-            return False
-        if not c_ents["ips"] and not t_ents["ips"] and c_ents["users"] and t_ents["users"] and c_ents["users"].isdisjoint(t_ents["users"]):
-            return False
-
-    return True
-
-
-def _resolve_target_claims(
-    contra: ContradictionItem,
-    claims: List[AnalyticalClaim],
-    ev_by_id: Dict[str, EvidenceRecord],
-) -> List[AnalyticalClaim]:
-    if not claims:
-        return []
-    if contra.target_claim_id:
-        matched = [c for c in claims if c.claim_id == contra.target_claim_id]
-        if matched:
-            return matched
-
-    if contra.target_evidence_ids:
-        t_set = set(contra.target_evidence_ids)
-        matched = [c for c in claims if set(c.evidence_ids) & t_set]
-        if matched:
-            return matched
-
-    if len(claims) == 1:
-        return [claims[0]]
-
-    # Match claims sharing entities with contradicting evidence when target ID wasn't explicitly specified
-    c_ents = _collect_entity_sets(contra.contradicting_evidence_ids, ev_by_id)
-    matched: List[AnalyticalClaim] = []
-    for clm in claims:
-        clm_ents = _collect_entity_sets(clm.evidence_ids, ev_by_id)
-        for k in ("hosts", "ips", "users", "endpoints"):
-            if c_ents[k] and clm_ents[k] and (c_ents[k] & clm_ents[k]):
-                matched.append(clm)
-                break
-    return matched
-
-
-def classify_supported_verdict(
-    source_kind: str,
-    supported_claims_count: int,
-    independent_evidence_count: int,
-) -> VerdictType:
-    """Apply the uniform verifier threshold before escalating CONFIRMED_ATTACK to EXPLOITABLE_CHAIN."""
-    has_code_or_config = source_kind in ("code", "config")
-    if has_code_or_config and supported_claims_count >= 2 and independent_evidence_count >= 2:
-        return VerdictType.EXPLOITABLE_CHAIN
-    return VerdictType.CONFIRMED_ATTACK
-
-
-_PRIO_RANK: Dict[str, int] = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-
-
-def determine_analysis_mode(
-    ingestion: ArtifactIngestionResult,
-) -> Tuple[str, str, str]:
-    """Classify the investigation workflow as event-driven, static artifact review, or hybrid."""
-    non_base = [ev for ev in ingestion.evidences if not ev.is_benign_baseline] or list(ingestion.evidences)
-    src_types = {ev.source_type for ev in non_base} if non_base else {ingestion.source_kind}
-    has_static = bool(src_types & {"code", "config"})
-    has_runtime = bool(src_types & {"log", "http"})
-    if has_static and has_runtime:
-        return (
-            "hybrid_investigation",
-            "Indagine Ibrida (Eventi Runtime + Codice/Config)",
-            "Correlazione ibrida tra codice/configurazione e tracce runtime: verifica sia la superficie statica sia l'evidenza osservata.",
-        )
-    if has_static or ingestion.source_kind in ("code", "config"):
-        return (
-            "artifact_review",
-            "Revisione Statica di Codice e Configurazioni",
-            "Revisione statica di codice/configurazione: individua superfici esposte e controlli assenti; richiede verifica runtime post-modifica.",
-        )
-    return (
-        "event_investigation",
-        "Indagine su Eventi (Log / Tracce HTTP)",
-        "Valutazione forense su eventi e tracce HTTP: stabilisce cosa è accaduto nei record disponibili e quali prove mancano.",
-    )
-
-
-def summarize_claim_priorities(
-    claims: List[AnalyticalClaim],
-) -> Tuple[Dict[str, int], List[str], List[str], List[AnalyticalClaim]]:
-    """Compute priority counts, high-priority open claim IDs, and prioritized open proofs."""
-    breakdown: Dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-    for c in claims:
-        key = c.priority if c.priority in breakdown else "medium"
-        breakdown[key] += 1
-
-    open_claims = [c for c in claims if c.status == "open"]
-    sorted_open = sorted(open_claims, key=lambda c: (_PRIO_RANK.get(c.priority, 2), c.step_index))
-    high_open_ids = [c.claim_id for c in sorted_open if c.priority in ("critical", "high")]
-    ordered_proofs = list(dict.fromkeys([c.confirming_or_refuting_proof for c in sorted_open if c.confirming_or_refuting_proof]))
-    return breakdown, high_open_ids, ordered_proofs, sorted_open
-
-
-def build_simulation_summary(replay: PurpleReplayReport) -> SimulationSummary:
-    if replay.attack_events_total == 0 and replay.benign_events_tested == 0:
-        return SimulationSummary(
-            status="NOT_APPLICABLE",
-            detection_coverage=replay.detection_coverage,
-            evasion_caught_rate=replay.evasion_caught_rate,
-            false_positive_rate=replay.false_positive_rate,
-            summary="No simulated attack events or benign baseline records to evaluate.",
-        )
-    if replay.false_positive_rate > 0.0:
-        status = "FALSE_POSITIVE_RISK"
-    elif replay.detection_coverage >= 1.0:
-        status = "COVERAGE_COMPLETE"
-    else:
-        status = "COVERAGE_PARTIAL"
-    return SimulationSummary(
-        status=status,  # type: ignore[arg-type]
-        detection_coverage=replay.detection_coverage,
-        evasion_caught_rate=replay.evasion_caught_rate,
-        false_positive_rate=replay.false_positive_rate,
-        summary=(
-            f"Rules caught {replay.attack_events_detected}/{replay.attack_events_total} synthetic events "
-            f"(coverage {int(replay.detection_coverage * 100)}%) with {replay.false_positives_count}/{replay.benign_events_tested} "
-            f"baseline false positives ({int(replay.false_positive_rate * 100)}% FPR)."
-        ),
-    )
+from hermes_cyber.replay_engine import build_simulation_summary, run_purple_replay
+from hermes_cyber.verdict_policy import (
+    _collect_entity_sets,
+    _is_contradiction_entity_coherent,
+    _resolve_target_claims,
+    classify_supported_verdict,
+    determine_analysis_mode,
+    summarize_claim_priorities,
+)
 
 
 class PurpleVerifier:
@@ -461,7 +177,6 @@ class PurpleVerifier:
         replay = run_purple_replay(ingestion, clean_red, clean_blue, skip_claim_ids=skip_claims)
         sim_summary = build_simulation_summary(replay)
 
-        has_code_or_config = ingestion.source_kind in ("code", "config")
         independent_ev_count = len(verified)
         sup_a = round(min(0.97, max(0.05, clean_red.confidence - 0.25 * (coherent_refutes if not supported_claims else 0) - 0.15 * coherent_weakens)), 3)
         sup_b = round(min(0.97, max(0.05, clean_blue.confidence + 0.10 * coherent_refutes)), 3)
@@ -575,3 +290,16 @@ class PurpleVerifier:
             remediation_verification=RemediationVerificationSummary(),
         )
         return clean_red, clean_blue, pv
+
+
+__all__ = [
+    "PurpleVerifier",
+    "_collect_entity_sets",
+    "_is_contradiction_entity_coherent",
+    "_resolve_target_claims",
+    "build_simulation_summary",
+    "classify_supported_verdict",
+    "determine_analysis_mode",
+    "run_purple_replay",
+    "summarize_claim_priorities",
+]
