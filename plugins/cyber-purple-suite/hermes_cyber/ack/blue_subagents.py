@@ -11,8 +11,24 @@ from hermes_cyber.models import AckSubAgentTrace
 from hermes_cyber.observer import PrivacyScrubber
 from hermes_cyber.router_bridge import ModelRouter, invoke_router_json
 
-_DANGEROUS_MODULES = frozenset({"subprocess", "ctypes", "socket", "shutil", "http", "urllib", "os", "importlib", "builtins", "pathlib"})
-_DANGEROUS_CALL_NAMES = frozenset({
+_SAFE_PATCH_ALLOWLIST = frozenset({
+    # Pure builtins & safe exceptions
+    "ValueError", "TypeError", "KeyError", "IndexError", "OverflowError", "ZeroDivisionError",
+    "AssertionError", "RuntimeError", "RecursionError", "Exception",
+    "len", "isinstance", "issubclass", "int", "float", "str", "bytes", "bytearray", "memoryview",
+    "bool", "dict", "list", "tuple", "set", "frozenset", "range", "enumerate", "zip",
+    "min", "max", "sum", "abs", "round", "sorted", "reversed", "all", "any",
+    "chr", "ord", "hex", "bin", "oct", "slice", "iter", "next", "repr", "ascii", "divmod", "pow", "hash",
+    "None", "True", "False",
+    # Pure non-mutating validation/unpack methods (excludes filesystem-ambiguous names like `replace`/`remove`)
+    "strip", "lstrip", "rstrip", "startswith", "endswith", "isdigit", "isalpha", "isalnum",
+    "isascii", "isspace", "count", "fromhex", "unpack", "unpack_from", "calcsize",
+})
+_UNSAFE_ATTR_RECEIVERS = frozenset({
+    "os", "sys", "subprocess", "shutil", "pathlib", "Path", "io",
+    "socket", "ctypes", "importlib", "builtins",
+})
+_FORBIDDEN_PATCH_NAMES = frozenset({
     "eval", "exec", "compile", "__import__", "system", "popen", "spawn",
     "open", "write", "writelines", "write_text", "write_bytes",
     "unlink", "remove", "rmdir", "rename", "replace", "mkdir", "makedirs",
@@ -21,31 +37,51 @@ _DANGEROUS_CALL_NAMES = frozenset({
 })
 
 
-def _extract_ast_surfaces(root_node: ast.AST) -> Tuple[Set[str], Set[str], Set[str]]:
+def _extract_ast_surfaces(fn_node: ast.FunctionDef) -> Tuple[Set[str], Set[str], Set[str], Set[str], Set[str], int]:
     imports: Set[str] = set()
     calls: Set[str] = set()
-    dunder_attrs: Set[str] = set()
-    for node in ast.walk(root_node):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.add(alias.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.add(node.module.split(".")[0])
-            elif node.level > 0:
-                imports.add(".")
-        elif isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
-            dunder_attrs.add(node.attr)
+    loaded_names: Set[str] = set()
+    bound_names: Set[str] = {fn_node.name}
+    attr_records: Set[str] = set()
+    forbidden_nodes = 0
+
+    for node in ast.walk(fn_node):
+        if isinstance(node, ast.arg):
+            bound_names.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound_names.add(node.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node is not fn_node:
+            forbidden_nodes += 1
+        elif isinstance(node, (ast.ClassDef, ast.Global, ast.Nonlocal, ast.Delete, ast.Lambda)):
+            forbidden_nodes += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports.add(ast.dump(node, include_attributes=False))
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id in _UNSAFE_ATTR_RECEIVERS:
+                forbidden_nodes += 1
+            attr_records.add(node.attr)
+            if node.attr in _FORBIDDEN_PATCH_NAMES or node.attr.startswith("_"):
+                forbidden_nodes += 1
+        elif isinstance(node, ast.Name):
+            if node.id in _FORBIDDEN_PATCH_NAMES or node.id.startswith("__"):
+                forbidden_nodes += 1
+            if isinstance(node.ctx, ast.Store):
+                bound_names.add(node.id)
+            elif isinstance(node.ctx, ast.Load):
+                loaded_names.add(node.id)
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 calls.add(node.func.id)
             elif isinstance(node.func, ast.Attribute):
                 calls.add(node.func.attr)
-    return imports, calls, dunder_attrs
+            else:
+                forbidden_nodes += 1
+
+    return imports, calls, loaded_names, bound_names, attr_records, forbidden_nodes
 
 
 def _is_llm_patch_ast_safe(original_source: str, patched_source: str, target_function: str) -> bool:
-    """Reject LLM-proposed patches that introduce imports/IO/dangerous calls or alter code outside target_function."""
+    """Reject LLM-proposed patches unless strictly scoped to target_function and default-deny AST allowlisted."""
     try:
         orig_tree = ast.parse(original_source)
         patch_tree = ast.parse(patched_source)
@@ -77,16 +113,23 @@ def _is_llm_patch_ast_safe(original_source: str, patched_source: str, target_fun
     if _non_target_dumps(orig_tree) != _non_target_dumps(patch_tree):
         return False
 
-    # Compare target_function AST surfaces directly so dangerous ops existing in unrelated module helpers
-    # cannot be newly introduced into target_function.
-    orig_imports, orig_calls, orig_dunders = _extract_ast_surfaces(orig_fn)
-    patch_imports, patch_calls, patch_dunders = _extract_ast_surfaces(patch_fn)
-    if patch_imports - orig_imports:
+    o_imp, o_calls, o_load, o_bound, o_attrs, o_forbid = _extract_ast_surfaces(orig_fn)
+    p_imp, p_calls, p_load, p_bound, p_attrs, p_forbid = _extract_ast_surfaces(patch_fn)
+    allowed_calls = _SAFE_PATCH_ALLOWLIST | {target_function}
+
+    if p_imp != o_imp:
         return False
-    if (patch_calls - orig_calls) & _DANGEROUS_CALL_NAMES:
+    if p_forbid > o_forbid:
         return False
-    if patch_dunders - orig_dunders:
-        return False
+    for cname in p_calls - o_calls:
+        if cname not in allowed_calls:
+            return False
+    for name in (p_load - p_bound) - (o_load - o_bound):
+        if name.startswith("_") or name not in _SAFE_PATCH_ALLOWLIST:
+            return False
+    for attr in p_attrs - o_attrs:
+        if attr.startswith("_") or attr not in _SAFE_PATCH_ALLOWLIST:
+            return False
     return True
 
 

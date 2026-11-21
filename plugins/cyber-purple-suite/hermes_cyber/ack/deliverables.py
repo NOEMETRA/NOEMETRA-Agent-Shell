@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,13 +15,20 @@ from hermes_cyber.models import AckCertificationReport
 
 
 def resolve_ack_runs_dir(explicit_runs_dir: Optional[Path] = None) -> Path:
-    """Resolve persistent NOEMETRA/runs root inside active profile home or OS temp fallback."""
+    """Resolve persistent NOEMETRA/runs root strictly isolated inside the active Hermes home/profile (AGENTS.md:13).
+
+    Unscoped OS temp runs carry no profile ownership and are never auto-migrated into any
+    profile; callers needing to inspect an external/legacy directory must pass ``explicit_runs_dir``.
+    """
     if explicit_runs_dir is not None:
         return Path(explicit_runs_dir).resolve()
-    hermes_home = os.environ.get("HERMES_HOME", "").strip()
-    if hermes_home:
-        return (Path(hermes_home).resolve() / "NOEMETRA" / "runs").resolve()
-    return (Path(tempfile.gettempdir()).resolve() / "NOEMETRA" / "runs").resolve()
+    try:
+        from hermes_constants import get_hermes_home
+        active_home = get_hermes_home().resolve()
+    except (ImportError, ModuleNotFoundError):
+        hermes_home = os.environ.get("HERMES_HOME", "").strip()
+        active_home = Path(hermes_home).resolve() if hermes_home else (Path.home() / ".hermes").resolve()
+    return (active_home / "NOEMETRA" / "runs").resolve()
 
 
 def _infer_lower_vs_upper_diff(chamber: DetonationChamber) -> str:

@@ -555,6 +555,72 @@ def test_ack_independent_red_blue_subagents_llm_integration_and_ast_safety_gate(
         "    return {'n': data[0]}\n"
     )
     assert _is_llm_patch_ast_safe(src_helper_sys, patch_adding_sys, "parse_packet") is False
+    # Indirect builtin subscript & aliased builtin code-exec escapes MUST be rejected
+    indirect_exec = (
+        "import struct\n"
+        "def parse_packet(data: bytes) -> dict:\n"
+        "    __builtins__['exec']('import os')\n"
+        "    return {'n': data[0]}\n"
+    )
+    assert _is_llm_patch_ast_safe(_BUGGY_PARSER_SOURCE, indirect_exec, "parse_packet") is False
+    aliased_open = (
+        "import struct\n"
+        "def parse_packet(data: bytes) -> dict:\n"
+        "    f = open\n"
+        "    return {'f': bool(f)}\n"
+    )
+    assert _is_llm_patch_ast_safe(_BUGGY_PARSER_SOURCE, aliased_open, "parse_packet") is False
+    # Calling an unrelated sibling helper (or defining a decorated nested function) MUST also be rejected
+    sibling_call = (
+        "import os\n"
+        "def unrelated_helper():\n"
+        "    os.system('echo hi')\n\n"
+        "def parse_packet(data: bytes) -> dict:\n"
+        "    unrelated_helper()\n"
+        "    return {'n': data[0]}\n"
+    )
+    assert _is_llm_patch_ast_safe(src_helper_sys, sibling_call, "parse_packet") is False
+    decorated_nested = (
+        "import struct\n"
+        "def parse_packet(data: bytes) -> dict:\n"
+        "    @eval\n"
+        "    def _x():\n"
+        "        return 1\n"
+        "    return {'n': _x()}\n"
+    )
+    assert _is_llm_patch_ast_safe(_BUGGY_PARSER_SOURCE, decorated_nested, "parse_packet") is False
+    # Import swap + unused nested shadow def (`from os import system` + nested `def system(): pass`) MUST be rejected
+    src_inner_import = "def parse_packet(data: bytes) -> dict:\n    import os\n    return {'n': data[0]}\n"
+    patch_import_swap = (
+        "def parse_packet(data: bytes) -> dict:\n"
+        "    from os import system\n"
+        "    def _unused():\n"
+        "        def system(): pass\n"
+        "    system('whoami')\n"
+        "    return {'n': data[0]}\n"
+    )
+    assert _is_llm_patch_ast_safe(src_inner_import, patch_import_swap, "parse_packet") is False
+    # Unsafe receiver method call (`os.replace` when `os` already in scope) MUST be rejected
+    src_with_os = "import os\ndef parse_packet(data: bytes) -> dict:\n    return {'n': data[0]}\n"
+    patch_os_replace = "import os\ndef parse_packet(data: bytes) -> dict:\n    os.replace('a', 'b')\n    return {'n': data[0]}\n"
+    assert _is_llm_patch_ast_safe(src_with_os, patch_os_replace, "parse_packet") is False
+
+    # Context-local profile scope resolution must keep default ACK runs strictly separated per profile (AGENTS.md:13)
+    from hermes_cyber.ack.deliverables import resolve_ack_runs_dir
+    from hermes_cyber.router_bridge import bind_cyber_profile_scope
+    home_a = tmp_path / "profile_alpha"
+    home_b = tmp_path / "profile_beta"
+    home_a.mkdir()
+    home_b.mkdir()
+    with bind_cyber_profile_scope(home_dir=home_a, profile="alpha"):
+        dir_a = resolve_ack_runs_dir()
+        rep_a = AdversarialCyberKernel().run_mission("ack-m1-exploit-patch-bypass", mutation_rounds=1)
+        assert Path(rep_a.deliverable_dir).is_relative_to(dir_a)
+        assert Path(rep_a.deliverable_dir).is_relative_to(home_a.resolve())
+    with bind_cyber_profile_scope(home_dir=home_b, profile="beta"):
+        dir_b = resolve_ack_runs_dir()
+        assert dir_a != dir_b
+        assert AdversarialCyberKernel().list_runs() == []
 
     # JSON corpus file for a `str`-typed parser must stay raw str text (not parsed into dict)
     from hermes_cyber.ack.workspace import _build_valid_corpus_entries
@@ -625,6 +691,52 @@ def test_ack_independent_red_blue_subagents_llm_integration_and_ast_safety_gate(
     for bc in blue_mock.calls:
         assert "failed_attack_classes" not in bc["prompt"]
         assert "red_mutation_plan" not in bc["prompt"]
+
+
+def test_ack_runs_dir_strict_profile_isolation_and_explicit_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import tempfile
+    from hermes_constants import get_hermes_home
+    from hermes_cyber.ack.deliverables import resolve_ack_runs_dir
+    from hermes_cyber.router_bridge import bind_cyber_profile_scope
+
+    fake_user_home = tmp_path / "user_home"
+    fake_temp = tmp_path / "os_temp"
+    legacy_runs_root = fake_temp / "NOEMETRA" / "runs"
+    legacy_run = legacy_runs_root / "ack-run-legacy1"
+    legacy_run.mkdir(parents=True)
+    (legacy_run / "report.json").write_text(json.dumps({"run_id": "ack-run-legacy1", "deliverable_dir": str(legacy_run)}), encoding="utf-8")
+    (legacy_run / "manifest.json").write_text(json.dumps({"run_id": "ack-run-legacy1", "exported_at": "2026-11-20T00:00:00Z", "sha256": {}}), encoding="utf-8")
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(fake_user_home / "AppData" / "Local"))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_temp))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_user_home))
+
+    profile_a = tmp_path / "profile_a"
+    profile_b = tmp_path / "profile_b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    with bind_cyber_profile_scope(home_dir=profile_a, profile="alpha"):
+        dir_a = resolve_ack_runs_dir()
+        assert dir_a == (profile_a.resolve() / "NOEMETRA" / "runs").resolve()
+        assert AdversarialCyberKernel().list_runs() == []
+    with bind_cyber_profile_scope(home_dir=profile_b, profile="beta"):
+        dir_b = resolve_ack_runs_dir()
+        assert dir_b == (profile_b.resolve() / "NOEMETRA" / "runs").resolve()
+        assert dir_b != dir_a
+        assert AdversarialCyberKernel().list_runs() == []
+
+    # Unscoped temp runs carry no profile ownership and are never auto-migrated into default home
+    expected_default_home = get_hermes_home().resolve()
+    expected_default_runs = (expected_default_home / "NOEMETRA" / "runs").resolve()
+    assert expected_default_runs.is_relative_to(fake_user_home.resolve())
+    assert resolve_ack_runs_dir() == expected_default_runs
+    assert AdversarialCyberKernel().list_runs() == []
+    assert legacy_run.is_dir()
+
+    # Callers needing to inspect an explicit non-profile runs dir can pass runs_dir=...
+    explicit_runs = AdversarialCyberKernel().list_runs(runs_dir=legacy_runs_root)
+    assert any(r.get("run_id") == "ack-run-legacy1" for r in explicit_runs)
 
 
 def test_ack_rest_api_runs_apply_patch_tool_and_ui_exposure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
