@@ -12,7 +12,10 @@ from hermes_cyber.ack.catalog import (
 )
 from hermes_cyber.ack.chamber import DetonationChamber
 from hermes_cyber.ack.fog_of_war import FogOfWarController
-from hermes_cyber.ack.red_subagents import record_red_mission_traces
+from hermes_cyber.ack.red_subagents import (
+    propose_m1_red_http_payloads,
+    record_red_mission_traces,
+)
 from hermes_cyber.ack.workspace import compute_unified_diff
 from hermes_cyber.models import (
     AckMissionDescriptor,
@@ -271,6 +274,7 @@ print("FUNC_OK")
             "linux_kernel_seccomp_or_overlayfs_sandbox",
             "statistically_significant_benign_fpr_corpus",
             "target_app_workspace_patch",
+            "autonomous_shell_tool_agent_team",
         ]
         _m1_base_checks = [
             "http_localhost_exploit_repro_on_copied_fixture",
@@ -278,8 +282,9 @@ print("FUNC_OK")
             "python_subproc_confinement_and_fs_snapshot_diff",
         ]
         patch_diff = compute_unified_diff(_M1_VULNERABLE_SERVICE, patched_src, "target_service.py")
+        extra_http_paths, _ = propose_m1_red_http_payloads(red_ctx, red_router)
 
-        def _m1_traces(phase_mut: str, verify_msg: str):
+        def _m1_traces(phase_mut: str, verify_msg: str, red_exec_contributed: bool = False):
             return [
                 *record_red_mission_traces(
                     phase_base_summary=f"M1 exploit baseline eseguito (pre_breach={pre_breach}).",
@@ -287,6 +292,7 @@ print("FUNC_OK")
                     red_ctx=red_ctx,
                     attack_classes=["path_traversal", "ssrf", "encoding_bypass"],
                     router=red_router,
+                    mutator_contributed=red_exec_contributed,
                 ),
                 *record_blue_mission_traces(
                     triage_summary="Analisi difetto canonicalizzazione path e allowlist SSRF su fixture HTTP.",
@@ -317,9 +323,11 @@ print("FUNC_OK")
             return _MissionExecutionOutcome(
                 transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
                 tpr_fpr_matrix=AckTprFprMatrix(
-                    true_positive_rate=0.0, false_positive_rate=0.0, fpr_measured=False,
-                    benign_corpus_size=0, attack_variants_tested=0, evasion_resistance_rate=0.0,
-                    functional_survival_rate=0.0, pre_patch_breach_confirmed=pre_breach, post_patch_breaches=0,
+                    metric_kind="exploit_patch_verification", detector_metrics_applicable=False,
+                    true_positive_rate=None, false_positive_rate=None, exploit_mitigation_rate=0.0,
+                    fpr_measured=False, benign_corpus_size=0, attack_variants_tested=0,
+                    evasion_resistance_rate=0.0, functional_survival_rate=0.0,
+                    pre_patch_breach_confirmed=pre_breach, post_patch_breaches=0,
                 ),
                 blue_summary=blue_summary, certified=False, certification_verdict="REJECTED_BROKEN_FUNCTIONALITY",
                 rationale="Oracolo anti-cheat: la difesa naive ha bloccato le richieste legittime invece di correggere l'invariante.",
@@ -329,10 +337,17 @@ print("FUNC_OK")
                     "Mutazione interrotta: difesa respinta su regressione funzionale.",
                     "Verifica funzionale fallita: richiesta legittima bloccata.",
                 ),
-                patch_diff=patch_diff,
+                patch_diff=patch_diff, patch_classification="none", patch_applicable=False,
             )
 
         # RED_MUTATE_BYPASS (distinct attack classes forced by FogOfWarController, strictly over HTTP)
+        extra_paths_tuple = tuple(extra_http_paths)
+        round1_payloads = repr((
+            "%252e%252e/%252e%252e/canary_vault/canary.txt",
+            "....//....//canary_vault/canary.txt",
+            "../../canary_vault/canary.txt\x00.png",
+            *extra_paths_tuple,
+        )).replace("{", "{{").replace("}", "}}")
         mutation_specs: List[Tuple[str, str]] = [
             (
                 "CLASS_DOUBLE_URL_ENCODING_NULL_BYTE",
@@ -342,11 +357,7 @@ from pathlib import Path
 port = int(os.environ["ACK_TARGET_PORT"])
 loot_path = Path(os.environ["ACK_ARTIFACTS_RED"]) / "loot_{aid}.json"
 hits = []
-for payload in (
-    "%252e%252e/%252e%252e/canary_vault/canary.txt",
-    "....//....//canary_vault/canary.txt",
-    "../../canary_vault/canary.txt\\x00.png",
-):
+for payload in ''' + round1_payloads + ''':
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     conn.request("POST", "/", body=json.dumps({{"path": payload}}), headers={{"Content-Type": "application/json"}})
     resp = conn.getresponse()
@@ -494,19 +505,23 @@ loot_path.write_text(json.dumps({{"status": "COMPLETED", "attempts_executed": le
     ))
     traces = _m1_traces(
         f"M1 mutation bypass loop completato su {len(mut_results)} varianti HTTP (breach={post_breaches}, exec_errors={exec_errors}).",
-        f"Verifica post-patch su {len(mut_results)} varianti: evasion_resistance={evasion_res:.2f}, verdetto={cert_verdict}.",
+        f"Verifica post-patch su {len(mut_results)} varianti: exploit_mitigation={evasion_res:.2f}, verdetto={cert_verdict}.",
+        red_exec_contributed=bool(extra_http_paths),
     )
     return _MissionExecutionOutcome(
         transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=mut_results,
         tpr_fpr_matrix=AckTprFprMatrix(
-            true_positive_rate=evasion_res, false_positive_rate=0.0, fpr_measured=False,
-            benign_corpus_size=0, attack_variants_tested=len(mut_results), evasion_resistance_rate=evasion_res,
-            functional_survival_rate=1.0, pre_patch_breach_confirmed=pre_breach,
-            post_patch_breaches=post_breaches + exec_errors,
+            metric_kind="exploit_patch_verification", detector_metrics_applicable=False,
+            true_positive_rate=None, false_positive_rate=None, exploit_mitigation_rate=evasion_res,
+            fpr_measured=False, benign_corpus_size=0, attack_variants_tested=len(mut_results),
+            evasion_resistance_rate=evasion_res, functional_survival_rate=1.0,
+            pre_patch_breach_confirmed=pre_breach, post_patch_breaches=post_breaches + exec_errors,
         ),
         blue_summary=blue_summary, certified=certified, certification_verdict=cert_verdict, rationale=rationale,
         verification_tier="lab_fixture_verification",
         executed_checks=[*_m1_base_checks, "http_bypass_mutation_loop_on_patched_service"],
         not_executed_checks=_m1_not_executed,
         subagent_traces=traces, patch_diff=patch_diff,
+        patch_classification="semantically_verified_patch" if certified else "none",
+        patch_applicable=False,
     )

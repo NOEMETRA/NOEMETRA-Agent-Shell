@@ -80,8 +80,20 @@ def parse_tlv_frame(data: bytes, depth: int = 0) -> list:
 '''
 
 _M4_DEFAULT_VALID_CORPUS = [
-    {"name": "msg1.bin", "kind": "bytes", "data": b"\x01\x00\x01\x00\x04ABCD".hex()},
-    {"name": "msg2.bin", "kind": "bytes", "data": b"\xff\x00\x01\x00\x08\x02\x00\x01\x00\x03XYZ".hex()},
+    {
+        "name": "msg1.bin",
+        "kind": "bytes",
+        "data": b"\x01\x00\x01\x00\x04ABCD".hex(),
+        "has_semantic_expected": True,
+        "expected_semantic": [{"type": 1, "count": 1, "size": 4}],
+    },
+    {
+        "name": "msg2.bin",
+        "kind": "bytes",
+        "data": b"\xff\x00\x01\x00\x08\x02\x00\x01\x00\x03XYZ".hex(),
+        "has_semantic_expected": True,
+        "expected_semantic": [{"type": 255, "nested": [{"type": 2, "count": 1, "size": 3}]}],
+    },
 ]
 
 _M4_BASE_FUZZ_SCRIPT = '''\
@@ -238,10 +250,20 @@ else:
     rejected_count = 0
     mismatch_count = 0
     error_count = 0
+    semantic_checked = 0
+    semantic_passed = 0
     for item in expected:
         try:
             res = fn(_dec(item))
-            if json.dumps(_stable_snapshot(res), sort_keys=True) != item["expected_snapshot"]:
+            snap_actual = json.dumps(_stable_snapshot(res), sort_keys=True)
+            if item.get("has_semantic_expected"):
+                semantic_checked += 1
+                exp_snap = json.dumps(_stable_snapshot(item.get("expected_semantic")), sort_keys=True)
+                if snap_actual == exp_snap:
+                    semantic_passed += 1
+                else:
+                    mismatch_count += 1
+            elif snap_actual != item["expected_snapshot"]:
                 mismatch_count += 1
         except ValueError:
             rejected_count += 1
@@ -262,8 +284,12 @@ else:
         "rejected_count": rejected_count,
         "mismatch_count": mismatch_count,
         "error_count": error_count,
+        "semantic_checked": semantic_checked,
+        "semantic_passed": semantic_passed,
         "repro_ok": repro_ok,
-        "fpr": round(rejected_count / len(expected), 4) if expected else None,
+        "rejection_rate": round(rejected_count / len(expected), 4) if expected else None,
+        "mismatch_rate": round(mismatch_count / len(expected), 4) if expected else None,
+        "semantic_pass_rate": round(semantic_passed / semantic_checked, 4) if semantic_checked > 0 else None,
     }}
     (blue_dir / "corpus_eval_res.json").write_text(json.dumps(summary), encoding="utf-8")
     if rejected_count == 0 and mismatch_count == 0 and error_count == 0 and repro_ok:

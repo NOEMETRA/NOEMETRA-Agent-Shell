@@ -6,7 +6,10 @@ import inspect
 import json
 from typing import Any, Dict, List, Literal, Optional
 
-from hermes_cyber.ack.blue_subagents import record_blue_mission_traces
+from hermes_cyber.ack.blue_subagents import (
+    propose_m3_blue_hardened_manifest,
+    record_blue_mission_traces,
+)
 from hermes_cyber.ack.catalog import (
     _MissionExecutionOutcome,
     _contract,
@@ -16,6 +19,10 @@ from hermes_cyber.ack.chamber import DetonationChamber
 from hermes_cyber.ack.fog_of_war import FogOfWarController
 from hermes_cyber.ack.manifest_parser import _parse_target_host_config
 from hermes_cyber.ack.manifest_patcher import _harden_manifest_text, _validate_hardened_manifest_syntax
+from hermes_cyber.ack.mission_m3_templates import (
+    _M3_DEFAULT_SYNTHETIC_MANIFEST,
+    _build_m3_host_runtime_sim,
+)
 from hermes_cyber.ack.red_subagents import record_red_mission_traces
 from hermes_cyber.ack.workspace import compute_unified_diff
 from hermes_cyber.ack.yaml_compat import _yaml_safe_dump_compat, _yaml_safe_load_compat
@@ -31,70 +38,6 @@ from hermes_cyber.models import (
     TelemetryAlertEvidence,
 )
 from hermes_cyber.router_bridge import ModelRouter
-
-_M3_DEFAULT_SYNTHETIC_MANIFEST = """\
-[Unit]
-Description=NOEMETRA Target Privileged Helper Service
-
-[Service]
-ServiceEnabled=true
-NoNewPrivileges=false
-ProtectSystem=false
-HelperWritable=true
-AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-
-[Socket]
-SocketMode=0666
-"""
-
-
-def _build_m3_host_runtime_sim() -> str:
-    yaml_load_src = inspect.getsource(_yaml_safe_load_compat)
-    parser_src = inspect.getsource(_parse_target_host_config)
-    return (
-        "import io, json, os, re\n"
-        "from pathlib import Path\n"
-        "from typing import Any, Dict, List, Optional, Tuple\n\n"
-        f"{yaml_load_src}\n\n"
-        f"{parser_src}\n\n"
-        '''\
-def check_action(vector: str) -> str:
-    up = Path(os.environ["ACK_UPPERDIR"])
-    manifest_text = (up / "cloned_target_manifest.conf").read_text(encoding="utf-8")
-    cfg = _parse_target_host_config(manifest_text)
-    canary_path = up / "canary_vault" / "canary.txt"
-    if vector == "healthcheck":
-        if not cfg.get("service_enabled", False):
-            raise RuntimeError("Service offline")
-        return "SERVICE_HEALTHY_200"
-    if vector == "helper_hijack":
-        if cfg.get("helper_writable") and not cfg.get("NoNewPrivileges"):
-            return canary_path.read_text(encoding="utf-8")
-        raise PermissionError("Helper script read-only & NoNewPrivileges enforced")
-    if vector == "ambient_caps":
-        caps = set(cfg.get("ambient_caps") or [])
-        if cfg.get("privileged_container") or ("CAP_SYS_ADMIN" in caps) or ("CAP_DAC_READ_SEARCH" in caps):
-            return canary_path.read_text(encoding="utf-8")
-        raise PermissionError("Privileged container & ambient capabilities dropped")
-    if vector == "unix_socket_ctl":
-        if not cfg.get("socket_acl_restricted"):
-            return canary_path.read_text(encoding="utf-8")
-        raise PermissionError("Unauthorized unix control socket denied")
-    raise ValueError(f"Unknown vector: {vector}")
-
-def handle_request(payload: dict) -> tuple:
-    try:
-        out = check_action(str(payload.get("vector", "")))
-        return 200, {"output": out}
-    except RuntimeError as exc:
-        return 503, {"error": str(exc)}
-    except PermissionError as exc:
-        return 403, {"error": str(exc)}
-    except Exception as exc:
-        return 400, {"error": str(exc)}
-'''
-    )
 
 
 def _run_m3_attack_path_hardening(
@@ -115,10 +58,10 @@ def _run_m3_attack_path_hardening(
     evidences: List[OutOfBandOracleEvidence] = []
     mut_results: List[AckMutationRoundResult] = []
     _m3_not_executed = [
-        "systemd_or_k8s_live_runtime_check",
-        "linux_kernel_seccomp_or_overlayfs_sandbox",
+        "live_systemd_or_kubernetes_control_plane_apply",
         "statistically_significant_benign_fpr_corpus",
         "target_host_live_apply",
+        "autonomous_shell_tool_agent_team",
     ]
 
     has_real_manifest = bool(target_config_content and target_config_content.strip())
@@ -159,9 +102,11 @@ def _run_m3_attack_path_hardening(
         return _MissionExecutionOutcome(
             transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
             tpr_fpr_matrix=AckTprFprMatrix(
-                true_positive_rate=0.0, false_positive_rate=0.0, fpr_measured=False,
-                benign_corpus_size=0, attack_variants_tested=0, evasion_resistance_rate=0.0,
-                functional_survival_rate=0.0, pre_patch_breach_confirmed=False, post_patch_breaches=0,
+                metric_kind="config_hardening_verification", detector_metrics_applicable=False,
+                true_positive_rate=None, false_positive_rate=None, exploit_mitigation_rate=0.0,
+                fpr_measured=False, benign_corpus_size=0, attack_variants_tested=0,
+                evasion_resistance_rate=0.0, functional_survival_rate=0.0,
+                pre_patch_breach_confirmed=False, post_patch_breaches=0,
             ),
             blue_summary="Nessuna patch applicata: manifest non valido.",
             certified=False, certification_verdict="INVALID_MANIFEST_FORMAT",
@@ -238,9 +183,11 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
         return _MissionExecutionOutcome(
             transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
             tpr_fpr_matrix=AckTprFprMatrix(
-                true_positive_rate=0.0, false_positive_rate=0.0, fpr_measured=False,
-                benign_corpus_size=0, attack_variants_tested=0, evasion_resistance_rate=0.0,
-                functional_survival_rate=1.0, pre_patch_breach_confirmed=False, post_patch_breaches=0,
+                metric_kind="config_hardening_verification", detector_metrics_applicable=False,
+                true_positive_rate=None, false_positive_rate=None, exploit_mitigation_rate=0.0,
+                fpr_measured=False, benign_corpus_size=0, attack_variants_tested=0,
+                evasion_resistance_rate=0.0, functional_survival_rate=1.0,
+                pre_patch_breach_confirmed=False, post_patch_breaches=0,
             ),
             blue_summary="Nessun diff necessario: il manifest clonato non esponeva vettori di escalation attivi pre-patch.",
             certified=False,
@@ -257,8 +204,21 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
         )
 
     blue_ctx = fow.build_blue_context(baseline_summary=json.dumps(baseline_cfg), oob_baseline=base_ev)
+    llm_manifest_candidate: Optional[str] = None
+    used_llm_manifest = False
+    if defense_mode != "naive_block_all" and blue_router is not None:
+        cand_m, _ = propose_m3_blue_hardened_manifest(manifest_text, str(baseline_cfg["format"]), blue_ctx, blue_router)
+        if cand_m and _validate_hardened_manifest_syntax(cand_m, str(baseline_cfg["format"]), enforce_hardened=True):
+            llm_manifest_candidate = cand_m
+            used_llm_manifest = True
+
     if defense_mode == "naive_block_all":
         blue_summary = f"naive_block_all ({baseline_cfg['format']}): disattivato il servizio nel manifest clonato."
+    elif used_llm_manifest:
+        blue_summary = (
+            f"structural (LLM hardened manifest {baseline_cfg['format']}): manifest proposto dal modello "
+            "validato sintatticamente e applicato su `cloned_target_manifest.conf`."
+        )
     else:
         blue_summary = (
             f"structural ({baseline_cfg['format']}): hardening format-preserving di `cloned_target_manifest.conf` "
@@ -269,21 +229,23 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
     yaml_dump_src = inspect.getsource(_yaml_safe_dump_compat)
     parse_fn_src = inspect.getsource(_parse_target_host_config)
     harden_fn_src = inspect.getsource(_harden_manifest_text)
+    apply_m3_body = (
+        f"up = Path(os.environ['ACK_UPPERDIR'])\n(up / 'cloned_target_manifest.conf').write_text({llm_manifest_candidate!r}, encoding='utf-8')\n"
+        if used_llm_manifest and llm_manifest_candidate is not None
+        else (
+            f"{yaml_load_src}\n\n{yaml_dump_src}\n\n{parse_fn_src}\n\n{harden_fn_src}\n\n"
+            "up = Path(os.environ['ACK_UPPERDIR'])\n"
+            "manifest_path = up / 'cloned_target_manifest.conf'\n"
+            f"manifest_path.write_text(_harden_manifest_text(manifest_path.read_text(encoding='utf-8'), {defense_mode!r}), encoding='utf-8')\n"
+        )
+    )
     rel_blue, _ = chamber.write_blue_artifact(
         "apply_hardening_m3.py",
         (
             "import io, json, os, re\n"
             "from pathlib import Path\n"
             "from typing import Any, Dict, List, Optional, Tuple\n\n"
-            f"{yaml_load_src}\n\n"
-            f"{yaml_dump_src}\n\n"
-            f"{parse_fn_src}\n\n"
-            f"{harden_fn_src}\n\n"
-            "up = Path(os.environ['ACK_UPPERDIR'])\n"
-            "manifest_path = up / 'cloned_target_manifest.conf'\n"
-            "manifest_path.write_text(_harden_manifest_text(manifest_path.read_text(encoding='utf-8'), "
-            f"{defense_mode!r}"
-            "), encoding='utf-8')\n"
+            f"{apply_m3_body}"
         ),
     )
     blue_contract = _contract(
@@ -313,7 +275,11 @@ for vec in ("helper_hijack", "ambient_caps", "unix_socket_ctl"):
             ),
             *record_blue_mission_traces(
                 triage_summary=f"Analisi configurazione `{baseline_cfg['format']}` per privilegi helper/capabilities/socket.",
-                patch_summary=blue_summary, verify_summary=verify_msg, blue_ctx=blue_ctx, router=blue_router,
+                patch_summary=blue_summary,
+                verify_summary=verify_msg,
+                blue_ctx=blue_ctx,
+                router=blue_router,
+                patch_contributed=used_llm_manifest,
             ),
         ]
     post_cfg = _parse_target_host_config(post_manifest_text)
@@ -393,9 +359,11 @@ print("SERVICE_HEALTHY_200", end="")
             return _MissionExecutionOutcome(
                 transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
                 tpr_fpr_matrix=AckTprFprMatrix(
-                    true_positive_rate=0.0, false_positive_rate=0.0, fpr_measured=False,
-                    benign_corpus_size=0, attack_variants_tested=0, evasion_resistance_rate=0.0,
-                    functional_survival_rate=0.0, pre_patch_breach_confirmed=pre_breach, post_patch_breaches=0,
+                    metric_kind="config_hardening_verification", detector_metrics_applicable=False,
+                    true_positive_rate=None, false_positive_rate=None, exploit_mitigation_rate=0.0,
+                    fpr_measured=False, benign_corpus_size=0, attack_variants_tested=0,
+                    evasion_resistance_rate=0.0, functional_survival_rate=0.0,
+                    pre_patch_breach_confirmed=pre_breach, post_patch_breaches=0,
                 ),
                 blue_summary=blue_summary, certified=False, certification_verdict="REJECTED_SERVICE_OUTAGE",
                 rationale="Hardening ha disabilitato il servizio invece di correggere i privilegi.",
@@ -523,10 +491,11 @@ out = body.get("output") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}
     return _MissionExecutionOutcome(
         transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=mut_results,
         tpr_fpr_matrix=AckTprFprMatrix(
-            true_positive_rate=evasion_res, false_positive_rate=0.0, fpr_measured=False,
-            benign_corpus_size=0, attack_variants_tested=rounds_to_run, evasion_resistance_rate=evasion_res,
-            functional_survival_rate=1.0, pre_patch_breach_confirmed=pre_breach,
-            post_patch_breaches=post_breaches + exec_errors,
+            metric_kind="config_hardening_verification", detector_metrics_applicable=False,
+            true_positive_rate=None, false_positive_rate=None, exploit_mitigation_rate=evasion_res,
+            fpr_measured=False, benign_corpus_size=0, attack_variants_tested=rounds_to_run,
+            evasion_resistance_rate=evasion_res, functional_survival_rate=1.0,
+            pre_patch_breach_confirmed=pre_breach, post_patch_breaches=post_breaches + exec_errors,
         ),
         blue_summary=blue_summary, certified=certified, certification_verdict=cert_verdict,
         rationale=rationale, audit_scope=audit_scope, verification_tier=ver_tier,
@@ -534,7 +503,9 @@ out = body.get("output") or f"BLOCKED({{resp.status}}): {{body.get('error', '')}
         not_executed_checks=_m3_not_executed,
         subagent_traces=_m3_traces(
             f"Testati {rounds_to_run} vettori privesc simulati (bypass={post_breaches}, errors={exec_errors}).",
-            f"Hardening verificato sul simulatore: verdetto={cert_verdict}, evasion_resistance={evasion_res:.2f}.",
+            f"Hardening verificato sul simulatore: verdetto={cert_verdict}, exploit_mitigation={evasion_res:.2f}.",
         ),
         patch_diff=patch_diff,
+        patch_classification="semantically_verified_patch" if certified else "none",
+        patch_applicable=False,
     )

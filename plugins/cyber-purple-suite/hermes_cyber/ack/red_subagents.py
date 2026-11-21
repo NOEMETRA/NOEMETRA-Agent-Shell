@@ -130,11 +130,14 @@ class RedReconSubAgent:
             "llm_hex_seeds": llm_hex_seeds[:8],
             "llm_str_seeds": llm_str_seeds[:8],
         }
+        llm_used = bool(llm_hex_seeds or llm_str_seeds)
         trace = AckSubAgentTrace(
             team="RED",
             role="RedReconSubAgent",
             phase="INIT_ARENA",
             model_used=model_used,
+            execution_kind="llm_executable_proposal" if llm_used else ("llm_advisory_note" if router is not None else "deterministic_role"),
+            contributed_payloads_or_patch=llm_used,
             visible_context_keys=sorted(red_ctx.keys()),
             summary=(
                 f"Analizzata firma `{target_function}({', '.join(arg_names)})` [input={input_kind}, "
@@ -210,6 +213,8 @@ class RedWeaponizerSubAgent:
             role="RedWeaponizerSubAgent",
             phase="RED_WEAPONIZE",
             model_used="deterministic",
+            execution_kind="deterministic_role",
+            contributed_payloads_or_patch=True,
             visible_context_keys=sorted(red_ctx.keys()),
             summary=f"Generati {len(candidates)} input avversari `{input_kind}` per il fuzzing & minimizzazione delta.",
             artifacts=["repro_min_crash"],
@@ -290,6 +295,7 @@ class RedBypassMutatorSubAgent:
             ]
 
         model_used = "deterministic"
+        llm_added = False
         if router is not None:
             sys_prompt = (
                 "You are RedBypassMutatorSubAgent under strict Fog of War. "
@@ -309,12 +315,14 @@ class RedBypassMutatorSubAgent:
                         try:
                             bytes.fromhex(hx)
                             specs[0][1].append({"kind": "bytes", "data": hx})
+                            llm_added = True
                         except ValueError:
                             pass
             elif isinstance(parsed, dict):
                 for st in (parsed.get("extra_str_mutations") or [])[:4]:
                     if isinstance(st, str):
                         specs[0][1].append({"kind": "json", "data": st})
+                        llm_added = True
 
         filtered = [s for s in specs if s[0] not in already_failed] or specs
         chosen = filtered[: max(1, min(len(filtered), rounds))]
@@ -323,11 +331,67 @@ class RedBypassMutatorSubAgent:
             role="RedBypassMutatorSubAgent",
             phase="RED_MUTATE_BYPASS",
             model_used=model_used,
+            execution_kind="llm_executable_proposal" if llm_added else ("llm_advisory_note" if router is not None else "deterministic_role"),
+            contributed_payloads_or_patch=llm_added,
             visible_context_keys=sorted(red_ctx.keys()),
             summary=f"Pianificati {len(chosen)} round di mutazione con cambio classe obbligatorio.",
             artifacts=[c for c, _ in chosen],
         )
         return chosen, trace
+
+
+def propose_m1_red_http_payloads(
+    red_ctx: Dict[str, Any],
+    router: Optional[ModelRouter],
+) -> Tuple[List[str], str]:
+    """Request executable path/SSRF probe strings from red_router for live HTTP testing in M1."""
+    if router is None:
+        return [], "deterministic"
+    parsed, m_label, _, _ = invoke_router_json(
+        router,
+        system_prompt=(
+            "You are RedBypassMutatorSubAgent under strict Fog of War. "
+            "Propose candidate path traversal or SSRF probe strings to execute against the isolated HTTP endpoint. "
+            "Reply JSON: {\"extra_http_paths\": [...]}."
+        ),
+        user_prompt=json.dumps({"red_context": red_ctx}),
+        scrubber=PrivacyScrubber(),
+    )
+    out: List[str] = []
+    if isinstance(parsed, dict):
+        for item in (parsed.get("extra_http_paths") or [])[:4]:
+            if isinstance(item, str) and 1 <= len(item) <= 160 and "\n" not in item and "\r" not in item:
+                out.append(item)
+    return out, m_label
+
+
+def propose_m2_red_telemetry_events(
+    red_ctx: Dict[str, Any],
+    router: Optional[ModelRouter],
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Request executable JSON telemetry events from red_router for M2 workload replay."""
+    if router is None:
+        return [], "deterministic"
+    parsed, m_label, _, _ = invoke_router_json(
+        router,
+        system_prompt=(
+            "You are RedBypassMutatorSubAgent under strict Fog of War. "
+            "Propose evasion telemetry event candidates to replay against the Python JSON detector. "
+            "Reply JSON: {\"extra_telemetry_events\": [{\"telemetry\": \"...\", \"entropy\": 4.2}]}."
+        ),
+        user_prompt=json.dumps({"red_context": red_ctx}),
+        scrubber=PrivacyScrubber(),
+    )
+    out: List[Dict[str, Any]] = []
+    if isinstance(parsed, dict):
+        for ev in (parsed.get("extra_telemetry_events") or [])[:3]:
+            if isinstance(ev, dict) and isinstance(ev.get("telemetry"), str) and 4 <= len(ev["telemetry"]) <= 240:
+                try:
+                    ent = max(0.0, min(8.0, float(ev.get("entropy", 3.5))))
+                except (TypeError, ValueError):
+                    ent = 3.5
+                out.append({"telemetry": ev["telemetry"], "entropy": ent})
+    return out, m_label
 
 
 def record_red_mission_traces(
@@ -337,10 +401,12 @@ def record_red_mission_traces(
     red_ctx: Dict[str, Any],
     attack_classes: List[str],
     router: Optional[ModelRouter] = None,
+    mutator_execution_kind: Optional[str] = None,
+    mutator_contributed: bool = False,
 ) -> List[AckSubAgentTrace]:
-    """Emit structured Red sub-agent fleet traces for M1-M3 while optionally querying red_router."""
+    """Emit structured Red sub-agent fleet traces for M1-M3 while recording advisory vs executable work."""
     model_used = "deterministic"
-    if router is not None:
+    if router is not None and not mutator_contributed:
         parsed, m_label, _, _ = invoke_router_json(
             router,
             system_prompt=(
@@ -353,14 +419,21 @@ def record_red_mission_traces(
         model_used = m_label
         if isinstance(parsed, dict) and parsed.get("strategy_note"):
             phase_mut_summary = f"{phase_mut_summary} | LLM Red note: {str(parsed['strategy_note'])[:140]}"
+    elif router is not None and mutator_contributed:
+        model_used = getattr(router, "last_model_used", None) or getattr(router, "ollama_model", "llm")
 
+    eff_mut_kind = mutator_execution_kind or (
+        "llm_executable_proposal" if mutator_contributed else ("llm_advisory_note" if router is not None else "deterministic_role")
+    )
     keys = sorted(red_ctx.keys())
     return [
         AckSubAgentTrace(
             team="RED",
             role="RedReconSubAgent",
             phase="INIT_ARENA",
-            model_used=model_used,
+            model_used=model_used if not mutator_contributed else "deterministic",
+            execution_kind="llm_advisory_note" if (router is not None and not mutator_contributed) else "deterministic_role",
+            contributed_payloads_or_patch=False,
             visible_context_keys=keys,
             summary=f"Mappatura superficie d'attacco `{red_ctx.get('target_endpoint', 'target')}` senza visibilità sulle difese Blue.",
             artifacts=[],
@@ -370,6 +443,8 @@ def record_red_mission_traces(
             role="RedWeaponizerSubAgent",
             phase="RED_WEAPONIZE",
             model_used="deterministic",
+            execution_kind="deterministic_role",
+            contributed_payloads_or_patch=True,
             visible_context_keys=keys,
             summary=phase_base_summary,
             artifacts=["baseline_poc"],
@@ -379,6 +454,8 @@ def record_red_mission_traces(
             role="RedBypassMutatorSubAgent",
             phase="RED_MUTATE_BYPASS",
             model_used=model_used,
+            execution_kind=eff_mut_kind,  # type: ignore[arg-type]
+            contributed_payloads_or_patch=mutator_contributed,
             visible_context_keys=keys,
             summary=phase_mut_summary,
             artifacts=list(attack_classes),

@@ -5,132 +5,20 @@ from __future__ import annotations
 import ast
 import json
 import textwrap
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_cyber.ack.ast_safety import (
+    AstPatchAuditResult,
+    audit_llm_patch_ast,
+    inspect_function_sensitive_ops,
+    is_llm_patch_ast_safe,
+)
 from hermes_cyber.models import AckSubAgentTrace
 from hermes_cyber.observer import PrivacyScrubber
 from hermes_cyber.router_bridge import ModelRouter, invoke_router_json
 
-_SAFE_PATCH_ALLOWLIST = frozenset({
-    # Pure builtins & safe exceptions
-    "ValueError", "TypeError", "KeyError", "IndexError", "OverflowError", "ZeroDivisionError",
-    "AssertionError", "RuntimeError", "RecursionError", "Exception",
-    "len", "isinstance", "issubclass", "int", "float", "str", "bytes", "bytearray", "memoryview",
-    "bool", "dict", "list", "tuple", "set", "frozenset", "range", "enumerate", "zip",
-    "min", "max", "sum", "abs", "round", "sorted", "reversed", "all", "any",
-    "chr", "ord", "hex", "bin", "oct", "slice", "iter", "next", "repr", "ascii", "divmod", "pow", "hash",
-    "None", "True", "False",
-    # Pure non-mutating validation/unpack methods (excludes filesystem-ambiguous names like `replace`/`remove`)
-    "strip", "lstrip", "rstrip", "startswith", "endswith", "isdigit", "isalpha", "isalnum",
-    "isascii", "isspace", "count", "fromhex", "unpack", "unpack_from", "calcsize",
-})
-_UNSAFE_ATTR_RECEIVERS = frozenset({
-    "os", "sys", "subprocess", "shutil", "pathlib", "Path", "io",
-    "socket", "ctypes", "importlib", "builtins",
-})
-_FORBIDDEN_PATCH_NAMES = frozenset({
-    "eval", "exec", "compile", "__import__", "system", "popen", "spawn",
-    "open", "write", "writelines", "write_text", "write_bytes",
-    "unlink", "remove", "rmdir", "rename", "replace", "mkdir", "makedirs",
-    "chmod", "chown", "symlink", "link", "truncate",
-    "getattr", "setattr", "delattr", "globals", "locals", "vars", "breakpoint", "input",
-})
-
-
-def _extract_ast_surfaces(fn_node: ast.FunctionDef) -> Tuple[Set[str], Set[str], Set[str], Set[str], Set[str], int]:
-    imports: Set[str] = set()
-    calls: Set[str] = set()
-    loaded_names: Set[str] = set()
-    bound_names: Set[str] = {fn_node.name}
-    attr_records: Set[str] = set()
-    forbidden_nodes = 0
-
-    for node in ast.walk(fn_node):
-        if isinstance(node, ast.arg):
-            bound_names.add(node.arg)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            bound_names.add(node.name)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node is not fn_node:
-            forbidden_nodes += 1
-        elif isinstance(node, (ast.ClassDef, ast.Global, ast.Nonlocal, ast.Delete, ast.Lambda)):
-            forbidden_nodes += 1
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            imports.add(ast.dump(node, include_attributes=False))
-        elif isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name) and node.value.id in _UNSAFE_ATTR_RECEIVERS:
-                forbidden_nodes += 1
-            attr_records.add(node.attr)
-            if node.attr in _FORBIDDEN_PATCH_NAMES or node.attr.startswith("_"):
-                forbidden_nodes += 1
-        elif isinstance(node, ast.Name):
-            if node.id in _FORBIDDEN_PATCH_NAMES or node.id.startswith("__"):
-                forbidden_nodes += 1
-            if isinstance(node.ctx, ast.Store):
-                bound_names.add(node.id)
-            elif isinstance(node.ctx, ast.Load):
-                loaded_names.add(node.id)
-        elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                calls.add(node.func.id)
-            elif isinstance(node.func, ast.Attribute):
-                calls.add(node.func.attr)
-            else:
-                forbidden_nodes += 1
-
-    return imports, calls, loaded_names, bound_names, attr_records, forbidden_nodes
-
-
-def _is_llm_patch_ast_safe(original_source: str, patched_source: str, target_function: str) -> bool:
-    """Reject LLM-proposed patches unless strictly scoped to target_function and default-deny AST allowlisted."""
-    try:
-        orig_tree = ast.parse(original_source)
-        patch_tree = ast.parse(patched_source)
-    except SyntaxError:
-        return False
-
-    def _non_target_dumps(tree: ast.Module) -> List[str]:
-        return [
-            ast.dump(n, include_attributes=False)
-            for n in tree.body
-            if not (isinstance(n, ast.FunctionDef) and n.name == target_function)
-        ]
-
-    orig_fns = [n for n in orig_tree.body if isinstance(n, ast.FunctionDef) and n.name == target_function]
-    patch_fns = [n for n in patch_tree.body if isinstance(n, ast.FunctionDef) and n.name == target_function]
-    if len(orig_fns) != 1 or len(patch_fns) != 1:
-        return False
-    orig_fn, patch_fn = orig_fns[0], patch_fns[0]
-    orig_decs = [ast.dump(d, include_attributes=False) for d in orig_fn.decorator_list]
-    patch_decs = [ast.dump(d, include_attributes=False) for d in patch_fn.decorator_list]
-    if orig_decs != patch_decs:
-        return False
-    if ast.dump(orig_fn.args, include_attributes=False) != ast.dump(patch_fn.args, include_attributes=False):
-        return False
-    orig_ret = ast.dump(orig_fn.returns, include_attributes=False) if orig_fn.returns is not None else None
-    patch_ret = ast.dump(patch_fn.returns, include_attributes=False) if patch_fn.returns is not None else None
-    if orig_ret != patch_ret:
-        return False
-    if _non_target_dumps(orig_tree) != _non_target_dumps(patch_tree):
-        return False
-
-    o_imp, o_calls, o_load, o_bound, o_attrs, o_forbid = _extract_ast_surfaces(orig_fn)
-    p_imp, p_calls, p_load, p_bound, p_attrs, p_forbid = _extract_ast_surfaces(patch_fn)
-    allowed_calls = _SAFE_PATCH_ALLOWLIST | {target_function}
-
-    if p_imp != o_imp:
-        return False
-    if p_forbid > o_forbid:
-        return False
-    for cname in p_calls - o_calls:
-        if cname not in allowed_calls:
-            return False
-    for name in (p_load - p_bound) - (o_load - o_bound):
-        if name.startswith("_") or name not in _SAFE_PATCH_ALLOWLIST:
-            return False
-    for attr in p_attrs - o_attrs:
-        if attr.startswith("_") or attr not in _SAFE_PATCH_ALLOWLIST:
-            return False
-    return True
+# Preserve historical internal name for tests and sibling modules
+_is_llm_patch_ast_safe = is_llm_patch_ast_safe
 
 
 def _apply_deterministic_ast_parser_hardening(
@@ -189,9 +77,9 @@ def _apply_deterministic_ast_parser_hardening(
 
     has_parser_crash_err = "class ParserCrashError" in original_source
     crash_types = (
-        "(ParserCrashError, IndexError, KeyError, TypeError, AttributeError, ZeroDivisionError, RecursionError, OverflowError, MemoryError, UnicodeDecodeError)"
+        "(ParserCrashError, IndexError, KeyError, TypeError, AttributeError, ZeroDivisionError, RecursionError, OverflowError, UnicodeDecodeError)"
         if has_parser_crash_err
-        else "(IndexError, KeyError, TypeError, AttributeError, ZeroDivisionError, RecursionError, OverflowError, MemoryError, UnicodeDecodeError)"
+        else "(IndexError, KeyError, TypeError, AttributeError, ZeroDivisionError, RecursionError, OverflowError, UnicodeDecodeError)"
     )
 
     if expected_kind == "bytes":
@@ -294,7 +182,8 @@ class BluePatchArchitectSubAgent:
         builtin_fixed_src: str = "",
         builtin_naive_block_src: str = "",
         router: Optional[ModelRouter] = None,
-    ) -> Tuple[str, str, AckSubAgentTrace]:
+    ) -> Tuple[str, str, AckSubAgentTrace, Dict[str, Any]]:
+        orig_sensitive, orig_non_allow = inspect_function_sensitive_ops(original_source, target_function)
         if defense_mode == "naive_block_all":
             if is_builtin_tlv and builtin_naive_block_src:
                 patched = builtin_naive_block_src
@@ -308,13 +197,23 @@ class BluePatchArchitectSubAgent:
                 role="BluePatchArchitectSubAgent",
                 phase="BLUE_DEFEND",
                 model_used="deterministic",
+                execution_kind="deterministic_role",
+                contributed_payloads_or_patch=True,
                 visible_context_keys=sorted(blue_ctx.keys()),
                 summary="Modalità anti-cheat `naive_block_all`: tutti gli input bloccati.",
                 artifacts=["patch.diff"],
             )
-            return patched, "naive_block_all: rifiuta tutti gli input del parser.", trace
+            meta = {
+                "patch_origin": "naive_block_all",
+                "sensitive_ops_in_original": orig_sensitive,
+                "non_allowlisted_calls_in_original": orig_non_allow,
+                "ast_manual_review_required": True,
+                "llm_rejection_reasons": [],
+            }
+            return patched, "naive_block_all: rifiuta tutti gli input del parser.", trace, meta
 
         model_used = "deterministic"
+        llm_rejections: List[str] = []
         if router is not None and not is_builtin_tlv:
             sys_prompt = (
                 "You are BluePatchArchitectSubAgent under strict Fog of War. "
@@ -336,31 +235,44 @@ class BluePatchArchitectSubAgent:
             )
             if isinstance(parsed, dict) and isinstance(parsed.get("patched_source"), str):
                 cand_src = parsed["patched_source"]
-                if _is_llm_patch_ast_safe(original_source, cand_src, target_function):
+                audit_res: AstPatchAuditResult = audit_llm_patch_ast(original_source, cand_src, target_function)
+                if audit_res.safe:
                     summary = str(parsed.get("summary") or "structural (Blue LLM patch AST-verified)")
                     trace = AckSubAgentTrace(
                         team="BLUE",
                         role="BluePatchArchitectSubAgent",
                         phase="BLUE_DEFEND",
                         model_used=m_label,
+                        execution_kind="llm_executable_proposal",
+                        contributed_payloads_or_patch=True,
                         visible_context_keys=sorted(blue_ctx.keys()),
                         summary=summary,
                         artifacts=["patch.diff"],
                     )
-                    return cand_src, summary, trace
+                    meta = {
+                        "patch_origin": "llm_ast_audited_patch",
+                        "sensitive_ops_in_original": orig_sensitive,
+                        "non_allowlisted_calls_in_original": audit_res.non_allowlisted_calls_in_original,
+                        "ast_manual_review_required": audit_res.manual_review_required,
+                        "llm_rejection_reasons": [],
+                    }
+                    return cand_src, summary, trace, meta
+                llm_rejections = list(audit_res.rejection_reasons)
                 model_used = f"{m_label} (fallback_ast_guard)"
 
         if is_builtin_tlv and builtin_fixed_src:
             patched = builtin_fixed_src
+            patch_origin = "builtin_structural_fix"
             summary = (
                 "structural: validazione esplicita bounds header (`length <= remaining`), "
                 "`count <= 256`, profondità max `8` con `InvalidTlvFrameError(ValueError)`."
             )
         else:
             patched = _apply_deterministic_ast_parser_hardening(original_source, target_function, expected_kind)
+            patch_origin = "deterministic_exception_wrapper"
             summary = (
-                f"structural (AST hardener): validazione tipo/dimensione, limite profondità ricorsione (64) "
-                f"e contenimento sicuro {triage.get('exception_types') or ['ValueError']} su `{target_function}`."
+                f"structural (exception containment wrapper): validazione tipo/dimensione, profondità max (64) "
+                f"e conversione sicura {triage.get('exception_types') or ['ValueError']} in ValueError su `{target_function}`."
             )
 
         trace = AckSubAgentTrace(
@@ -368,11 +280,20 @@ class BluePatchArchitectSubAgent:
             role="BluePatchArchitectSubAgent",
             phase="BLUE_DEFEND",
             model_used=model_used,
+            execution_kind="deterministic_role" if model_used == "deterministic" else "llm_advisory_note",
+            contributed_payloads_or_patch=True,
             visible_context_keys=sorted(blue_ctx.keys()),
             summary=summary,
             artifacts=["patch.diff"],
         )
-        return patched, summary, trace
+        meta = {
+            "patch_origin": patch_origin,
+            "sensitive_ops_in_original": orig_sensitive,
+            "non_allowlisted_calls_in_original": orig_non_allow,
+            "ast_manual_review_required": bool(patch_origin == "deterministic_exception_wrapper" or orig_sensitive),
+            "llm_rejection_reasons": llm_rejections,
+        }
+        return patched, summary, trace, meta
 
 
 class BlueRegressionSubAgent:
@@ -464,11 +385,14 @@ class BlueRegressionSubAgent:
                 pytest.skip("No valid corpus items supplied.")
             for case in _VALID_CASES:
                 res = fn(_decode_input(case))
-                if "expected_snapshot" in case:
+                if case.get("has_semantic_expected"):
+                    exp_snap = json.dumps(_stable_snapshot(case.get("expected_semantic")), sort_keys=True)
+                    assert json.dumps(_stable_snapshot(res), sort_keys=True) == exp_snap
+                elif "expected_snapshot" in case:
                     assert json.dumps(_stable_snapshot(res), sort_keys=True) == case["expected_snapshot"]
                 elif "expected_repr" in case:
                     assert repr(res) == case["expected_repr"]
-                if "expected_json" in case:
+                elif "expected_json" in case:
                     assert res == case["expected_json"]
 
 
@@ -493,6 +417,63 @@ class BlueRegressionSubAgent:
         return test_src, trace
 
 
+def propose_m2_blue_rule_additions(
+    blue_ctx: Dict[str, Any],
+    router: Optional[ModelRouter],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Ask blue_router for executable JSON telemetry patterns actually merged and tested in M2."""
+    if router is None:
+        return None, "deterministic"
+    parsed, m_label, _, _ = invoke_router_json(
+        router,
+        system_prompt=(
+            "You are BluePatchArchitectSubAgent under strict Fog of War. "
+            "Propose executable detection substrings for JSON telemetry events. "
+            "Reply JSON: {\"extra_patterns\": [...], \"defense_note\": \"...\"}."
+        ),
+        user_prompt=json.dumps({"blue_context": blue_ctx}),
+        scrubber=PrivacyScrubber(),
+    )
+    if isinstance(parsed, dict):
+        raw_pats = parsed.get("extra_patterns") or []
+        clean_pats = [
+            str(p) for p in raw_pats[:6]
+            if isinstance(p, str) and 4 <= len(p.strip()) <= 64 and "\n" not in p
+        ]
+        if clean_pats:
+            return {
+                "rule_id": "blue_llm_proposed_rule",
+                "engine": "python_json_rule_engine",
+                "patterns": clean_pats,
+                "excludes": ["benign=true", "pytest_worker=true"],
+            }, m_label
+    return None, m_label
+
+
+def propose_m3_blue_hardened_manifest(
+    manifest_text: str,
+    fmt: str,
+    blue_ctx: Dict[str, Any],
+    router: Optional[ModelRouter],
+) -> Tuple[Optional[str], str]:
+    """Ask blue_router for an executable hardened manifest evaluated against M3 syntax + simulator."""
+    if router is None:
+        return None, "deterministic"
+    parsed, m_label, _, _ = invoke_router_json(
+        router,
+        system_prompt=(
+            "You are BluePatchArchitectSubAgent under strict Fog of War. "
+            "Harden the supplied manifest preserving format validity and service health. "
+            "Reply JSON: {\"hardened_manifest\": \"...\", \"defense_note\": \"...\"}."
+        ),
+        user_prompt=json.dumps({"format": fmt, "blue_context": blue_ctx, "manifest": manifest_text[:4000]}),
+        scrubber=PrivacyScrubber(),
+    )
+    if isinstance(parsed, dict) and isinstance(parsed.get("hardened_manifest"), str) and parsed["hardened_manifest"].strip():
+        return parsed["hardened_manifest"], m_label
+    return None, m_label
+
+
 def record_blue_mission_traces(
     *,
     triage_summary: str,
@@ -500,10 +481,12 @@ def record_blue_mission_traces(
     verify_summary: str,
     blue_ctx: Dict[str, Any],
     router: Optional[ModelRouter] = None,
+    patch_execution_kind: Optional[str] = None,
+    patch_contributed: bool = False,
 ) -> List[AckSubAgentTrace]:
-    """Emit structured Blue sub-agent fleet traces for M1-M3 while optionally querying blue_router."""
+    """Emit structured Blue sub-agent fleet traces for M1-M3 while recording advisory vs executable work."""
     model_used = "deterministic"
-    if router is not None:
+    if router is not None and not patch_contributed:
         parsed, m_label, _, _ = invoke_router_json(
             router,
             system_prompt=(
@@ -516,7 +499,12 @@ def record_blue_mission_traces(
         model_used = m_label
         if isinstance(parsed, dict) and parsed.get("defense_note"):
             patch_summary = f"{patch_summary} | LLM Blue note: {str(parsed['defense_note'])[:140]}"
+    elif router is not None and patch_contributed:
+        model_used = getattr(router, "last_model_used", None) or getattr(router, "ollama_model", "llm")
 
+    eff_kind = patch_execution_kind or (
+        "llm_executable_proposal" if patch_contributed else ("llm_advisory_note" if router is not None else "deterministic_role")
+    )
     keys = sorted(blue_ctx.keys())
     return [
         AckSubAgentTrace(
@@ -524,6 +512,8 @@ def record_blue_mission_traces(
             role="BlueTriageSubAgent",
             phase="ORACLE_BASELINE_CHECK",
             model_used="deterministic",
+            execution_kind="deterministic_role",
+            contributed_payloads_or_patch=False,
             visible_context_keys=keys,
             summary=triage_summary,
             artifacts=[],
@@ -533,6 +523,8 @@ def record_blue_mission_traces(
             role="BluePatchArchitectSubAgent",
             phase="BLUE_DEFEND",
             model_used=model_used,
+            execution_kind=eff_kind,  # type: ignore[arg-type]
+            contributed_payloads_or_patch=patch_contributed,
             visible_context_keys=keys,
             summary=patch_summary,
             artifacts=["patch.diff"],
@@ -542,6 +534,8 @@ def record_blue_mission_traces(
             role="BlueRegressionSubAgent",
             phase="ORACLE_FUNCTIONAL_AND_FPR_CHECK",
             model_used="deterministic",
+            execution_kind="deterministic_role",
+            contributed_payloads_or_patch=False,
             visible_context_keys=keys,
             summary=verify_summary,
             artifacts=["regression_tests/"],

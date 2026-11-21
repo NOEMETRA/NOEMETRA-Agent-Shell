@@ -56,7 +56,9 @@ def cyber_run_purple_benchmark(args: Any = None, **kwargs) -> str:
 def cyber_get_status(args: Any = None, **kwargs) -> str:
     """Restituisce lo stato attuale della pipeline cyber, modelli Red/Blue configurati e ultimo caso."""
     try:
-        return json.dumps(_get_cyber_assistant().get_status(), indent=2)
+        status = dict(_get_cyber_assistant().get_status())
+        status.pop("ack_session_id", None)
+        return json.dumps(status, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
@@ -105,9 +107,11 @@ def cyber_run_ack_mission(args: Any = None, **kwargs) -> str:
 
 
 def cyber_apply_ack_patch(args: Any = None, **kwargs) -> str:
-    """Applica esplicitamente una patch certificata ACK sul file target originale dopo conferma e check SHA-256."""
+    """Applica esplicitamente una patch Workspace Mode previo token umano monouso legato a sessione, run e target."""
     run_id = str(_extract_arg(args, kwargs, "run_id", "") or "").strip()
     confirm_raw = _extract_arg(args, kwargs, "confirm_apply", False)
+    approval_token = str(_extract_arg(args, kwargs, "approval_token", "") or "").strip()
+    session_id = str(_extract_arg(args, kwargs, "session_id", "") or "").strip()
     confirm_apply = (
         confirm_raw
         if isinstance(confirm_raw, bool)
@@ -116,7 +120,12 @@ def cyber_apply_ack_patch(args: Any = None, **kwargs) -> str:
     if not run_id:
         return json.dumps({"error": "Parametro 'run_id' obbligatorio."})
     try:
-        result = _get_cyber_assistant().apply_ack_patch(run_id, confirm_apply=confirm_apply)
+        result = _get_cyber_assistant().apply_ack_patch(
+            run_id,
+            confirm_apply=confirm_apply,
+            approval_token=approval_token,
+            session_id=session_id,
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
@@ -246,18 +255,20 @@ TOOLS = [
     },
     {
         "name": "cyber_apply_ack_patch",
-        "description": "Applica su disco una patch certificata da ack-m4-fuzz-to-fix-pipeline solo con conferma esplicita e verifica drift SHA-256.",
+        "description": "Applica su disco una patch ACK Workspace Mode solo con token di approvazione umana monouso vincolato a sessione, run e target.",
         "handler": cyber_apply_ack_patch,
         "schema": {
             "name": "cyber_apply_ack_patch",
-            "description": "Applica patch certificata ACK sul file target originale previa conferma e backup .orig.",
+            "description": "Applica patch ACK sul file target originale previa approvazione monouso legata alla sessione e backup .orig.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "run_id": {"type": "string", "description": "ID della run ACK salvata in NOEMETRA/runs/<run_id>"},
-                    "confirm_apply": {"type": "boolean", "description": "Deve essere true per autorizzare la scrittura sul file originale"},
+                    "confirm_apply": {"type": "boolean", "description": "Deve essere true; richiede inoltre approval_token e session_id umani"},
+                    "approval_token": {"type": "string", "description": "Token monouso emesso dall'operatore umano tramite /ack/apply-approval"},
+                    "session_id": {"type": "string", "description": "Identificatore di sessione attiva ack_session_id legato all'approvazione"},
                 },
-                "required": ["run_id", "confirm_apply"],
+                "required": ["run_id", "confirm_apply", "approval_token", "session_id"],
             },
         },
     },

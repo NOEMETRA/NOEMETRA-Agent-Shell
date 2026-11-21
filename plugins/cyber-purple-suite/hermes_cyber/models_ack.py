@@ -59,6 +59,31 @@ AckSecurityBoundaryType = Literal[
 
 AckWorkspaceModeType = Literal["isolated_copy", "git_worktree"]
 
+AckPatchClassificationType = Literal[
+    "none",
+    "exception_containment_only",
+    "root_cause_patch_unverified_semantics",
+    "semantically_verified_patch",
+]
+
+AckMetricKindType = Literal[
+    "detector_tpr_fpr",
+    "exploit_patch_verification",
+    "config_hardening_verification",
+    "parser_fuzz_verification",
+]
+
+AckSubAgentArchitectureType = Literal[
+    "in_process_role_pipeline",
+    "llm_guided_role_pipeline",
+]
+
+AckSubAgentExecutionKindType = Literal[
+    "deterministic_role",
+    "llm_advisory_note",
+    "llm_executable_proposal",
+]
+
 
 class ActionExecutionLimits(BaseModel):
     """Strict resource and network confinement bounds inside the Detonation Chamber."""
@@ -143,8 +168,16 @@ class FogOfWarAudit(BaseModel):
 class AckTprFprMatrix(BaseModel):
     """Empirical detection, evasion-resistance, and functional-survival scorecard."""
 
-    true_positive_rate: float = 0.0
-    false_positive_rate: float = 0.0
+    metric_kind: AckMetricKindType = "detector_tpr_fpr"
+    detector_metrics_applicable: bool = False
+    true_positive_rate: Optional[float] = None
+    false_positive_rate: Optional[float] = None
+    crash_mitigation_rate: Optional[float] = None
+    valid_input_rejection_rate: Optional[float] = None
+    valid_output_mismatch_rate: Optional[float] = None
+    semantic_assertion_pass_rate: Optional[float] = None
+    semantic_assertions_count: int = 0
+    exploit_mitigation_rate: Optional[float] = None
     max_allowed_fpr: float = 0.05
     evasion_resistance_rate: float = 0.0
     functional_survival_rate: float = 0.0
@@ -184,6 +217,8 @@ class AckSubAgentTrace(BaseModel):
     role: str
     phase: AckStateType
     model_used: str = "deterministic"
+    execution_kind: AckSubAgentExecutionKindType = "deterministic_role"
+    contributed_payloads_or_patch: bool = False
     visible_context_keys: List[str] = Field(default_factory=list)
     summary: str
     artifacts: List[str] = Field(default_factory=list)
@@ -199,6 +234,12 @@ class AckWorkspaceTargetInfo(BaseModel):
     original_sha256: str
     original_untouched: bool = True
     valid_corpus_count: int = 0
+    patch_classification: AckPatchClassificationType = "none"
+    semantic_tests_verified: bool = False
+    semantic_assertions_count: int = 0
+    sensitive_ops_in_original: List[str] = Field(default_factory=list)
+    manual_review_required: bool = False
+    approval_id: Optional[str] = None
     patch_applied: bool = False
     applied_at: Optional[str] = None
 
@@ -241,6 +282,11 @@ class AckCertificationReport(BaseModel):
     target_invariant: str
     certified: bool
     certification_verdict: str
+    patch_classification: AckPatchClassificationType = "none"
+    patch_applicable: bool = False
+    subagent_execution_architecture: AckSubAgentArchitectureType = "in_process_role_pipeline"
+    manual_review_required: bool = False
+    manual_review_reasons: List[str] = Field(default_factory=list)
     executed_checks: List[str] = Field(default_factory=list)
     not_executed_checks: List[str] = Field(default_factory=list)
     state_transitions: List[AckStateTransition] = Field(default_factory=list)

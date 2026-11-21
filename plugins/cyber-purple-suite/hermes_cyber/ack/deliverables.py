@@ -51,21 +51,42 @@ def _infer_lower_vs_upper_diff(chamber: DetonationChamber) -> str:
     return "\n".join(chunks)
 
 
+def _fmt_pct(val: Optional[float]) -> str:
+    return f"{round(val * 100, 1)}%" if val is not None else "N/A"
+
+
 def _render_markdown_report(report: AckCertificationReport) -> str:
     m = report.tpr_fpr_matrix
+    if m.metric_kind == "detector_tpr_fpr" and m.detector_metrics_applicable:
+        metric_lines = [
+            f"- **Detector TPR (True Positive Rate)**: `{_fmt_pct(m.true_positive_rate)}` (`{m.attack_variants_tested}` varianti testate)",
+            f"- **Detector FPR (False Positive Rate)**: `{_fmt_pct(m.false_positive_rate)}` (`fpr_measured={m.fpr_measured}`, `benign_corpus_size={m.benign_corpus_size}`)",
+        ]
+    elif m.metric_kind == "parser_fuzz_verification":
+        metric_lines = [
+            f"- **Crash Mitigation Rate**: `{_fmt_pct(m.crash_mitigation_rate)}` (`{m.attack_variants_tested}` classi fuzz)",
+            f"- **Valid Input Rejection Rate**: `{_fmt_pct(m.valid_input_rejection_rate)}` (`n={m.benign_corpus_size}`)",
+            f"- **Valid Output Mismatch Rate**: `{_fmt_pct(m.valid_output_mismatch_rate)}`",
+            f"- **Semantic Assertions Pass Rate**: `{_fmt_pct(m.semantic_assertion_pass_rate)}` (`{m.semantic_assertions_count}` asserzioni)",
+        ]
+    else:
+        metric_lines = [
+            f"- **Exploit/Bypass Mitigation Rate**: `{_fmt_pct(m.exploit_mitigation_rate)}` (`{m.attack_variants_tested}` round mutati)",
+            f"- **Detector TPR/FPR**: `N/A` (missione non-detector: `{m.metric_kind}`)",
+        ]
     lines: List[str] = [
         f"# NOEMETRA ACK Run Report — `{report.run_id}`",
         "",
         f"- **Missione**: `{report.mission_id}` ({report.title})",
-        f"- **Verdetto**: `{report.certification_verdict}` (`certified={report.certified}`)",
-        f"- **Verification Tier**: `{report.verification_tier}` | **Audit Scope**: `{report.audit_scope}`",
+        f"- **Verdetto**: `{report.certification_verdict}` (`certified={report.certified}`, `patch_classification={report.patch_classification}`)",
+        f"- **Verification Tier**: `{report.verification_tier}` | **Audit Scope**: `{report.audit_scope}` | **Sub-Agent Architecture**: `{report.subagent_execution_architecture}`",
         f"- **Security Boundary**: `{report.security_boundary_level}` ({report.isolation_backend})",
         f"- **Avviso Confine**: {report.untrusted_llm_code_warning}",
+        *(["- **Manual Review Required**: `" + "; ".join(report.manual_review_reasons) + "`"] if report.manual_review_required else []),
         "",
         "## Metriche Misurate",
-        f"- **True Positive / Evasion Resistance Rate**: `{round(m.true_positive_rate * 100, 1)}%` (`{m.attack_variants_tested}` varianti testate)",
-        f"- **False Positive Rate**: `{round(m.false_positive_rate * 100, 1)}%` (`fpr_measured={m.fpr_measured}`, `benign_corpus_size={m.benign_corpus_size}`)",
-        f"- **Functional Survival Rate**: `{round(m.functional_survival_rate * 100, 1)}%`",
+        *metric_lines,
+        f"- **Evasion Resistance Rate**: `{round(m.evasion_resistance_rate * 100, 1)}%` | **Functional Survival Rate**: `{round(m.functional_survival_rate * 100, 1)}%`",
         f"- **Pre-Patch Breach Confirmed**: `{m.pre_patch_breach_confirmed}` | **Post-Patch Breaches**: `{m.post_patch_breaches}`",
         "",
         "## Controlli Eseguiti vs Non Eseguiti",
@@ -139,8 +160,15 @@ def export_ack_deliverables(
             patched_dir = run_dir / "patched_target"
             for base_dir in (chamber.lowerdir, chamber.upperdir):
                 if base_dir.is_dir():
+                    base_res = base_dir.resolve()
                     for fpath in sorted(base_dir.rglob("*")):
-                        if not fpath.is_file():
+                        if fpath.is_symlink():
+                            continue
+                        try:
+                            resolved_fp = fpath.resolve()
+                        except OSError:
+                            continue
+                        if not resolved_fp.is_relative_to(base_res) or not resolved_fp.is_file():
                             continue
                         rel_p = fpath.relative_to(base_dir)
                         if (
@@ -196,6 +224,11 @@ def export_ack_deliverables(
         "mission_id": report.mission_id,
         "certified": report.certified,
         "certification_verdict": report.certification_verdict,
+        "patch_classification": report.patch_classification,
+        "patch_applicable": report.patch_applicable,
+        "subagent_execution_architecture": report.subagent_execution_architecture,
+        "manual_review_required": report.manual_review_required,
+        "manual_review_reasons": report.manual_review_reasons,
         "verification_tier": report.verification_tier,
         "audit_scope": report.audit_scope,
         "security_boundary_level": report.security_boundary_level,
@@ -243,6 +276,11 @@ def export_ack_deliverables(
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "certified": report.certified,
         "certification_verdict": report.certification_verdict,
+        "patch_classification": report.patch_classification,
+        "patch_applicable": report.patch_applicable,
+        "subagent_execution_architecture": report.subagent_execution_architecture,
+        "manual_review_required": report.manual_review_required,
+        "manual_review_reasons": report.manual_review_reasons,
         "verification_tier": report.verification_tier,
         "audit_scope": report.audit_scope,
         "security_boundary_level": report.security_boundary_level,

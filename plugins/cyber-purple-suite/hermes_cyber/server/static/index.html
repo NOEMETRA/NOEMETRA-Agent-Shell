@@ -107,8 +107,11 @@
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       }[ch]));
     }
+    let currentAckSessionId = '';
+    let pendingAckApproval = null;
     async function apiFetch(path, opts) {
-      const res = await fetch(API + path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      const mergedHeaders = { 'Content-Type': 'application/json', ...((opts && opts.headers) || {}) };
+      const res = await fetch(API + path, { ...opts, headers: mergedHeaders });
       if (!res.ok) throw new Error(await res.text());
       return res.json();
     }
@@ -311,47 +314,97 @@
       const rep = await apiFetch('/ack/run', { method: 'POST', body: JSON.stringify(body) });
       renderAckReport(rep);
     }
+    async function requestAckApproval() {
+      const rep = currentAckReport;
+      const ws = rep && rep.workspace_target;
+      if (!rep || !rep.run_id || !ws || !ws.target_file_path) return;
+      const chk = document.getElementById('ackConfirmApplyChk');
+      const revChk = document.getElementById('ackManualReviewChk');
+      if (!chk || !chk.checked) return;
+      if (rep.manual_review_required && (!revChk || !revChk.checked)) return;
+      if (!currentAckSessionId) {
+        const st = await apiFetch('/status');
+        currentAckSessionId = st.ack_session_id || '';
+      }
+      pendingAckApproval = await apiFetch('/ack/apply-approval', {
+        method: 'POST',
+        body: JSON.stringify({
+          run_id: rep.run_id,
+          target_file_path: ws.target_file_path,
+          session_id: currentAckSessionId,
+          acknowledge_manual_review: Boolean(revChk && revChk.checked)
+        })
+      });
+      renderAckReport(currentAckReport);
+    }
     async function applyAckPatch(runId) {
       const chk = document.getElementById('ackConfirmApplyChk');
-      if (!chk || !chk.checked) return;
+      if (!chk || !chk.checked || !pendingAckApproval || pendingAckApproval.run_id !== runId) return;
       const res = await apiFetch('/ack/apply-patch', {
         method: 'POST',
-        body: JSON.stringify({ run_id: runId, confirm_apply: true })
+        body: JSON.stringify({
+          run_id: runId,
+          confirm_apply: true,
+          approval_token: pendingAckApproval.approval_token,
+          session_id: pendingAckApproval.session_id
+        })
       });
+      pendingAckApproval = null;
       if (currentAckReport && currentAckReport.workspace_target) {
         currentAckReport.workspace_target.patch_applied = true;
         currentAckReport.workspace_target.applied_at = res.applied_at;
+        currentAckReport.workspace_target.approval_id = res.approval_id;
         renderAckReport(currentAckReport);
       }
+    }
+    function pctStr(val) {
+      return val == null ? 'N/A' : `${Math.round(val * 100)}%`;
     }
     function renderAckReport(rep) {
       currentAckReport = rep;
       const m = rep.tpr_fpr_matrix || {};
       const fow = rep.fog_of_war || {};
       const ws = rep.workspace_target || null;
-      const fprLabel = m.fpr_measured
-        ? `FPR: ${Math.round((m.false_positive_rate || 0)*100)}% (n=${esc(m.benign_corpus_size ?? 0)})`
-        : 'FPR: N/A (non misurato)';
-      const fprBadgeClass = m.fpr_measured ? ((m.false_positive_rate || 0) <= 0.05 ? 'b-green' : 'b-red') : 'b-amber';
+      let domainBadges = '';
+      if (m.metric_kind === 'detector_tpr_fpr' && m.detector_metrics_applicable) {
+        const fprCls = (m.false_positive_rate || 0) <= 0.05 ? 'b-green' : 'b-red';
+        domainBadges = `
+          <span class="badge b-green">Detector TPR: ${pctStr(m.true_positive_rate)}</span>
+          <span class="badge ${fprCls}">Detector FPR: ${pctStr(m.false_positive_rate)} (n=${esc(m.benign_corpus_size ?? 0)})</span>
+          <span class="badge b-blue">Evasion Resistance: ${pctStr(m.evasion_resistance_rate)}</span>`;
+      } else if (m.metric_kind === 'parser_fuzz_verification') {
+        const semCls = (m.semantic_assertions_count || 0) > 0 ? 'b-green' : 'b-amber';
+        const semLbl = (m.semantic_assertions_count || 0) > 0
+          ? `Semantic Assertions: ${pctStr(m.semantic_assertion_pass_rate)} (n=${esc(m.semantic_assertions_count)})`
+          : 'Semantic Assertions: 0 (non fornite)';
+        domainBadges = `
+          <span class="badge b-green">Crash Mitigation: ${pctStr(m.crash_mitigation_rate)}</span>
+          <span class="badge b-blue">Valid Input Rejection: ${pctStr(m.valid_input_rejection_rate)} (n=${esc(m.benign_corpus_size ?? 0)})</span>
+          <span class="badge ${semCls}">${semLbl}</span>`;
+      } else {
+        domainBadges = `<span class="badge b-green">Exploit/Bypass Mitigation: ${pctStr(m.exploit_mitigation_rate ?? m.evasion_resistance_rate)}</span>`;
+      }
+      const approvalReady = Boolean(pendingAckApproval && pendingAckApproval.run_id === rep.run_id);
       document.getElementById('reportPanel').innerHTML = `
-        <div style="border-left:4px solid ${rep.certified ? 'var(--green)' : 'var(--red)'};padding-left:12px;margin-bottom:14px;">
-          <span class="badge ${rep.certified ? 'b-green' : 'b-red'}">${rep.certified ? 'CERTIFIED' : 'REJECTED'}</span>
+        <div style="border-left:4px solid ${rep.certified ? 'var(--green)' : (rep.patch_applicable ? 'var(--amber)' : 'var(--red)')};padding-left:12px;margin-bottom:14px;">
+          <span class="badge ${rep.certified ? 'b-green' : 'b-red'}">${rep.certified ? 'CERTIFIED' : (rep.patch_applicable ? 'CONTAINED / REVIEW' : 'REJECTED')}</span>
           <span class="badge b-purple">${esc(rep.certification_verdict)}</span>
+          ${rep.patch_classification && rep.patch_classification !== 'none' ? `<span class="badge ${rep.patch_classification === 'semantically_verified_patch' ? 'b-green' : 'b-amber'}">${esc(rep.patch_classification)}</span>` : ''}
           ${rep.verification_tier ? `<span class="badge ${rep.verification_tier === 'workspace_target_verification' ? 'b-green' : 'b-blue'}">${esc(rep.verification_tier)}</span>` : ''}
           <span class="badge b-blue">Sandbox: ${esc(rep.sandbox_id)}</span>
+          ${rep.subagent_execution_architecture ? `<span class="badge b-purple">Ruoli Red/Blue in-process: ${esc(rep.subagent_execution_architecture)}</span>` : ''}
           ${rep.security_boundary_level ? `<span class="badge b-amber">${esc(rep.security_boundary_level)}</span>` : ''}
           ${rep.isolation_backend ? `<span class="badge b-purple">${esc(rep.isolation_backend)}</span>` : ''}
           ${rep.audit_scope ? `<span class="badge ${(rep.audit_scope === 'cloned_target_manifest' || rep.audit_scope === 'workspace_target_file') ? 'b-green' : 'b-amber'}">${esc(rep.audit_scope)}</span>` : ''}
           ${fow.enforced ? '<span class="badge b-green">Fog of War Enforced</span>' : ''}
           ${rep.shadow_clone_only ? '<span class="badge b-amber">Shadow Clone CoW</span>' : ''}
           ${rep.untrusted_llm_code_warning ? `<div class="note-box">${esc(rep.untrusted_llm_code_warning)}</div>` : ''}
+          ${rep.manual_review_required ? `<div class="note-box" style="border-color:var(--red);color:#fecdd3;"><strong>Revisione manuale richiesta:</strong> ${esc((rep.manual_review_reasons || []).join(' · ') || 'Verificare semantica e operazioni sensibili.')}${ws && (ws.sensitive_ops_in_original || []).length ? `<br>Op. sensibili originali: <code>${esc(ws.sensitive_ops_in_original.join(', '))}</code>` : ''}</div>` : ''}
           <h3 style="margin:6px 0;">${esc(rep.title)}</h3>
           <p style="color:var(--muted);margin:4px 0;"><strong>Invariante:</strong> ${esc(rep.target_invariant)} — ${esc(rep.blue_patch_or_rules_summary)}</p>
           <p>
-            <span class="badge b-green">TPR: ${Math.round((m.true_positive_rate || 0)*100)}%</span>
-            <span class="badge ${fprBadgeClass}">${fprLabel}</span>
-            <span class="badge b-blue">Evasion Resistance: ${Math.round((m.evasion_resistance_rate || 0)*100)}%</span>
-            <span class="badge b-purple">Functional Survival: ${Math.round((m.functional_survival_rate || 0)*100)}%</span>
+            ${domainBadges}
+            <span class="badge b-purple">Functional Survival: ${pctStr(m.functional_survival_rate)}</span>
           </p>
         </div>
         <div class="stage-card" style="margin-bottom:10px;">
@@ -360,7 +413,7 @@
           <div style="color:var(--muted);"><strong>not_executed_checks:</strong> ${esc((rep.not_executed_checks || []).join(', ') || 'Nessuno')}</div>
         </div>
         ${(rep.subagent_traces || []).length ? `<h4>Sub-Agent Fleet (Fog of War: ${rep.subagent_traces.length})</h4>` +
-          rep.subagent_traces.map(tr => `<div class="ev-item"><span class="badge ${tr.team === 'RED' ? 'b-red' : 'b-blue'}">${esc(tr.team)} ${esc(tr.role)}</span><span class="badge b-purple">${esc(tr.phase)}</span><span class="badge b-amber">${esc(tr.model_used)}</span><span style="color:var(--muted);">[keys: ${esc((tr.visible_context_keys || []).join(', '))}]</span> ${esc(tr.summary)}</div>`).join('') : ''}
+          rep.subagent_traces.map(tr => `<div class="ev-item"><span class="badge ${tr.team === 'RED' ? 'b-red' : 'b-blue'}">${esc(tr.team)} ${esc(tr.role)}</span><span class="badge b-purple">${esc(tr.phase)}</span><span class="badge b-amber">${esc(tr.model_used)}</span>${tr.execution_kind ? `<span class="badge b-blue">${esc(tr.execution_kind)}</span>` : ''}<span style="color:var(--muted);">[keys: ${esc((tr.visible_context_keys || []).join(', '))}]</span> ${esc(tr.summary)}</div>`).join('') : ''}
         ${(rep.deliverable_dir || rep.patch_diff || ws) ? `<div class="stage-card" style="margin:10px 0;">
           <strong>Artefatti Persistenti (deliverable_dir) &amp; Patch Diff</strong>
           ${rep.deliverable_dir ? `<div><strong>deliverable_dir:</strong> <code>${esc(rep.deliverable_dir)}</code> (${esc((rep.deliverable_files || []).length)} file)</div>` : ''}
@@ -368,9 +421,14 @@
           ${rep.patch_diff ? `<pre>${esc(rep.patch_diff)}</pre>` : ''}
           ${ws ? `<div style="margin-top:8px;">
             <div><strong>Workspace Target:</strong> <code>${esc(ws.target_file_path)}</code> (${esc(ws.target_function)}) | untouched=${esc(ws.original_untouched)} | patch_applied=${esc(ws.patch_applied)}</div>
-            ${rep.certified && !ws.patch_applied ? `<div class="row" style="margin-top:6px;">
+            ${(rep.patch_applicable || rep.certified) && !ws.patch_applied ? `<div style="margin-top:6px;">
               <label class="row"><input type="checkbox" id="ackConfirmApplyChk"> Confermo applicazione patch (crea .orig)</label>
-              <button type="button" class="primary" onclick="applyAckPatch('${esc(rep.run_id)}')">Applica Patch al Progetto</button>
+              ${rep.manual_review_required ? `<label class="row" style="color:#fde68a;"><input type="checkbox" id="ackManualReviewChk"> Confermo revisione manuale rischi/semantiche</label>` : ''}
+              <div class="row" style="margin-top:6px;">
+                <button type="button" onclick="requestAckApproval()">1. Autorizza Monouso (Conferma OS)</button>
+                <button type="button" class="primary" ${approvalReady ? '' : 'disabled'} onclick="applyAckPatch('${esc(rep.run_id)}')">2. Applica Patch con Token Monouso</button>
+              </div>
+              ${approvalReady ? `<div style="font-size:11px;color:#93c5fd;">Token monouso emesso: ${esc(pendingAckApproval.approval_id)} (scade ${esc(pendingAckApproval.expires_at)})</div>` : ''}
             </div>` : ''}
           </div>` : ''}
         </div>` : ''}
@@ -392,6 +450,7 @@
       const ackList = ackData.missions || status.ack_missions || [];
       document.getElementById('ackMissionSelect').innerHTML = ackList.map(m => `<option value="${esc(m.mission_id)}">${esc(m.title)}</option>`).join('');
       populateModelSelects(models);
+      currentAckSessionId = status.ack_session_id || '';
       document.getElementById('useLlmChk').checked = Boolean(status.use_llm);
       if (status.active_case) renderReport(status.active_case);
     })();

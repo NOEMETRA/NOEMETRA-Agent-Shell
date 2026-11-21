@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from hermes_cyber.ack_arena import AdversarialCyberKernel
 from hermes_cyber.blue_agent import BlueInvestigatorAgent, _build_sigma_yaml
@@ -66,6 +68,7 @@ class CyberPurpleAssistant:
         blue_provider: str = "ollama",
         blue_model: str = "gemma4:12b",
         use_llm: bool = False,
+        ack_human_confirm_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ):
         self.profile = profile or "default"
         self.home_dir = Path(home_dir).resolve() if home_dir else None
@@ -77,7 +80,8 @@ class CyberPurpleAssistant:
         self.red_agent = RedOperatorAgent()
         self.blue_agent = BlueInvestigatorAgent()
         self.verifier = PurpleVerifier()
-        self.ack_kernel = AdversarialCyberKernel()
+        self.ack_kernel = AdversarialCyberKernel(human_confirm_fn=ack_human_confirm_fn)
+        self.ack_session_id = f"{compute_home_fingerprint(self.storage_dir.parent)[:16]}-{secrets.token_hex(8)}"
 
         # Dual independent ModelRouter instances for Red vs Blue multi-model dialectics
         self.red_router = ModelRouter(
@@ -415,12 +419,51 @@ class CyberPurpleAssistant:
         self._check_profile_storage_live()
         return self.ack_kernel.list_runs(runs_dir=self.storage_dir / "NOEMETRA" / "runs")
 
-    def apply_ack_patch(self, run_id: str, *, confirm_apply: bool = False) -> Dict[str, Any]:
-        """Explicitly apply a verified ACK workspace patch after user confirmation and drift checks."""
+    def issue_ack_patch_approval(
+        self,
+        run_id: str,
+        *,
+        session_id: str,
+        expected_target_file_path: Optional[str] = None,
+        acknowledge_manual_review: bool = False,
+        remote_client: bool = False,
+        operator_principal: str = "",
+    ) -> Dict[str, Any]:
+        """Issue a single-use human approval token bound to active session, run_id, target, and hashes."""
         self._check_profile_storage_live()
+        sess = str(session_id or "").strip()
+        if not sess or not hmac.compare_digest(sess, self.ack_session_id):
+            raise PermissionError("Session identity non valida per questo assistant: approvazione negata.")
+        return self.ack_kernel.issue_patch_approval(
+            run_id,
+            session_id=sess,
+            expected_target_file_path=expected_target_file_path,
+            acknowledge_manual_review=acknowledge_manual_review,
+            remote_client=remote_client,
+            operator_principal=operator_principal,
+            runs_dir=self.storage_dir / "NOEMETRA" / "runs",
+        )
+
+    def apply_ack_patch(
+        self,
+        run_id: str,
+        *,
+        confirm_apply: bool = False,
+        approval_token: str = "",
+        session_id: str = "",
+        operator_principal: str = "",
+    ) -> Dict[str, Any]:
+        """Explicitly apply a verified ACK workspace patch after single-use approval and drift checks."""
+        self._check_profile_storage_live()
+        sess = str(session_id or "").strip()
+        if not sess or not hmac.compare_digest(sess, self.ack_session_id):
+            raise PermissionError("Modifica negata: session_id mancante o non corrispondente alla sessione attiva.")
         result = self.ack_kernel.apply_patch(
             run_id,
             confirm_apply=confirm_apply,
+            approval_token=approval_token,
+            session_id=sess,
+            operator_principal=operator_principal,
             runs_dir=self.storage_dir / "NOEMETRA" / "runs",
         )
         if (
@@ -430,6 +473,7 @@ class CyberPurpleAssistant:
         ):
             self._last_ack_report.workspace_target.patch_applied = True
             self._last_ack_report.workspace_target.applied_at = result.get("applied_at")
+            self._last_ack_report.workspace_target.approval_id = result.get("approval_id")
         return result
 
     def get_status(self) -> Dict[str, Any]:
@@ -439,6 +483,7 @@ class CyberPurpleAssistant:
             "status": "ready",
             "profile": self.profile,
             "home_fingerprint": compute_home_fingerprint(self.storage_dir.parent),
+            "ack_session_id": self.ack_session_id,
             "allow_remote": self.allow_remote,
             "use_llm": self.use_llm,
             "red_provider": self.red_router.default_provider,

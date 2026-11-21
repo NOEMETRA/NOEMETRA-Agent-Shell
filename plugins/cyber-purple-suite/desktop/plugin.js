@@ -401,6 +401,8 @@ function CyberPurplePage({ ctx }) {
   const [ackValidCorpusDir, setAckValidCorpusDir] = useState('')
   const [ackWorkspaceMode, setAckWorkspaceMode] = useState('isolated_copy')
   const [ackConfirmApply, setAckConfirmApply] = useState(false)
+  const [ackManualReviewAck, setAckManualReviewAck] = useState(false)
+  const [ackPendingApproval, setAckPendingApproval] = useState(null)
   const [ackApplyResult, setAckApplyResult] = useState(null)
   const [ackReport, setAckReport] = useState(null)
   const [activeTab, setActiveTab] = useState('clash') // 'clash' | 'replay' | 'benchmark' | 'ack'
@@ -590,6 +592,8 @@ function CyberPurplePage({ ctx }) {
     if (!selectedAckMissionId || busy) return
     setBusy(true)
     setAckConfirmApply(false)
+    setAckManualReviewAck(false)
+    setAckPendingApproval(null)
     setAckApplyResult(null)
     try {
       const body = {
@@ -623,22 +627,60 @@ function CyberPurplePage({ ctx }) {
     }
   }
 
+  const handleRequestAckApproval = async () => {
+    const ws = ackReport?.workspace_target
+    if (!ackReport?.run_id || !ws?.target_file_path || !ackConfirmApply || busy) return
+    if (ackReport.manual_review_required && !ackManualReviewAck) return
+    setBusy(true)
+    try {
+      let sessId = status?.ack_session_id
+      if (!sessId) {
+        const st = await ctx.rest('/status')
+        setStatus(st)
+        sessId = st?.ack_session_id
+      }
+      const approval = await ctx.rest('/ack/apply-approval', {
+        method: 'POST',
+        timeoutMs: 75000,
+        body: {
+          run_id: ackReport.run_id,
+          target_file_path: ws.target_file_path,
+          session_id: sessId || '',
+          acknowledge_manual_review: Boolean(ackManualReviewAck)
+        }
+      })
+      setAckPendingApproval(approval)
+      host.notify({
+        kind: 'info',
+        message: `Token monouso emesso (${approval?.approval_id}) per ${ackReport.run_id}`
+      })
+    } catch (err) {
+      host.notifyError(err, 'Errore autorizzazione monouso ACK')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const handleApplyAckPatch = async () => {
-    if (!ackReport?.run_id || !ackConfirmApply || busy) return
+    if (!ackReport?.run_id || !ackConfirmApply || !ackPendingApproval?.approval_token || busy) return
+    if (ackPendingApproval.run_id !== ackReport.run_id) return
     setBusy(true)
     try {
       const res = await ctx.rest('/ack/apply-patch', {
         method: 'POST',
         body: {
           run_id: ackReport.run_id,
-          confirm_apply: true
+          confirm_apply: true,
+          approval_token: ackPendingApproval.approval_token,
+          session_id: ackPendingApproval.session_id
         }
       })
+      setAckPendingApproval(null)
       setAckApplyResult(res)
       setAckReport((prev) => prev ? {
         ...prev,
         workspace_target: prev.workspace_target
-          ? { ...prev.workspace_target, patch_applied: true, applied_at: res?.applied_at }
+          ? { ...prev.workspace_target, patch_applied: true, applied_at: res?.applied_at, approval_id: res?.approval_id }
           : prev.workspace_target
       } : prev)
       host.notify({
@@ -1044,10 +1086,16 @@ function CyberPurplePage({ ctx }) {
                               jsxs('div', {
                                 style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '6px' },
                                 children: [
-                                  jsx('span', { className: ackReport.certified ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red', children: ackReport.certified ? 'CERTIFIED' : 'REJECTED' }),
+                                  jsx('span', { className: ackReport.certified ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red', children: ackReport.certified ? 'CERTIFIED' : (ackReport.patch_applicable ? 'CONTAINED / REVIEW' : 'REJECTED') }),
                                   jsx('span', { className: 'cp-badge cp-b-purple', children: ackReport.certification_verdict }),
+                                  ackReport.patch_classification && ackReport.patch_classification !== 'none'
+                                    ? jsx('span', { className: ackReport.patch_classification === 'semantically_verified_patch' ? 'cp-badge cp-b-green' : 'cp-badge cp-b-amber', children: ackReport.patch_classification })
+                                    : null,
                                   ackReport.verification_tier ? jsx('span', { className: ackReport.verification_tier === 'workspace_target_verification' ? 'cp-badge cp-b-green' : 'cp-badge cp-b-blue', children: ackReport.verification_tier }) : null,
                                   jsx('span', { className: 'cp-badge cp-b-blue', children: `Sandbox: ${ackReport.sandbox_id}` }),
+                                  ackReport.subagent_execution_architecture
+                                    ? jsx('span', { className: 'cp-badge cp-b-purple', children: `Ruoli Red/Blue in-process: ${ackReport.subagent_execution_architecture}` })
+                                    : null,
                                   ackReport.security_boundary_level ? jsx('span', { className: 'cp-badge cp-b-amber', children: ackReport.security_boundary_level }) : null,
                                   ackReport.isolation_backend ? jsx('span', { className: 'cp-badge cp-b-purple', children: ackReport.isolation_backend }) : null,
                                   ackReport.audit_scope ? jsx('span', { className: (ackReport.audit_scope === 'cloned_target_manifest' || ackReport.audit_scope === 'workspace_target_file') ? 'cp-badge cp-b-green' : 'cp-badge cp-b-amber', children: ackReport.audit_scope }) : null,
@@ -1061,21 +1109,51 @@ function CyberPurplePage({ ctx }) {
                                   children: ackReport.untrusted_llm_code_warning
                                 })
                                 : null,
+                              ackReport.manual_review_required
+                                ? jsxs('div', {
+                                  style: { fontSize: '11.5px', padding: '6px 8px', borderRadius: '6px', background: 'rgba(244, 63, 94, 0.12)', border: '1px solid rgba(244, 63, 94, 0.4)', color: '#fecdd3', marginBottom: '6px' },
+                                  children: [
+                                    jsx('strong', { children: 'Revisione manuale richiesta: ' }),
+                                    jsx('span', { children: (ackReport.manual_review_reasons || []).join(' · ') || 'Verificare semantica e operazioni sensibili del parser.' }),
+                                    (ackReport.workspace_target?.sensitive_ops_in_original || []).length > 0
+                                      ? jsx('div', { style: { marginTop: '3px' }, children: `Op. sensibili nel file originale: ${ackReport.workspace_target.sensitive_ops_in_original.join(', ')}` })
+                                      : null
+                                  ]
+                                })
+                                : null,
                               jsx('div', { style: { fontWeight: 700, fontSize: '13.5px', marginBottom: '4px' }, children: ackReport.title }),
                               jsx('div', { style: { fontSize: '12px', color: 'var(--muted-foreground, #cbd5e1)', marginBottom: '6px' }, children: `Invariante: ${ackReport.target_invariant} | Blue: ${ackReport.blue_patch_or_rules_summary}` }),
                               jsxs('div', {
                                 style: { display: 'flex', gap: '8px', flexWrap: 'wrap' },
                                 children: [
-                                  jsx('span', { className: 'cp-badge cp-b-green', children: `TPR: ${Math.round((ackReport.tpr_fpr_matrix?.true_positive_rate || 0) * 100)}%` }),
-                                  jsx('span', {
-                                    className: ackReport.tpr_fpr_matrix?.fpr_measured
-                                      ? ((ackReport.tpr_fpr_matrix?.false_positive_rate || 0) <= 0.05 ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red')
-                                      : 'cp-badge cp-b-amber',
-                                    children: ackReport.tpr_fpr_matrix?.fpr_measured
-                                      ? `FPR: ${Math.round((ackReport.tpr_fpr_matrix?.false_positive_rate || 0) * 100)}% (n=${ackReport.tpr_fpr_matrix?.benign_corpus_size ?? 0})`
-                                      : 'FPR: N/A (non misurato)'
-                                  }),
-                                  jsx('span', { className: 'cp-badge cp-b-blue', children: `Evasion Resistance: ${Math.round((ackReport.tpr_fpr_matrix?.evasion_resistance_rate || 0) * 100)}%` }),
+                                  ...(ackReport.tpr_fpr_matrix?.metric_kind === 'detector_tpr_fpr' && ackReport.tpr_fpr_matrix?.detector_metrics_applicable
+                                    ? [
+                                      jsx('span', { className: 'cp-badge cp-b-green', children: `Detector TPR: ${Math.round((ackReport.tpr_fpr_matrix?.true_positive_rate || 0) * 100)}%` }),
+                                      jsx('span', {
+                                        className: (ackReport.tpr_fpr_matrix?.false_positive_rate || 0) <= 0.05 ? 'cp-badge cp-b-green' : 'cp-badge cp-b-red',
+                                        children: `Detector FPR: ${Math.round((ackReport.tpr_fpr_matrix?.false_positive_rate || 0) * 100)}% (n=${ackReport.tpr_fpr_matrix?.benign_corpus_size ?? 0})`
+                                      }),
+                                      jsx('span', { className: 'cp-badge cp-b-blue', children: `Evasion Resistance: ${Math.round((ackReport.tpr_fpr_matrix?.evasion_resistance_rate || 0) * 100)}%` })
+                                    ]
+                                    : ackReport.tpr_fpr_matrix?.metric_kind === 'parser_fuzz_verification'
+                                    ? [
+                                      jsx('span', { className: 'cp-badge cp-b-green', children: `Crash Mitigation: ${Math.round((ackReport.tpr_fpr_matrix?.crash_mitigation_rate || 0) * 100)}%` }),
+                                      jsx('span', {
+                                        className: ackReport.tpr_fpr_matrix?.valid_input_rejection_rate != null ? 'cp-badge cp-b-blue' : 'cp-badge cp-b-amber',
+                                        children: ackReport.tpr_fpr_matrix?.valid_input_rejection_rate != null
+                                          ? `Valid Input Rejection: ${Math.round((ackReport.tpr_fpr_matrix.valid_input_rejection_rate || 0) * 100)}% (n=${ackReport.tpr_fpr_matrix?.benign_corpus_size ?? 0})`
+                                          : 'Valid Input Rejection: N/A'
+                                      }),
+                                      jsx('span', {
+                                        className: (ackReport.tpr_fpr_matrix?.semantic_assertions_count || 0) > 0 ? 'cp-badge cp-b-green' : 'cp-badge cp-b-amber',
+                                        children: (ackReport.tpr_fpr_matrix?.semantic_assertions_count || 0) > 0
+                                          ? `Semantic Assertions: ${Math.round((ackReport.tpr_fpr_matrix?.semantic_assertion_pass_rate || 0) * 100)}% (n=${ackReport.tpr_fpr_matrix.semantic_assertions_count})`
+                                          : 'Semantic Assertions: 0 (non fornite)'
+                                      })
+                                    ]
+                                    : [
+                                      jsx('span', { className: 'cp-badge cp-b-green', children: `Exploit/Bypass Mitigation: ${Math.round((ackReport.tpr_fpr_matrix?.exploit_mitigation_rate ?? ackReport.tpr_fpr_matrix?.evasion_resistance_rate ?? 0) * 100)}%` })
+                                    ]),
                                   jsx('span', { className: 'cp-badge cp-b-purple', children: `Functional Survival: ${Math.round((ackReport.tpr_fpr_matrix?.functional_survival_rate || 0) * 100)}%` }),
                                   jsx('span', { className: 'cp-badge cp-b-amber', children: `Post-Patch Breaches: ${ackReport.tpr_fpr_matrix?.post_patch_breaches ?? 0}` })
                                 ]
@@ -1103,6 +1181,8 @@ function CyberPurplePage({ ctx }) {
                                     jsx('span', { className: 'cp-badge cp-b-purple', children: tr.phase }),
                                     ' ',
                                     jsx('span', { className: 'cp-badge cp-b-amber', children: tr.model_used }),
+                                    ' ',
+                                    tr.execution_kind ? jsx('span', { className: 'cp-badge cp-b-blue', children: tr.execution_kind }) : null,
                                     ' ',
                                     jsx('span', { style: { fontSize: '11px', color: 'var(--muted-foreground, #94a3b8)' }, children: `[keys: ${(tr.visible_context_keys || []).join(', ')}] ` }),
                                     jsx('span', { children: tr.summary })
@@ -1138,9 +1218,9 @@ function CyberPurplePage({ ctx }) {
                                           `patch_applied=${String(ackReport.workspace_target.patch_applied)}`
                                         ]
                                       }),
-                                      ackReport.certified && !ackReport.workspace_target.patch_applied
+                                      (ackReport.patch_applicable || ackReport.certified) && !ackReport.workspace_target.patch_applied
                                         ? jsxs('div', {
-                                          style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' },
+                                          style: { display: 'flex', flexDirection: 'column', gap: '6px' },
                                           children: [
                                             jsxs('label', {
                                               style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '12px' },
@@ -1148,18 +1228,46 @@ function CyberPurplePage({ ctx }) {
                                                 jsx('input', {
                                                   type: 'checkbox',
                                                   checked: ackConfirmApply,
-                                                  onChange: (e) => setAckConfirmApply(Boolean(e.target.checked))
+                                                  onChange: (e) => { setAckConfirmApply(Boolean(e.target.checked)); setAckPendingApproval(null) }
                                                 }),
                                                 'Confermo applicazione patch sul file target originale (crea backup .orig)'
                                               ]
                                             }),
-                                            jsx('button', {
-                                              type: 'button',
-                                              className: 'cp-btn cp-btn-primary',
-                                              disabled: busy || !ackConfirmApply,
-                                              onClick: handleApplyAckPatch,
-                                              children: 'Applica Patch al Progetto'
-                                            })
+                                            ackReport.manual_review_required
+                                              ? jsxs('label', {
+                                                style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '12px', color: '#fde68a' },
+                                                children: [
+                                                  jsx('input', {
+                                                    type: 'checkbox',
+                                                    checked: ackManualReviewAck,
+                                                    onChange: (e) => { setAckManualReviewAck(Boolean(e.target.checked)); setAckPendingApproval(null) }
+                                                  }),
+                                                  'Confermo revisione manuale rischi, semantica e operazioni sensibili preesistenti'
+                                                ]
+                                              })
+                                              : null,
+                                            jsxs('div', {
+                                              style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' },
+                                              children: [
+                                                jsx('button', {
+                                                  type: 'button',
+                                                  className: 'cp-btn',
+                                                  disabled: busy || !ackConfirmApply || (ackReport.manual_review_required && !ackManualReviewAck),
+                                                  onClick: handleRequestAckApproval,
+                                                  children: '1. Autorizza Monouso (Conferma OS)'
+                                                }),
+                                                jsx('button', {
+                                                  type: 'button',
+                                                  className: 'cp-btn cp-btn-primary',
+                                                  disabled: busy || !ackPendingApproval?.approval_token || ackPendingApproval.run_id !== ackReport.run_id,
+                                                  onClick: handleApplyAckPatch,
+                                                  children: '2. Applica Patch con Token Monouso'
+                                                })
+                                              ]
+                                            }),
+                                            ackPendingApproval?.run_id === ackReport.run_id
+                                              ? jsx('div', { style: { fontSize: '11px', color: '#93c5fd' }, children: `Token monouso pronto (${ackPendingApproval.approval_id}) · scade ${ackPendingApproval.expires_at}` })
+                                              : null
                                           ]
                                         })
                                         : null,

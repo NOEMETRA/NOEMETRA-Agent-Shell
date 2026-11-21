@@ -13,8 +13,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from cyber_hermes_plugin.cyber_plugin import TOOLS, cyber_apply_ack_patch
-from hermes_cyber.ack import AdversarialCyberKernel, FogOfWarController
+from cyber_hermes_plugin.cyber_plugin import TOOLS, cyber_apply_ack_patch, cyber_get_status
+from hermes_cyber.ack import (
+    AdversarialCyberKernel,
+    FogOfWarController,
+    prompt_interactive_operator_confirmation,
+)
 from hermes_cyber.ack.blue_subagents import _is_llm_patch_ast_safe
 from hermes_cyber.pipeline import CyberPurpleAssistant
 from hermes_cyber.server import api as cyber_api
@@ -91,21 +95,35 @@ def test_ack_honest_boundaries_metrics_and_no_fake_labels(tmp_path: Path):
         assert report.security_boundary_level == "process_confinement_not_untrusted_sandbox"
         assert "untrusted LLM code" in report.untrusted_llm_code_warning
         assert len(report.executed_checks) >= 2
-        assert len(report.not_executed_checks) >= 1
+        assert "autonomous_shell_tool_agent_team" in report.not_executed_checks
+        assert report.subagent_execution_architecture == "in_process_role_pipeline"
 
         dumped = json.dumps(report.model_dump(mode="json"))
         for bad in _STALE_FAKE_LABELS:
             assert bad not in dumped, f"Stale misleading label {bad!r} leaked in {mid}"
 
         if mid in ("ack-m1-exploit-patch-bypass", "ack-m3-attack-path-hardening"):
+            assert report.tpr_fpr_matrix.detector_metrics_applicable is False
+            assert report.tpr_fpr_matrix.true_positive_rate is None
+            assert report.tpr_fpr_matrix.false_positive_rate is None
             assert report.tpr_fpr_matrix.fpr_measured is False
             assert report.tpr_fpr_matrix.benign_corpus_size == 0
+            assert report.tpr_fpr_matrix.exploit_mitigation_rate == 1.0
         elif mid == "ack-m2-detection-evasion-arena":
+            assert report.tpr_fpr_matrix.metric_kind == "detector_tpr_fpr"
+            assert report.tpr_fpr_matrix.detector_metrics_applicable is True
             assert report.tpr_fpr_matrix.fpr_measured is True
             assert report.tpr_fpr_matrix.benign_corpus_size == 10
+            assert "ebpf" not in report.blue_patch_or_rules_summary.lower()
         else:
-            assert report.tpr_fpr_matrix.fpr_measured is True
+            assert report.tpr_fpr_matrix.metric_kind == "parser_fuzz_verification"
+            assert report.tpr_fpr_matrix.detector_metrics_applicable is False
+            assert report.tpr_fpr_matrix.true_positive_rate is None
+            assert report.tpr_fpr_matrix.false_positive_rate is None
+            assert report.tpr_fpr_matrix.fpr_measured is False
             assert report.tpr_fpr_matrix.benign_corpus_size == 2
+            assert report.tpr_fpr_matrix.semantic_assertions_count == 2
+            assert report.tpr_fpr_matrix.semantic_assertion_pass_rate == 1.0
 
 
 def test_ack_persistent_deliverables_survive_cleanup_and_match_sha256(tmp_path: Path):
@@ -171,8 +189,16 @@ def test_ack_m4_workspace_mode_isolated_copy_and_git_worktree_with_standalone_py
     )
     assert rep_iso.audit_scope == "workspace_target_file"
     assert rep_iso.verification_tier == "workspace_target_verification"
-    assert rep_iso.certified is True
-    assert rep_iso.certification_verdict == "VERIFIED_WORKSPACE_PARSER_PATCH"
+    # Deterministic AST exception wrapper alone certifies ONLY as exception containment, not full fix
+    assert rep_iso.certified is False
+    assert rep_iso.patch_applicable is True
+    assert rep_iso.patch_classification == "exception_containment_only"
+    assert rep_iso.certification_verdict == "CONTAINED_WORKSPACE_PARSER_EXCEPTIONS"
+    assert rep_iso.manual_review_required is True
+    assert rep_iso.tpr_fpr_matrix.detector_metrics_applicable is False
+    assert rep_iso.tpr_fpr_matrix.true_positive_rate is None
+    assert rep_iso.tpr_fpr_matrix.valid_input_rejection_rate == 0.0
+    assert rep_iso.tpr_fpr_matrix.crash_mitigation_rate == 1.0
     assert rep_iso.workspace_target is not None
     assert rep_iso.workspace_target.workspace_mode == "isolated_copy"
     assert rep_iso.workspace_target.original_untouched is True
@@ -253,7 +279,8 @@ def test_ack_m4_workspace_mode_isolated_copy_and_git_worktree_with_standalone_py
         workspace_mode="git_worktree",
         runs_dir=runs_dir,
     )
-    assert rep_wt.certified is True
+    assert rep_wt.patch_applicable is True
+    assert rep_wt.patch_classification == "exception_containment_only"
     assert rep_wt.workspace_target is not None
     assert rep_wt.workspace_target.workspace_mode == "git_worktree"
     assert rep_wt.workspace_target.target_rel_path == "parsers/pkt_parser.py"
@@ -285,13 +312,14 @@ def test_ack_m4_workspace_mode_isolated_copy_and_git_worktree_with_standalone_py
         valid_inputs=[b"\x01\x09"],
         runs_dir=runs_dir,
     )
-    assert rep_obj.certified is True
+    assert rep_obj.patch_applicable is True
+    assert rep_obj.patch_classification == "exception_containment_only"
     obj_reg = list((Path(rep_obj.deliverable_dir) / "regression_tests").glob("test_ack_regression_*.py"))[0]
     obj_proc = subprocess.run([sys.executable, "-m", "pytest", str(obj_reg), "-q"], capture_output=True, text=True, timeout=20, check=False)
     assert obj_proc.returncode == 0, f"Custom object snapshot regression failed:\n{obj_proc.stdout}\n{obj_proc.stderr}"
 
-    # Per-case FPR calculation: rejecting 1 of 2 valid inputs reports FPR=0.5 (not hardcoded 1.0),
-    # and a syntax/import-broken module leaves FPR unmeasured (fpr_measured=False).
+    # Per-case valid input rejection rate: rejecting 1 of 2 valid inputs reports 0.5 (not hardcoded 1.0),
+    # and naive_block_all reports 1.0 without falsely labelling parser metrics as detector TPR/FPR.
     partial_parser = tmp_path / "partial_fpr.py"
     partial_parser.write_text(
         "def parse_txt(text: str) -> str:\n"
@@ -321,8 +349,10 @@ def test_ack_m4_workspace_mode_isolated_copy_and_git_worktree_with_standalone_py
         runs_dir=runs_dir,
     )
     assert rep_half.certified is False
-    assert rep_half.tpr_fpr_matrix.fpr_measured is True
-    assert rep_half.tpr_fpr_matrix.false_positive_rate == 0.5
+    assert rep_half.patch_applicable is False
+    assert rep_half.tpr_fpr_matrix.detector_metrics_applicable is False
+    assert rep_half.tpr_fpr_matrix.false_positive_rate is None
+    assert rep_half.tpr_fpr_matrix.valid_input_rejection_rate == 0.5
     assert rep_half.tpr_fpr_matrix.functional_survival_rate == 0.5
 
     rep_fpr = kernel.run_mission(
@@ -335,8 +365,10 @@ def test_ack_m4_workspace_mode_isolated_copy_and_git_worktree_with_standalone_py
         runs_dir=runs_dir,
     )
     assert rep_fpr.certified is False
-    assert rep_fpr.tpr_fpr_matrix.fpr_measured is True
-    assert rep_fpr.tpr_fpr_matrix.false_positive_rate == 1.0
+    assert rep_fpr.patch_applicable is False
+    assert rep_fpr.tpr_fpr_matrix.detector_metrics_applicable is False
+    assert rep_fpr.tpr_fpr_matrix.false_positive_rate is None
+    assert rep_fpr.tpr_fpr_matrix.valid_input_rejection_rate == 1.0
 
     # Non-listed extension resource file inside workspace `tests/` directory must also be staged,
     # while secrets (.env, .pem, credentials.json, .ssh/) MUST be excluded from staging and deliverables!
@@ -375,7 +407,7 @@ def test_ack_m4_workspace_mode_isolated_copy_and_git_worktree_with_standalone_py
         valid_inputs=["alpha", "beta"],
         runs_dir=runs_dir,
     )
-    assert rep_plain.certified is True
+    assert rep_plain.patch_applicable is True
     recon_trace = next(t for t in rep_plain.subagent_traces if t.role == "RedReconSubAgent")
     assert "input=str" in recon_trace.summary
 
@@ -392,7 +424,11 @@ def test_ack_m4_workspace_mode_isolated_copy_and_git_worktree_with_standalone_py
 
 
 def test_ack_apply_patch_confirmation_drift_backup_and_manifest_refresh(tmp_path: Path):
-    kernel = AdversarialCyberKernel()
+    default_kernel = AdversarialCyberKernel()
+    recorded_confirm: List[Dict[str, Any]] = []
+    kernel = AdversarialCyberKernel(
+        human_confirm_fn=lambda ctx: (recorded_confirm.append(dict(ctx)), True)[1]
+    )
     runs_dir = tmp_path / "runs"
 
     app_dir = tmp_path / "app"
@@ -405,7 +441,7 @@ def test_ack_apply_patch_confirmation_drift_backup_and_manifest_refresh(tmp_path
     corpus_dir.mkdir()
     (corpus_dir / "valid.bin").write_bytes(b"\x00\x01\x00\x02AB")
 
-    report = kernel.run_mission(
+    report = default_kernel.run_mission(
         "ack-m4-fuzz-to-fix-pipeline",
         mutation_rounds=2,
         target_file_path=str(parser_file),
@@ -413,44 +449,93 @@ def test_ack_apply_patch_confirmation_drift_backup_and_manifest_refresh(tmp_path
         valid_corpus_dir=str(corpus_dir),
         runs_dir=runs_dir,
     )
-    assert report.certified is True
+    assert report.patch_applicable is True
+    assert report.patch_classification == "exception_containment_only"
+    assert report.manual_review_required is True
 
-    # Deny without explicit confirmation
+    # Default kernel without interactive human confirmation MUST fail closed
+    with pytest.raises(PermissionError, match="conferma interattiva umana"):
+        default_kernel.issue_patch_approval(
+            report.run_id,
+            session_id="sess-human-1",
+            expected_target_file_path=str(parser_file),
+            acknowledge_manual_review=True,
+            runs_dir=runs_dir,
+        )
+
+    # Deny without explicit confirmation OR without single-use session-bound approval token
     with pytest.raises(PermissionError):
         kernel.apply_patch(report.run_id, confirm_apply=False, runs_dir=runs_dir)
+    with pytest.raises(PermissionError, match="approvazione umana monouso"):
+        kernel.apply_patch(report.run_id, confirm_apply=True, runs_dir=runs_dir)
 
-    # Reject path-traversal run_id
+    # Issuing approval without acknowledging manual_review_required must fail closed
+    with pytest.raises(PermissionError, match="Revisione manuale"):
+        kernel.issue_patch_approval(report.run_id, session_id="sess-human-1", runs_dir=runs_dir)
+
+    approval = kernel.issue_patch_approval(
+        report.run_id,
+        session_id="sess-human-1",
+        expected_target_file_path=str(parser_file),
+        acknowledge_manual_review=True,
+        runs_dir=runs_dir,
+    )
+    assert len(recorded_confirm) == 1
+    assert recorded_confirm[0]["run_id"] == report.run_id
+    assert recorded_confirm[0]["target_file_path"] == str(parser_file.resolve())
+    assert recorded_confirm[0]["original_sha256"] == _sha256_file(parser_file)
+    assert recorded_confirm[0]["patch_diff_sha256"] == approval["patch_diff_sha256"]
+    assert recorded_confirm[0]["patched_target_sha256"] == approval["patched_target_sha256"]
+    tok = approval["approval_token"]
+
+    # Reject path-traversal run_id and wrong-session / wrong-run token binding
     with pytest.raises(ValueError):
-        kernel.apply_patch("../escape", confirm_apply=True, runs_dir=runs_dir)
+        kernel.apply_patch("../escape", confirm_apply=True, approval_token=tok, session_id="sess-human-1", runs_dir=runs_dir)
+    with pytest.raises(PermissionError, match="Session mismatch"):
+        kernel.apply_patch(report.run_id, confirm_apply=True, approval_token=tok, session_id="sess-hijack", runs_dir=runs_dir)
 
     # Reject if target file drifted on disk before confirmation
     parser_file.write_bytes(orig_bytes + b"\n# external edit\n")
     with pytest.raises(ValueError, match="Drift"):
-        kernel.apply_patch(report.run_id, confirm_apply=True, runs_dir=runs_dir)
+        kernel.apply_patch(report.run_id, confirm_apply=True, approval_token=tok, session_id="sess-human-1", runs_dir=runs_dir)
     parser_file.write_bytes(orig_bytes)
 
-    # Reject if patched_target snapshot drifted / was tampered with after certification
+    # Reject if patched_target snapshot drifted / was tampered with after run export
     patched_snap = Path(report.deliverable_dir) / "patched_target" / parser_file.name
     snap_orig = patched_snap.read_bytes()
     patched_snap.write_bytes(snap_orig + b"\n# tampered post-certification\n")
     with pytest.raises(ValueError, match="Integrità snapshot compromessa"):
-        kernel.apply_patch(report.run_id, confirm_apply=True, runs_dir=runs_dir)
+        kernel.apply_patch(report.run_id, confirm_apply=True, approval_token=tok, session_id="sess-human-1", runs_dir=runs_dir)
     patched_snap.write_bytes(snap_orig)
 
-    # Succeed on clean original file and verified snapshot with explicit confirm_apply=True
-    applied = kernel.apply_patch(report.run_id, confirm_apply=True, runs_dir=runs_dir)
+    # Succeed ONCE on clean original file and verified snapshot with valid one-time session-bound token
+    applied = kernel.apply_patch(
+        report.run_id,
+        confirm_apply=True,
+        approval_token=tok,
+        session_id="sess-human-1",
+        runs_dir=runs_dir,
+    )
     assert applied["patch_applied"] is True
+    assert applied["approval_id"] == approval["approval_id"]
     backup_path = Path(applied["backup_path"])
     assert backup_path.is_file()
     assert backup_path.read_bytes() == orig_bytes
     assert parser_file.read_bytes() != orig_bytes
 
+    # Replaying the exact same single-use approval token MUST fail
+    parser_file.write_bytes(orig_bytes)
+    with pytest.raises(PermissionError, match="già consumato"):
+        kernel.apply_patch(report.run_id, confirm_apply=True, approval_token=tok, session_id="sess-human-1", runs_dir=runs_dir)
+    parser_file.write_bytes((Path(report.deliverable_dir) / "patched_target" / parser_file.name).read_bytes())
+
     manifest = json.loads((Path(report.deliverable_dir) / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["workspace_target"]["patch_applied"] is True
+    assert manifest["workspace_target"]["approval_id"] == approval["approval_id"]
     rep_disk = Path(report.deliverable_dir) / "report.json"
     assert manifest["sha256"]["report.json"] == _sha256_file(rep_disk)
 
-    # Workspace Mode without any valid corpus must fail closed and refuse patch application (even naive_block_all)
+    # Workspace Mode without any valid corpus must fail closed and refuse approval & patch application
     empty_parser = tmp_path / "empty_corpus_parser.py"
     empty_parser.write_text(_BUGGY_PARSER_SOURCE, encoding="utf-8")
     for mode in ("structural", "naive_block_all"):
@@ -463,8 +548,13 @@ def test_ack_apply_patch_confirmation_drift_backup_and_manifest_refresh(tmp_path
             runs_dir=runs_dir,
         )
         assert rep_nocorpus.certified is False
+        assert rep_nocorpus.patch_applicable is False
         assert rep_nocorpus.certification_verdict == "REJECTED_NO_VALID_CORPUS"
-        with pytest.raises(ValueError, match="non certificata"):
+        with pytest.raises(ValueError, match="non applicabile"):
+            kernel.issue_patch_approval(
+                rep_nocorpus.run_id, session_id="sess-human-1", acknowledge_manual_review=True, runs_dir=runs_dir
+            )
+        with pytest.raises(PermissionError):
             kernel.apply_patch(rep_nocorpus.run_id, confirm_apply=True, runs_dir=runs_dir)
 
     # Recursive depth guard on patched recursive parser must stop cleanly at depth > 64 (not bypass wrapper)
@@ -677,7 +767,10 @@ def test_ack_independent_red_blue_subagents_llm_integration_and_ast_safety_gate(
         target_function="parse_packet",
         valid_corpus_dir=str(corpus_dir),
     )
-    assert rep.certified is True
+    assert rep.patch_applicable is True
+    assert rep.patch_classification == "exception_containment_only"
+    assert rep.certification_verdict == "CONTAINED_WORKSPACE_PARSER_EXCEPTIONS"
+    assert rep.subagent_execution_architecture == "llm_guided_role_pipeline"
     assert FogOfWarController().verify_trace_isolation(rep.subagent_traces) is True
     assert len(red_mock.calls) >= 2
     assert len(blue_mock.calls) == 1
@@ -740,19 +833,100 @@ def test_ack_runs_dir_strict_profile_isolation_and_explicit_runs_dir(tmp_path: P
 
 
 def test_ack_rest_api_runs_apply_patch_tool_and_ui_exposure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    assistant = CyberPurpleAssistant(profile="ack_api_test", home_dir=tmp_path, use_llm=False)
-    monkeypatch.setattr(cyber_api, "_resolve_authorized_context", lambda _req: ("ack_api_test", tmp_path))
-    monkeypatch.setattr(cyber_api, "_req_assistant", lambda _req: assistant)
-
-    app = FastAPI()
-    app.include_router(cyber_router, prefix="/api/plugins/cyber-purple-suite")
-    client = TestClient(app)
+    recorded_prompts: List[Dict[str, Any]] = []
+    confirm_state = {"decision": True, "mutate_toctou": False}
 
     parser_file = tmp_path / "api_parser.py"
     parser_file.write_text(_BUGGY_PARSER_SOURCE, encoding="utf-8")
+    orig_api_bytes = parser_file.read_bytes()
     corpus_dir = tmp_path / "api_corpus"
     corpus_dir.mkdir()
     (corpus_dir / "valid.bin").write_bytes(b"\x00\x01\x00\x02ZZ")
+
+    def _human_confirm(ctx: Dict[str, Any]) -> bool:
+        recorded_prompts.append(dict(ctx))
+        if confirm_state["mutate_toctou"]:
+            parser_file.write_bytes(orig_api_bytes + b"\n# toctou drift during human dialog\n")
+        return bool(confirm_state["decision"])
+
+    default_assistant = CyberPurpleAssistant(profile="ack_api_default", home_dir=tmp_path, use_llm=False)
+    assistant = CyberPurpleAssistant(
+        profile="ack_api_test",
+        home_dir=tmp_path,
+        use_llm=False,
+        ack_human_confirm_fn=_human_confirm,
+    )
+    current_principal: Dict[str, Any] = {"native": {"profile_id": "opA"}, "hosted": None}
+    current_assistant_ref = {"obj": default_assistant}
+    monkeypatch.setattr(cyber_api, "_resolve_authorized_context", lambda _req: ("ack_api_test", tmp_path))
+    monkeypatch.setattr(cyber_api, "_req_assistant", lambda _req: current_assistant_ref["obj"])
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _inject_test_principal(request, call_next):
+        if current_principal["native"] is not None:
+            request.state.native_http_principal = current_principal["native"]
+        if current_principal["hosted"] is not None:
+            request.state.hosted_http_authenticated = current_principal["hosted"]
+        return await call_next(request)
+
+    app.include_router(cyber_router, prefix="/api/plugins/cyber-purple-suite")
+    client = TestClient(app)
+
+    # Default fail-closed assistant: an automated client reading /status + sending legacy "human-approval" MUST get 403
+    def_status = client.get("/api/plugins/cyber-purple-suite/status")
+    assert def_status.status_code == 200
+    def_sess_id = def_status.json()["ack_session_id"]
+    def_run = client.post(
+        "/api/plugins/cyber-purple-suite/ack/run",
+        json={
+            "mission_id": "ack-m4-fuzz-to-fix-pipeline",
+            "mutation_rounds": 1,
+            "target_file_path": str(parser_file),
+            "target_function": "parse_packet",
+            "valid_corpus_dir": str(corpus_dir),
+            "workspace_mode": "isolated_copy",
+        },
+    )
+    assert def_run.status_code == 200
+    r_forged = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-approval",
+        headers={"X-Noemetra-Operator-Confirm": "human-approval"},
+        json={
+            "run_id": def_run.json()["run_id"],
+            "target_file_path": str(parser_file),
+            "session_id": def_sess_id,
+            "acknowledge_manual_review": True,
+            "operator_confirm": "human-approval",
+        },
+    )
+    assert r_forged.status_code == 403
+
+    # Default OS confirm gate fails closed under pytest AND for remote clients, and HTTP seam rejects hosted=False
+    assert prompt_interactive_operator_confirmation({"run_id": "r1"}) is False
+    assert prompt_interactive_operator_confirmation({"run_id": "r1", "remote_client": True}) is False
+    current_principal["native"] = None
+    current_principal["hosted"] = False
+    r_unauth = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-approval",
+        json={"run_id": def_run.json()["run_id"], "target_file_path": str(parser_file), "session_id": def_sess_id, "acknowledge_manual_review": True},
+    )
+    assert r_unauth.status_code == 401
+
+    # Switch to interactive-human-confirm test assistant and principal opA
+    current_principal["hosted"] = None
+    current_principal["native"] = {"profile_id": "opA"}
+    current_assistant_ref["obj"] = assistant
+
+    r_status = client.get("/api/plugins/cyber-purple-suite/status")
+    assert r_status.status_code == 200
+    sess_id = r_status.json()["ack_session_id"]
+
+    # Tool status must NOT leak ack_session_id to the LLM agent
+    monkeypatch.setattr("cyber_hermes_plugin.cyber_plugin._get_cyber_assistant", lambda: assistant)
+    tool_status = json.loads(cyber_get_status())
+    assert "ack_session_id" not in tool_status
 
     r_run = client.post(
         "/api/plugins/cyber-purple-suite/ack/run",
@@ -767,7 +941,9 @@ def test_ack_rest_api_runs_apply_patch_tool_and_ui_exposure(tmp_path: Path, monk
     )
     assert r_run.status_code == 200
     body = r_run.json()
-    assert body["certified"] is True
+    assert body["patch_applicable"] is True
+    assert body["patch_classification"] == "exception_containment_only"
+    assert body["certification_verdict"] == "CONTAINED_WORKSPACE_PARSER_EXCEPTIONS"
     run_id = body["run_id"]
 
     r_runs = client.get("/api/plugins/cyber-purple-suite/ack/runs")
@@ -776,24 +952,104 @@ def test_ack_rest_api_runs_apply_patch_tool_and_ui_exposure(tmp_path: Path, monk
 
     r_deny = client.post(
         "/api/plugins/cyber-purple-suite/ack/apply-patch",
-        json={"run_id": run_id, "confirm_apply": False},
+        json={"run_id": run_id, "confirm_apply": True},
     )
     assert r_deny.status_code == 403
 
+    r_wrong_sess = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-approval",
+        json={
+            "run_id": run_id,
+            "target_file_path": str(parser_file),
+            "session_id": "wrong-sess",
+            "acknowledge_manual_review": True,
+        },
+    )
+    assert r_wrong_sess.status_code == 403
+
+    # Human operator clicks "No" -> 403
+    confirm_state["decision"] = False
+    r_human_deny = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-approval",
+        json={
+            "run_id": run_id,
+            "target_file_path": str(parser_file),
+            "session_id": sess_id,
+            "acknowledge_manual_review": True,
+        },
+    )
+    assert r_human_deny.status_code == 403
+
+    # TOCTOU drift during human confirmation -> aborted without minting a token, file restored after
+    confirm_state["decision"] = True
+    confirm_state["mutate_toctou"] = True
+    r_toctou = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-approval",
+        json={
+            "run_id": run_id,
+            "target_file_path": str(parser_file),
+            "session_id": sess_id,
+            "acknowledge_manual_review": True,
+        },
+    )
+    assert r_toctou.status_code in (400, 403)
+    assert "approval_token" not in r_toctou.json()
+    confirm_state["mutate_toctou"] = False
+    parser_file.write_bytes(orig_api_bytes)
+
+    r_appr = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-approval",
+        json={
+            "run_id": run_id,
+            "target_file_path": str(parser_file),
+            "session_id": sess_id,
+            "acknowledge_manual_review": True,
+        },
+    )
+    assert r_appr.status_code == 200
+    tok = r_appr.json()["approval_token"]
+
+    # Principal mismatch: token minted under opA MUST fail when applied by opB
+    current_principal["native"] = {"profile_id": "opB"}
+    r_wrong_principal = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-patch",
+        json={"run_id": run_id, "confirm_apply": True, "approval_token": tok, "session_id": sess_id},
+    )
+    assert r_wrong_principal.status_code == 403
+    current_principal["native"] = {"profile_id": "opA"}
+
+    parser_file.write_bytes(orig_api_bytes)
     r_apply = client.post(
         "/api/plugins/cyber-purple-suite/ack/apply-patch",
-        json={"run_id": run_id, "confirm_apply": True},
+        json={"run_id": run_id, "confirm_apply": True, "approval_token": tok, "session_id": sess_id},
     )
     assert r_apply.status_code == 200
     assert r_apply.json()["patch_applied"] is True
+    assert r_apply.json()["approval_id"] == r_appr.json()["approval_id"]
 
-    # Hermes tool registration and behavior
-    assert any(t["name"] == "cyber_apply_ack_patch" for t in TOOLS)
-    monkeypatch.setattr("cyber_hermes_plugin.cyber_plugin._get_cyber_assistant", lambda: assistant)
-    tool_err = json.loads(cyber_apply_ack_patch({"run_id": "missing_run", "confirm_apply": True}))
+    # Replay must be refused both after patch drift (400/403) and even if original bytes are restored (403 consumed)
+    r_replay_drift = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-patch",
+        json={"run_id": run_id, "confirm_apply": True, "approval_token": tok, "session_id": sess_id},
+    )
+    assert r_replay_drift.status_code in (400, 403)
+    patched_bytes_on_disk = parser_file.read_bytes()
+    parser_file.write_bytes(orig_api_bytes)
+    r_replay_consumed = client.post(
+        "/api/plugins/cyber-purple-suite/ack/apply-patch",
+        json={"run_id": run_id, "confirm_apply": True, "approval_token": tok, "session_id": sess_id},
+    )
+    assert r_replay_consumed.status_code == 403
+    parser_file.write_bytes(patched_bytes_on_disk)
+
+    # Hermes tool registration: confirm_apply=True alone without human approval_token MUST fail, no minting tool exposed
+    tool_names = [t["name"] for t in TOOLS]
+    assert "cyber_apply_ack_patch" in tool_names
+    assert not any("approval" in n for n in tool_names)
+    tool_err = json.loads(cyber_apply_ack_patch({"run_id": run_id, "confirm_apply": True}))
     assert "error" in tool_err
 
-    # Desktop & Web UI sync + feature parity markers
+    # Desktop & Web UI sync + feature parity markers (and removal of spoofable human-approval strings)
     suite_root = Path(__file__).resolve().parents[1]
     repo_root = suite_root.parents[1]
     desk = (suite_root / "desktop" / "plugin.js").read_text(encoding="utf-8")
@@ -801,9 +1057,14 @@ def test_ack_rest_api_runs_apply_patch_tool_and_ui_exposure(tmp_path: Path, monk
     web_html = (suite_root / "hermes_cyber" / "server" / "static" / "index.html").read_text(encoding="utf-8")
 
     assert desk == app_js
+    for forbidden in ("human-approval", "X-Noemetra-Operator-Confirm"):
+        assert forbidden not in desk
+        assert forbidden not in web_html
     for marker in (
         "/ack/run",
+        "/ack/apply-approval",
         "/ack/apply-patch",
+        "ack_session_id",
         "target_config_content",
         "target_file_path",
         "target_function",
@@ -812,12 +1073,18 @@ def test_ack_rest_api_runs_apply_patch_tool_and_ui_exposure(tmp_path: Path, monk
         "verification_tier",
         "security_boundary_level",
         "untrusted_llm_code_warning",
+        "patch_classification",
+        "manual_review_required",
+        "subagent_execution_architecture",
+        "metric_kind",
+        "crash_mitigation_rate",
+        "valid_input_rejection_rate",
+        "semantic_assertion_pass_rate",
         "subagent_traces",
         "executed_checks",
         "not_executed_checks",
         "patch_diff",
         "deliverable_dir",
-        "fpr_measured",
     ):
         assert marker in desk, f"Missing UI marker {marker!r} in desktop plugin.js"
         assert marker in web_html, f"Missing UI marker {marker!r} in web index.html"

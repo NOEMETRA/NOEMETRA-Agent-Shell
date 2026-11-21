@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any, Dict, List, Optional
 
-from hermes_cyber.ack.blue_subagents import record_blue_mission_traces
+from hermes_cyber.ack.blue_subagents import (
+    propose_m2_blue_rule_additions,
+    record_blue_mission_traces,
+)
 from hermes_cyber.ack.catalog import (
     _MissionExecutionOutcome,
     _contract,
@@ -13,7 +17,18 @@ from hermes_cyber.ack.catalog import (
 )
 from hermes_cyber.ack.chamber import DetonationChamber
 from hermes_cyber.ack.fog_of_war import FogOfWarController
-from hermes_cyber.ack.red_subagents import record_red_mission_traces
+from hermes_cyber.ack.mission_m2_templates import (
+    _M2_BASELINE_RULES,
+    _M2_BENIGN_CORPUS,
+    _M2_DETECTOR_ENGINE,
+    _M2_OVERBROAD_RULES,
+    _M2_STRUCTURAL_RULES,
+    _M2_TARGET_WORKLOAD,
+)
+from hermes_cyber.ack.red_subagents import (
+    propose_m2_red_telemetry_events,
+    record_red_mission_traces,
+)
 from hermes_cyber.ack.workspace import compute_unified_diff
 from hermes_cyber.models import (
     AckMissionDescriptor,
@@ -27,110 +42,6 @@ from hermes_cyber.models import (
     TelemetryAlertEvidence,
 )
 from hermes_cyber.router_bridge import ModelRouter
-
-_M2_TARGET_WORKLOAD = '''\
-import json
-import os
-from pathlib import Path
-
-def execute_ttp_payload(aid: str, event_record: dict) -> dict:
-    up = Path(os.environ["ACK_UPPERDIR"])
-    canary_val = (up / "canary_vault" / "canary.txt").read_text(encoding="utf-8").strip()
-    (up / f"telemetry_{aid}.json").write_text(json.dumps([event_record]), encoding="utf-8")
-    return {"canary": canary_val, "telemetry_written": f"telemetry_{aid}.json"}
-
-def handle_request(payload: dict) -> tuple:
-    try:
-        res = execute_ttp_payload(str(payload["aid"]), dict(payload["event"]))
-        return 200, res
-    except Exception as exc:
-        return 403, {"error": str(exc)}
-'''
-
-_M2_BASELINE_RULES = {
-    "mode": "baseline",
-    "rules": [
-        {"rule_id": "naive_bash_devtcp", "engine": "python_json_rule_engine", "patterns": ["bash -i >& /dev/tcp/"], "excludes": []}
-    ],
-}
-
-_M2_STRUCTURAL_RULES = {
-    "mode": "structural",
-    "rules": [
-        {
-            "rule_id": "blue_rule_memfd_exec",
-            "engine": "python_json_rule_engine",
-            "patterns": ["memfd_create", "/proc/self/fd/", "execveat("],
-            "excludes": ["signed_package_manager=true", "benign=true"],
-        },
-        {
-            "rule_id": "blue_lotl_lineage_obf",
-            "engine": "python_json_rule_engine",
-            "patterns": ["parent=python3 child=sh", "${IFS}", "LD_PRELOAD=", "base64 -d"],
-            "excludes": ["pytest_worker=true", "benign=true"],
-        },
-        {
-            "rule_id": "blue_egress_entropy_beacon",
-            "engine": "python_json_rule_engine",
-            "patterns": ["qtype=TXT", "beacon_jitter="],
-            "min_entropy": 4.2,
-            "excludes": ["ntp.ubuntu.com", "healthcheck=200 ok", "proc=postfix", "proc=certbot", "benign=true"],
-        },
-    ],
-}
-
-_M2_OVERBROAD_RULES = {
-    "mode": "overbroad_alert_all",
-    "rules": [{"rule_id": "ban_all_wildcard", "engine": "python_json_rule_engine", "patterns": [""], "excludes": []}],
-}
-
-_M2_DETECTOR_ENGINE = '''\
-import json, os, sys
-from pathlib import Path
-
-def evaluate(rules_spec: dict, events: list) -> list:
-    if rules_spec.get("mode") == "overbroad_alert_all":
-        return [{"event_index": i, "triggered": True, "rule_ids": ["ban_all_wildcard"]} for i in range(len(events))]
-    outcomes = []
-    for i, ev in enumerate(events):
-        line = ev.get("telemetry", "")
-        low = line.lower()
-        entropy = float(ev.get("entropy", 0.0))
-        hits = []
-        for r in rules_spec.get("rules", []):
-            if any(ex.lower() in low for ex in r.get("excludes", [])):
-                continue
-            min_ent = r.get("min_entropy")
-            pat_hit = any(p.lower() in low for p in r.get("patterns", []))
-            if min_ent is not None:
-                if pat_hit and entropy >= float(min_ent):
-                    hits.append(r["rule_id"])
-            elif pat_hit:
-                hits.append(r["rule_id"])
-        outcomes.append({"event_index": i, "triggered": bool(hits), "rule_ids": hits})
-    return outcomes
-
-if __name__ == "__main__":
-    blue_dir = Path(os.environ["ACK_ARTIFACTS_BLUE"])
-    rules = json.loads((blue_dir / "blue_rules.json").read_text(encoding="utf-8"))
-    events_path = Path(sys.argv[1])
-    events = json.loads(events_path.read_text(encoding="utf-8"))
-    res = evaluate(rules, events)
-    print(json.dumps(res))
-'''
-
-_M2_BENIGN_CORPUS = [
-    {"telemetry": "proc=pytest cmd='python3 -m pytest -q' pytest_worker=true benign=true", "entropy": 1.8},
-    {"telemetry": "proc=git cmd='git status --short' benign=true", "entropy": 1.6},
-    {"telemetry": "proc=systemd cmd='systemctl status nginx.service' benign=true", "entropy": 1.7},
-    {"telemetry": "proc=postfix qtype=TXT query='_dmarc.corp.example.com' benign=true", "entropy": 2.3},
-    {"telemetry": "proc=certbot qtype=TXT query='_acme-challenge.app.example.com' benign=true", "entropy": 2.4},
-    {"telemetry": "proc=restic signer='CN=Restic' signature_verified=true benign=true", "entropy": 2.1},
-    {"telemetry": "proc=nginx GET /api/v1/health status=200 healthcheck=200 ok benign=true", "entropy": 1.4},
-    {"telemetry": "proc=chronyd dns_dst=ntp.ubuntu.com qtype=A benign=true", "entropy": 1.5},
-    {"telemetry": "proc=apt-get signed_package_manager=true benign=true", "entropy": 1.9},
-    {"telemetry": "proc=uvicorn worker startup HTTP/1.1 ready benign=true", "entropy": 1.7},
-]
 
 
 def _run_m2_detection_evasion(
@@ -249,14 +160,18 @@ res = json.loads(resp.read().decode("utf-8"))
 
     # BLUE_DEFEND
     blue_ctx = fow.build_blue_context(baseline_summary="naive_bash_devtcp missed memfd_create", oob_baseline=base_ev)
+    blue_llm_rule = None
     if defense_mode == "overbroad_alert_all":
-        chosen_rules = _M2_OVERBROAD_RULES
+        chosen_rules = copy.deepcopy(_M2_OVERBROAD_RULES)
         blue_summary = "overbroad_alert_all: regola wildcard che genera allarme su qualsiasi evento."
     else:
-        chosen_rules = _M2_STRUCTURAL_RULES
+        chosen_rules = copy.deepcopy(_M2_STRUCTURAL_RULES)
+        blue_llm_rule, _ = propose_m2_blue_rule_additions(blue_ctx, blue_router)
+        if blue_llm_rule is not None:
+            chosen_rules["rules"].append(blue_llm_rule)
         blue_summary = (
-            "structural: Sigma + eBPF syscall (`memfd_create`, `/proc/self/fd/`) + lineage (`python3->sh`, `${IFS}`) "
-            "+ egress entropia (>=4.2) con esclusioni baseline firmate."
+            "structural (python_json_rule_engine): regole JSON su indicatori `memfd_create`, `/proc/self/fd/`, "
+            "lineage `python3->sh`/`${IFS}` ed entropia egress (>=4.2) con esclusioni baseline firmate."
         )
 
     rel_blue, _ = chamber.write_blue_artifact("deploy_rules_m2.py", f'''\
@@ -342,6 +257,7 @@ fpr = fps / max(1, len(benign))
         "live_ebpf_or_auditd_kernel_telemetry_capture",
         "real_fileless_memfd_exec_detonation",
         "production_endpoint_telemetry_replay",
+        "autonomous_shell_tool_agent_team",
     ]
     _m2_base_checks = [
         "python_json_rule_engine_against_synthetic_events",
@@ -353,15 +269,20 @@ fpr = fps / max(1, len(benign))
         json.dumps(chosen_rules, indent=2),
         "blue_rules.json",
     )
+    red_llm_events, _ = propose_m2_red_telemetry_events(red_ctx, red_router)
 
     def _m2_traces(phase_mut: str, verify_msg: str):
+        atk_labels = ["cli_arg_spoofing", "fileless_memfd", "jitter_dns_beacon"]
+        if red_llm_events:
+            atk_labels.append("llm_proposed_evasion")
         return [
             *record_red_mission_traces(
                 phase_base_summary=f"M2 baseline event replay completato (pre_breach={pre_breach}).",
                 phase_mut_summary=phase_mut,
                 red_ctx=red_ctx,
-                attack_classes=["cli_arg_spoofing", "fileless_memfd", "jitter_dns_beacon"],
+                attack_classes=atk_labels,
                 router=red_router,
+                mutator_contributed=bool(red_llm_events),
             ),
             *record_blue_mission_traces(
                 triage_summary="Analisi copertura regole JSON su telemetria sintetica ed esclusioni benigne.",
@@ -369,6 +290,7 @@ fpr = fps / max(1, len(benign))
                 verify_summary=verify_msg,
                 blue_ctx=blue_ctx,
                 router=blue_router,
+                patch_contributed=bool(blue_llm_rule is not None),
             ),
         ]
 
@@ -381,6 +303,7 @@ fpr = fps / max(1, len(benign))
         return _MissionExecutionOutcome(
             transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
             tpr_fpr_matrix=AckTprFprMatrix(
+                metric_kind="detector_tpr_fpr", detector_metrics_applicable=True,
                 true_positive_rate=0.0, false_positive_rate=fpr_val, fpr_measured=True,
                 benign_corpus_size=len(_M2_BENIGN_CORPUS), attack_variants_tested=0,
                 evasion_resistance_rate=0.0, functional_survival_rate=0.0,
@@ -395,10 +318,10 @@ fpr = fps / max(1, len(benign))
                 "Mutazione non avviata: regole respinte per FPR elevato sul corpus benigno.",
                 f"Check FPR respinto ({fpr_val:.3f} > 0.050) su {len(_M2_BENIGN_CORPUS)} eventi benigni.",
             ),
-            patch_diff=patch_diff,
+            patch_diff=patch_diff, patch_classification="none", patch_applicable=False,
         )
 
-    # RED_MUTATE_BYPASS (3 distinct evasion attack classes)
+    # RED_MUTATE_BYPASS (3 distinct fixed baseline evasion classes, plus optional executable LLM telemetry events)
     evasion_specs = [
         (
             "CLASS_CLI_ARG_SPOOFING_ENV_EXPANSION",
@@ -413,13 +336,15 @@ fpr = fps / max(1, len(benign))
             {"telemetry": "proc=svc_etl dns_src=10.200.0.5 qtype=TXT beacon_jitter=17s query=JBSWY3DPEBLW64TMMQ", "entropy": 4.85},
         ),
     ]
-    rounds_to_run = max(1, min(len(evasion_specs), mutation_rounds))
+    selected_specs = list(evasion_specs[: max(1, min(len(evasion_specs), mutation_rounds))])
+    for llm_idx, llm_evt in enumerate(red_llm_events, start=1):
+        selected_specs.append((f"CLASS_LLM_PROPOSED_EVASION_{llm_idx}", llm_evt))
+    rounds_to_run = len(selected_specs)
     detected_cnt = 0
     stealth_cnt = 0
     exec_errors = 0
     with chamber.target_server("target_workload.py", "handle_request") as m2_mut_port:
-        for idx in range(rounds_to_run):
-            atk_class, evt_dict = evasion_specs[idx]
+        for idx, (atk_class, evt_dict) in enumerate(selected_specs):
             aid = f"act_red_m2_mut_{idx + 1:02d}"
             if inject_broken_mutation and idx == 0:
                 mut_code = "raise RuntimeError('Simulated broken telemetry mutation harness')\n"
@@ -527,6 +452,7 @@ res = json.loads(resp.read().decode("utf-8"))
     return _MissionExecutionOutcome(
         transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=mut_results,
         tpr_fpr_matrix=AckTprFprMatrix(
+            metric_kind="detector_tpr_fpr", detector_metrics_applicable=True,
             true_positive_rate=tpr, false_positive_rate=fpr_val, fpr_measured=True,
             benign_corpus_size=len(_M2_BENIGN_CORPUS), attack_variants_tested=rounds_to_run,
             evasion_resistance_rate=tpr, functional_survival_rate=1.0,
@@ -541,4 +467,6 @@ res = json.loads(resp.read().decode("utf-8"))
             f"Matrice empirica su corpus sintetico: TPR={tpr:.2f}, FPR={fpr_val:.3f} (n={len(_M2_BENIGN_CORPUS)}).",
         ),
         patch_diff=patch_diff,
+        patch_classification="semantically_verified_patch" if certified else "none",
+        patch_applicable=False,
     )

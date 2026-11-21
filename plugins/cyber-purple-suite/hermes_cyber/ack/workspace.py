@@ -6,12 +6,11 @@ import ast
 import difflib
 import json
 import os
-import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -142,6 +141,74 @@ def _infer_param_type_hint(source_code: str, target_function: str) -> str:
     return "bytes" if "bytes" in first_arg.arg.lower() or "raw" in first_arg.arg.lower() else "str"
 
 
+class _OversizedStagedFileError(ValueError):
+    """Raised when a regular file exceeds the bounded staging byte limit."""
+
+
+def _read_bounded_regular_file(resolved: Path, max_bytes: int, label: str) -> bytes:
+    """Stat-before-read + bounded read enforcing regular file type and max byte limit."""
+    try:
+        st = resolved.stat()
+    except OSError as exc:
+        raise ValueError(f"Impossibile accedere al file workspace '{label}': {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"File workspace '{label}' non è un file regolare.")
+    if st.st_size > max_bytes:
+        raise _OversizedStagedFileError(
+            f"File workspace '{label}' supera il limite per staging isolato ({max_bytes} byte)."
+        )
+    try:
+        with resolved.open("rb") as fh:
+            data = fh.read(max_bytes + 1)
+    except OSError as exc:
+        raise ValueError(f"Impossibile leggere file workspace '{label}': {exc}") from exc
+    if len(data) > max_bytes:
+        raise _OversizedStagedFileError(
+            f"File workspace '{label}' supera il limite per staging isolato ({max_bytes} byte)."
+        )
+    return data
+
+
+def _resolve_in_perimeter_file(raw_path: Path, perimeter_root: Path, label: str) -> Path:
+    """Resolve *raw_path* rejecting broken symlinks or resolved paths escaping *perimeter_root*."""
+    root_res = perimeter_root.resolve()
+    if raw_path.is_symlink():
+        try:
+            resolved = raw_path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"Symlink interrotto rifiutato in '{label}': {raw_path}") from exc
+        if not resolved.is_relative_to(root_res):
+            raise ValueError(f"Symlink fuori dal perimetro {label} rifiutato: '{raw_path}' -> '{resolved}'")
+        return resolved
+    resolved = raw_path.resolve()
+    if not resolved.is_relative_to(root_res):
+        raise ValueError(f"Percorso fuori dal perimetro {label} rifiutato: '{raw_path}' -> '{resolved}'")
+    return resolved
+
+
+@dataclass(frozen=True)
+class AckSemanticTestCase:
+    """Explicit opt-in wrapper pairing a valid parser input with its expected semantic output."""
+
+    input: Any
+    expected: Any
+
+
+def _encode_valid_input_entry(name: str, raw_item: Any, param_type_hint: str) -> Dict[str, Any]:
+    if isinstance(raw_item, AckSemanticTestCase):
+        entry = _encode_valid_input_entry(name, raw_item.input, param_type_hint)
+        entry["has_semantic_expected"] = True
+        entry["expected_semantic"] = raw_item.expected
+        return entry
+    if isinstance(raw_item, dict) and raw_item.get("encoding") == "hex" and isinstance(raw_item.get("data"), str):
+        return {"name": name, "kind": "bytes", "data": raw_item["data"]}
+    if isinstance(raw_item, (bytes, bytearray)):
+        return {"name": name, "kind": "bytes", "data": bytes(raw_item).hex()}
+    if param_type_hint == "bytes" and isinstance(raw_item, str):
+        return {"name": name, "kind": "bytes", "data": raw_item.encode("utf-8").hex()}
+    return {"name": name, "kind": "json", "data": raw_item}
+
+
 def _build_valid_corpus_entries(
     *,
     param_type_hint: str,
@@ -151,34 +218,49 @@ def _build_valid_corpus_entries(
     entries: List[Dict[str, Any]] = []
     if valid_inputs is not None:
         for idx, item in enumerate(valid_inputs[:64]):
-            if isinstance(item, dict) and item.get("encoding") == "hex" and isinstance(item.get("data"), str):
-                entries.append({"name": f"input_{idx + 1}", "kind": "bytes", "data": item["data"]})
-            elif isinstance(item, (bytes, bytearray)):
-                entries.append({"name": f"input_{idx + 1}", "kind": "bytes", "data": bytes(item).hex()})
-            elif param_type_hint == "bytes" and isinstance(item, str):
-                entries.append({"name": f"input_{idx + 1}", "kind": "bytes", "data": item.encode("utf-8").hex()})
-            else:
-                entries.append({"name": f"input_{idx + 1}", "kind": "json", "data": item})
+            entries.append(_encode_valid_input_entry(f"input_{idx + 1}", item, param_type_hint))
         return entries, True
 
     if valid_corpus_dir:
-        cdir = Path(valid_corpus_dir).resolve()
+        raw_cdir = Path(valid_corpus_dir)
+        if raw_cdir.is_symlink():
+            raise ValueError(f"Directory corpus symlink non consentita: {valid_corpus_dir}")
+        cdir = raw_cdir.resolve()
         if not cdir.is_dir():
             raise FileNotFoundError(f"Directory valid_corpus_dir non trovata: {valid_corpus_dir}")
-        files = sorted(p for p in cdir.iterdir() if p.is_file())[:32]
-        for fpath in files:
-            raw_bytes = fpath.read_bytes()
-            if len(raw_bytes) > 512 * 1024:
+        for fpath in sorted(cdir.iterdir()):
+            if len(entries) >= 32:
+                break
+            if fpath.name.endswith(".expected.json"):
+                continue
+            rel_p = fpath.relative_to(cdir)
+            resolved = _resolve_in_perimeter_file(fpath, cdir, "corpus")
+            if is_sensitive_workspace_file(rel_p) or is_sensitive_workspace_file(resolved.relative_to(cdir)):
+                continue
+            if not resolved.is_file():
+                continue
+            try:
+                raw_bytes = _read_bounded_regular_file(resolved, 512 * 1024, fpath.name)
+            except _OversizedStagedFileError:
                 continue
             if param_type_hint == "bytes" or fpath.suffix.lower() in (".bin", ".dat", ".tlv", ".raw"):
-                entries.append({"name": fpath.name, "kind": "bytes", "data": raw_bytes.hex()})
+                entry: Dict[str, Any] = {"name": fpath.name, "kind": "bytes", "data": raw_bytes.hex()}
             elif fpath.suffix.lower() == ".json" and param_type_hint == "dict":
                 try:
-                    entries.append({"name": fpath.name, "kind": "json", "data": json.loads(raw_bytes.decode("utf-8"))})
+                    entry = {"name": fpath.name, "kind": "json", "data": json.loads(raw_bytes.decode("utf-8"))}
                 except Exception:
-                    entries.append({"name": fpath.name, "kind": "json", "data": raw_bytes.decode("utf-8", errors="replace")})
+                    entry = {"name": fpath.name, "kind": "json", "data": raw_bytes.decode("utf-8", errors="replace")}
             else:
-                entries.append({"name": fpath.name, "kind": "json", "data": raw_bytes.decode("utf-8", errors="replace")})
+                entry = {"name": fpath.name, "kind": "json", "data": raw_bytes.decode("utf-8", errors="replace")}
+
+            sidecar = cdir / f"{fpath.stem}.expected.json"
+            if sidecar.exists() or sidecar.is_symlink():
+                side_res = _resolve_in_perimeter_file(sidecar, cdir, "corpus_sidecar")
+                if not is_sensitive_workspace_file(side_res.relative_to(cdir)) and side_res.is_file():
+                    side_bytes = _read_bounded_regular_file(side_res, 512 * 1024, sidecar.name)
+                    entry["has_semantic_expected"] = True
+                    entry["expected_semantic"] = json.loads(side_bytes.decode("utf-8"))
+            entries.append(entry)
         return entries, True
 
     return [], False
@@ -198,13 +280,16 @@ def stage_python_parser_workspace(
     if not str(target_function or "").strip() or not str(target_function).isidentifier():
         raise ValueError(f"Nome funzione parser non valido: {target_function!r}")
 
-    src_path = Path(target_file_path).resolve()
+    raw_src = Path(target_file_path)
+    if raw_src.is_symlink():
+        raise ValueError(f"Target Workspace Mode symlink non consentito: {target_file_path}")
+    src_path = raw_src.resolve()
     if not src_path.is_file():
         raise FileNotFoundError(f"File target Python non trovato: {target_file_path}")
     if src_path.suffix.lower() != ".py":
         raise ValueError(f"M4 Workspace Mode supporta file .py; ricevuto: {src_path.name}")
 
-    raw_bytes = src_path.read_bytes()
+    raw_bytes = _read_bounded_regular_file(src_path, _MAX_STAGED_FILE_BYTES, src_path.name)
     orig_sha = _sha256_bytes(raw_bytes)
     orig_text = raw_bytes.decode("utf-8")
     param_hint = _infer_param_type_hint(orig_text, str(target_function).strip())
@@ -263,26 +348,46 @@ def stage_python_parser_workspace(
         target_rel_path = src_path.relative_to(project_root).as_posix()
         extra_files: Dict[str, bytes] = {}
         total_bytes = len(raw_bytes)
+        project_root_res = project_root.resolve()
         for root_s, dirs, files in os.walk(project_root):
-            dirs[:] = sorted(d for d in dirs if d not in _SKIP_COPY_DIRS)
+            kept_dirs: List[str] = []
+            for d in sorted(dirs):
+                if d in _SKIP_COPY_DIRS:
+                    continue
+                d_path = Path(root_s) / d
+                if d_path.is_symlink():
+                    try:
+                        d_res = d_path.resolve(strict=True)
+                    except OSError as exc:
+                        raise ValueError(f"Symlink directory interrotta rifiutata: '{d_path}'") from exc
+                    if not d_res.is_relative_to(project_root_res):
+                        raise ValueError(f"Symlink directory fuori dal perimetro workspace rifiutata: '{d_path}' -> '{d_res}'")
+                    continue
+                kept_dirs.append(d)
+            dirs[:] = kept_dirs
             rpath = Path(root_s)
             for fname in sorted(files):
                 fpath = rpath / fname
-                if fpath == src_path or fpath.suffix.lower() == ".pyc" or not fpath.is_file():
+                if fpath == src_path or fpath.suffix.lower() == ".pyc":
                     continue
                 rel_p = fpath.relative_to(project_root)
-                if is_sensitive_workspace_file(rel_p):
-                    continue
                 rel_str = rel_p.as_posix()
+                resolved = _resolve_in_perimeter_file(fpath, project_root, "workspace")
+                if is_sensitive_workspace_file(rel_p) or is_sensitive_workspace_file(resolved.relative_to(project_root_res)):
+                    continue
+                if not resolved.is_file():
+                    continue
                 try:
-                    content_b = fpath.read_bytes()
+                    st_size = resolved.stat().st_size
                 except OSError as exc:
-                    raise ValueError(f"Impossibile leggere dipendenza workspace '{rel_str}': {exc}") from exc
-                if len(content_b) > _MAX_STAGED_FILE_BYTES:
+                    raise ValueError(f"Impossibile accedere a dipendenza workspace '{rel_str}': {exc}") from exc
+                if len(extra_files) + 1 > _MAX_STAGED_FILES or total_bytes + st_size > _MAX_STAGED_TOTAL_BYTES:
                     raise ValueError(
-                        f"File workspace '{rel_str}' supera il limite per staging isolato ({_MAX_STAGED_FILE_BYTES} byte)."
+                        f"Workspace '{project_root}' troppo grande per staging completo "
+                        f"(limite: {_MAX_STAGED_FILES} file / {_MAX_STAGED_TOTAL_BYTES} byte)."
                     )
-                if len(extra_files) + 1 > _MAX_STAGED_FILES or total_bytes + len(content_b) > _MAX_STAGED_TOTAL_BYTES:
+                content_b = _read_bounded_regular_file(resolved, _MAX_STAGED_FILE_BYTES, rel_str)
+                if total_bytes + len(content_b) > _MAX_STAGED_TOTAL_BYTES:
                     raise ValueError(
                         f"Workspace '{project_root}' troppo grande per staging completo "
                         f"(limite: {_MAX_STAGED_FILES} file / {_MAX_STAGED_TOTAL_BYTES} byte)."
@@ -293,10 +398,14 @@ def stage_python_parser_workspace(
         if wt_dir is not None and wt_repo_root is not None:
             wt_target = wt_dir / target_rel_path
             wt_target.parent.mkdir(parents=True, exist_ok=True)
+            if wt_target.is_symlink():
+                wt_target.unlink()
             wt_target.write_bytes(raw_bytes)
             for rel_str, res_bytes in extra_files.items():
                 dest_h = wt_dir / rel_str
                 dest_h.parent.mkdir(parents=True, exist_ok=True)
+                if dest_h.is_symlink():
+                    dest_h.unlink()
                 dest_h.write_bytes(res_bytes)
 
         valid_corpus, user_supplied = _build_valid_corpus_entries(
@@ -324,112 +433,3 @@ def stage_python_parser_workspace(
     except BaseException:
         _cleanup_git_worktree(wt_repo_root, wt_dir)
         raise
-
-
-def apply_ack_run_patch(
-    runs_dir: Path,
-    run_id: str,
-    *,
-    confirm_apply: bool = False,
-) -> Dict[str, Any]:
-    """Explicitly apply a verified Workspace Mode patch onto the original PC file after SHA-256 drift check."""
-    if not re.match(r"^[A-Za-z0-9_-]+$", str(run_id or "")):
-        raise ValueError(f"run_id ACK non valido: {run_id!r}")
-    if confirm_apply is not True:
-        raise PermissionError(
-            "Modifica al progetto originale negata: è richiesta conferma esplicita (confirm_apply=True)."
-        )
-
-    runs_root = runs_dir.resolve()
-    run_dir = (runs_root / run_id).resolve()
-    if run_dir.parent != runs_root:
-        raise ValueError(f"Percorso run_id non valido: {run_id!r}")
-    manifest_path = run_dir / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest della run ACK non trovato: {run_id}")
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("run_id") != run_id:
-        raise ValueError(f"Manifest run_id non corrispondente ({manifest.get('run_id')!r} != {run_id!r}).")
-    if not manifest.get("certified"):
-        raise ValueError(f"Impossibile applicare patch da una run non certificata ({manifest.get('certification_verdict')}).")
-
-    ws = manifest.get("workspace_target")
-    if not isinstance(ws, dict) or not ws.get("target_file_path"):
-        raise ValueError("La run selezionata non ha un target Workspace Mode applicabile su disco.")
-
-    patch_text = (run_dir / "patch.diff").read_text(encoding="utf-8") if (run_dir / "patch.diff").exists() else ""
-    if not patch_text.strip():
-        raise ValueError("patch.diff vuoto: nessuna modifica da applicare.")
-
-    orig_path = Path(ws["target_file_path"]).resolve()
-    if not orig_path.is_file():
-        raise FileNotFoundError(f"File target originale non più presente: {orig_path}")
-
-    patched_root = (run_dir / "patched_target").resolve()
-    rel_snap_path = str(ws.get("target_rel_path") or orig_path.name).replace("\\", "/").lstrip("/")
-    patched_snapshot = (patched_root / rel_snap_path).resolve()
-    if not patched_snapshot.is_relative_to(patched_root) or not patched_snapshot.is_file():
-        raise FileNotFoundError(f"Artefatto patched_target mancante in {run_dir}")
-
-    sha_map = manifest.get("sha256")
-    if not isinstance(sha_map, dict):
-        raise ValueError("Manifest privo di mappa integrità SHA-256: applicazione annullata.")
-    rel_patched_key = f"patched_target/{patched_snapshot.relative_to(patched_root).as_posix()}"
-    expected_patched_sha = str(sha_map.get(rel_patched_key) or "")
-    patched_bytes = patched_snapshot.read_bytes()
-    patched_sha = _sha256_bytes(patched_bytes)
-    if not expected_patched_sha or patched_sha != expected_patched_sha:
-        raise ValueError(
-            f"Integrità snapshot compromessa per {rel_patched_key}: SHA-256 attuale ({patched_sha[:12]}) "
-            f"non corrisponde al manifest ({expected_patched_sha[:12]}). Applicazione annullata."
-        )
-    expected_diff_sha = str(sha_map.get("patch.diff") or "")
-    if not expected_diff_sha or _sha256_bytes((run_dir / "patch.diff").read_bytes()) != expected_diff_sha:
-        raise ValueError("Integrità compromessa o checksum mancante per patch.diff.")
-
-    current_sha = _sha256_bytes(orig_path.read_bytes())
-    expected_sha = str(ws.get("original_sha256") or "")
-    if current_sha != expected_sha:
-        raise ValueError(
-            f"Drift rilevato sul file originale {orig_path.name}: SHA-256 attuale ({current_sha[:12]}) "
-            f"non corrisponde allo stato iniziale ({expected_sha[:12]}). Applicazione annullata."
-        )
-
-    backup_dir = run_dir / "backup"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / f"{orig_path.name}.orig"
-    if not backup_path.exists():
-        backup_path.write_bytes(orig_path.read_bytes())
-
-    orig_path.write_bytes(patched_bytes)
-    applied_at = datetime.now(timezone.utc).isoformat()
-
-    ws["patch_applied"] = True
-    ws["applied_at"] = applied_at
-    ws["applied_sha256"] = patched_sha
-    ws["backup_path"] = str(backup_path)
-    manifest["workspace_target"] = ws
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-    report_path = run_dir / "report.json"
-    if report_path.exists():
-        rep_obj = json.loads(report_path.read_text(encoding="utf-8"))
-        if isinstance(rep_obj.get("workspace_target"), dict):
-            rep_obj["workspace_target"]["patch_applied"] = True
-            rep_obj["workspace_target"]["applied_at"] = applied_at
-            report_path.write_text(json.dumps(rep_obj, indent=2), encoding="utf-8")
-            sha_map = manifest.get("sha256")
-            if isinstance(sha_map, dict):
-                sha_map["report.json"] = _sha256_bytes(report_path.read_bytes())
-                manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-    return {
-        "run_id": run_id,
-        "target_file_path": str(orig_path),
-        "patch_applied": True,
-        "applied_at": applied_at,
-        "original_sha256": expected_sha,
-        "patched_sha256": patched_sha,
-        "backup_path": str(backup_path),
-    }

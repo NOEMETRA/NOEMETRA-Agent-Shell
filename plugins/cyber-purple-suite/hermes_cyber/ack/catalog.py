@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from hermes_cyber.models import (
     AckMissionDescriptor,
     AckMutationRoundResult,
+    AckPatchClassificationType,
     AckStateTransition,
     AckSubAgentTrace,
     AckTprFprMatrix,
@@ -159,3 +160,7 @@ class _MissionExecutionOutcome:
     execution_logs: List[Dict[str, Any]] = field(default_factory=list)
     repro_artifacts: Dict[str, bytes] = field(default_factory=dict)
     workspace_target: Optional[AckWorkspaceTargetInfo] = None
+    patch_classification: AckPatchClassificationType = "none"
+    patch_applicable: bool = False
+    manual_review_required: bool = False
+    manual_review_reasons: List[str] = field(default_factory=list)

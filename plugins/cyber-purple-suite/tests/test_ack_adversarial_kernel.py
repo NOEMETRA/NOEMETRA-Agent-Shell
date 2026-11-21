@@ -53,7 +53,12 @@ def test_all_four_ack_missions_structural_pass_seven_states_and_oob_invariants(m
     # Pre-patch breach must be confirmed by out-of-band oracle before Blue intervention
     assert rep.tpr_fpr_matrix.pre_patch_breach_confirmed is True
     assert rep.tpr_fpr_matrix.post_patch_breaches == 0
-    assert rep.tpr_fpr_matrix.false_positive_rate <= rep.tpr_fpr_matrix.max_allowed_fpr
+    if rep.tpr_fpr_matrix.detector_metrics_applicable:
+        assert rep.tpr_fpr_matrix.false_positive_rate is not None
+        assert rep.tpr_fpr_matrix.false_positive_rate <= rep.tpr_fpr_matrix.max_allowed_fpr
+    else:
+        assert rep.tpr_fpr_matrix.true_positive_rate is None
+        assert rep.tpr_fpr_matrix.false_positive_rate is None
     assert rep.tpr_fpr_matrix.evasion_resistance_rate == 1.0
     assert rep.tpr_fpr_matrix.functional_survival_rate == 1.0
 
@@ -528,6 +533,8 @@ def test_hermes_cyber_modular_architecture_no_monoliths():
         "hermes_cyber.case_verification",
         "hermes_cyber.ack",
         "hermes_cyber.ack.catalog",
+        "hermes_cyber.ack.ast_safety",
+        "hermes_cyber.ack.approval",
         "hermes_cyber.ack.runner_templates",
         "hermes_cyber.ack.chamber",
         "hermes_cyber.ack.fog_of_war",
@@ -535,9 +542,12 @@ def test_hermes_cyber_modular_architecture_no_monoliths():
         "hermes_cyber.ack.manifest_parser",
         "hermes_cyber.ack.manifest_patcher",
         "hermes_cyber.ack.mission_m1_appsec",
+        "hermes_cyber.ack.mission_m2_templates",
         "hermes_cyber.ack.mission_m2_evasion",
+        "hermes_cyber.ack.mission_m3_templates",
         "hermes_cyber.ack.mission_m3_hardening",
         "hermes_cyber.ack.mission_m4_fuzzing",
+        "hermes_cyber.ack.mission_m4_outcome",
         "hermes_cyber.ack.mission_m4_templates",
         "hermes_cyber.ack.workspace",
         "hermes_cyber.ack.deliverables",

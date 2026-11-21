@@ -19,6 +19,10 @@ from hermes_cyber.ack.catalog import (
 )
 from hermes_cyber.ack.chamber import DetonationChamber
 from hermes_cyber.ack.fog_of_war import FogOfWarController
+from hermes_cyber.ack.mission_m4_outcome import (
+    build_m4_early_failure_outcome,
+    build_m4_final_outcome,
+)
 from hermes_cyber.ack.mission_m4_templates import (
     _M4_APPLY_PATCH_SCRIPT,
     _M4_BASE_FUZZ_SCRIPT,
@@ -241,34 +245,19 @@ def _run_m4_fuzz_to_fix(
             ))
             if ws_info is not None and staged is not None:
                 ws_info.original_untouched = _sha256_bytes(Path(staged.target_file_path).read_bytes()) == staged.original_sha256
-            return _MissionExecutionOutcome(
-                transitions=transitions,
-                contracts=contracts,
-                evidences=evidences,
-                mutation_rounds=[],
-                tpr_fpr_matrix=AckTprFprMatrix(
-                    true_positive_rate=0.0,
-                    false_positive_rate=0.0,
-                    evasion_resistance_rate=0.0,
-                    functional_survival_rate=1.0,
-                    pre_patch_breach_confirmed=False,
-                    post_patch_breaches=0,
-                    fpr_measured=bool(valid_corpus),
-                    benign_corpus_size=len(valid_corpus),
-                    attack_variants_tested=0,
-                ),
-                blue_summary="Nessuna patch applicata: i test avversari non hanno causato crash sul target.",
-                certified=False,
-                certification_verdict="NO_BASELINE_CRASH_REPRODUCED",
-                rationale="ORACLE_BASELINE_CHECK non ha riprodotto eccezioni non gestite pre-patch sul target.",
-                audit_scope=audit_scope,
+            return build_m4_early_failure_outcome(
+                transitions=transitions, contracts=contracts, evidences=evidences, traces=traces,
+                exec_logs=exec_logs, repro_artifacts=repro_artifacts, audit_scope=audit_scope,
                 verification_tier=verification_tier,
                 executed_checks=["valid_baseline_capture", "red_subagent_fuzzing", "oob_oracle_baseline_check"],
-                not_executed_checks=["patch_synthesis", "red_bypass_mutation", "real_asan_ubsan_native_sanitizers"],
-                subagent_traces=traces,
-                execution_logs=exec_logs,
-                repro_artifacts=repro_artifacts,
-                workspace_target=ws_info,
+                not_executed_checks=[
+                    "patch_synthesis", "red_bypass_mutation", "real_asan_ubsan_native_sanitizers", "autonomous_shell_tool_agent_team"
+                ],
+                blue_summary="Nessuna patch applicata: i test avversari non hanno causato crash sul target.",
+                cert_verdict="NO_BASELINE_CRASH_REPRODUCED",
+                rationale="ORACLE_BASELINE_CHECK non ha riprodotto eccezioni non gestite pre-patch sul target.",
+                pre_breach=False, func_survival=1.0, total_valid=len(valid_corpus),
+                rej_rate=0.0 if valid_corpus else None, mis_rate=0.0 if valid_corpus else None, ws_info=ws_info,
             )
 
         # 2. Blue Sub-Agents: Triage -> Patch Architect -> Apply Diff (`BLUE_DEFEND`)
@@ -280,7 +269,7 @@ def _run_m4_fuzz_to_fix(
             traceback_excerpt=json.dumps(crashes[:3]),
         )
         triage, triage_trace = BlueTriageSubAgent().diagnose_crash(blue_ctx, crashes, fn_name)
-        patched_parser, blue_summary, arch_trace = BluePatchArchitectSubAgent().synthesize_parser_patch(
+        patched_parser, blue_summary, arch_trace, patch_meta = BluePatchArchitectSubAgent().synthesize_parser_patch(
             target_source,
             fn_name,
             triage,
@@ -293,6 +282,9 @@ def _run_m4_fuzz_to_fix(
             router=blue_router,
         )
         traces.extend([triage_trace, arch_trace])
+        patch_origin = str(patch_meta.get("patch_origin") or "deterministic_exception_wrapper")
+        if ws_info is not None:
+            ws_info.sensitive_ops_in_original = list(patch_meta.get("sensitive_ops_in_original") or [])
         patch_diff = compute_unified_diff(target_source, patched_parser, target_filename)
 
         rel_blue, _ = chamber.write_blue_artifact(
@@ -367,8 +359,14 @@ def _run_m4_fuzz_to_fix(
             except Exception:
                 eval_obj = {}
         total_eval = int(eval_obj.get("total_valid") or 0)
-        fpr_measured = bool(valid_corpus and total_eval > 0 and eval_obj.get("fpr") is not None)
-        fpr_val = float(eval_obj["fpr"]) if fpr_measured else 0.0
+        raw_rej_rate = eval_obj.get("rejection_rate")
+        raw_mis_rate = eval_obj.get("mismatch_rate")
+        raw_sem_rate = eval_obj.get("semantic_pass_rate")
+        rej_rate = float(raw_rej_rate) if (valid_corpus and raw_rej_rate is not None) else (0.0 if is_builtin_tlv else None)
+        mis_rate = float(raw_mis_rate) if (valid_corpus and raw_mis_rate is not None) else None
+        sem_checked = int(eval_obj.get("semantic_checked") or 0)
+        sem_passed = int(eval_obj.get("semantic_passed") or 0)
+        sem_rate = float(raw_sem_rate) if (sem_checked > 0 and raw_sem_rate is not None) else None
         rejected_n = int(eval_obj.get("rejected_count") or 0)
         mismatch_n = int(eval_obj.get("mismatch_count") or 0)
         error_n = int(eval_obj.get("error_count") or 0)
@@ -388,12 +386,15 @@ def _run_m4_fuzz_to_fix(
         )
         evidences.append(OutOfBandOracleEvidence(
             action_id=func_contract.action_id, exit_code=frc, fs_diff=ffs,
-            functional_suite_passed=func_ok, fpr_value=fpr_val if fpr_measured else None,
+            functional_suite_passed=func_ok, fpr_value=None,
             isolation_backend=chamber.isolation_backend, oracle_verdict=func_verdict,
         ))
         transitions.append(AckStateTransition(
             state="ORACLE_FUNCTIONAL_AND_FPR_CHECK", actor="ORACLE",
-            summary=f"Valid corpus ({len(valid_corpus)} casi) + regression crash: passed={func_ok} ({func_verdict}, fpr={fpr_val if fpr_measured else 'N/A'}).",
+            summary=(
+                f"Valid corpus ({len(valid_corpus)} casi, semantiche={sem_passed}/{sem_checked}) "
+                f"+ regression crash: passed={func_ok} ({func_verdict}, rej={rej_rate if rej_rate is not None else 'N/A'})."
+            ),
             passed=func_ok,
         ))
         if not func_ok:
@@ -403,27 +404,24 @@ def _run_m4_fuzz_to_fix(
                 fail_rationale = "Workspace Mode richiede almeno 1 input valido (`valid_corpus_dir` o `valid_inputs`) per verificare la preservazione funzionale prima della certificazione."
             else:
                 fail_verdict = "REJECTED_BROKEN_PARSER"
-                fail_summary = "Respinto: parser rotto o falsi positivi sugli input validi."
-                fail_rationale = "La patch ha alterato l'output o rigettato input validi del corpus."
+                fail_summary = "Respinto: parser rotto, mismatch semantico o rigetto input validi."
+                fail_rationale = "La patch ha alterato l'output, fallito asserzioni semantiche o rigettato input validi del corpus."
             transitions.append(AckStateTransition(state="CERTIFY_REPORT", actor="ORACLE", summary=fail_summary, passed=False))
-            return _MissionExecutionOutcome(
-                transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=[],
-                tpr_fpr_matrix=AckTprFprMatrix(
-                    true_positive_rate=0.0, false_positive_rate=fpr_val, evasion_resistance_rate=0.0,
-                    functional_survival_rate=func_survival, pre_patch_breach_confirmed=pre_breach, post_patch_breaches=0,
-                    fpr_measured=fpr_measured, benign_corpus_size=total_eval if fpr_measured else len(valid_corpus), attack_variants_tested=0,
-                ),
-                blue_summary=blue_summary, certified=False, certification_verdict=fail_verdict,
-                rationale=fail_rationale,
-                audit_scope=audit_scope, verification_tier=verification_tier,
+            return build_m4_early_failure_outcome(
+                transitions=transitions, contracts=contracts, evidences=evidences, traces=traces,
+                exec_logs=exec_logs, repro_artifacts=repro_artifacts, audit_scope=audit_scope,
+                verification_tier=verification_tier,
                 executed_checks=["valid_baseline_capture", "red_subagent_fuzzing", "blue_ast_patch_synthesis", "valid_corpus_functional_gate"],
                 not_executed_checks=[
-                    "red_bypass_mutation",
-                    "real_asan_ubsan_native_sanitizers",
+                    "red_bypass_mutation", "real_asan_ubsan_native_sanitizers", "autonomous_shell_tool_agent_team",
                     *([] if has_valid_evidence else ["user_supplied_valid_corpus_regression"]),
                 ],
-                subagent_traces=traces, patch_diff=patch_diff, regression_test_code=regression_code,
-                execution_logs=exec_logs, repro_artifacts=repro_artifacts, workspace_target=ws_info,
+                blue_summary=blue_summary, cert_verdict=fail_verdict, rationale=fail_rationale,
+                pre_breach=pre_breach, func_survival=func_survival,
+                total_valid=total_eval if total_eval > 0 else len(valid_corpus),
+                rej_rate=rej_rate, mis_rate=mis_rate, sem_rate=sem_rate, sem_checked=sem_checked,
+                patch_diff=patch_diff, regression_code=regression_code, ws_info=ws_info,
+                manual_review_required=True,
             )
 
         # 4. Red Bypass Mutator Sub-Agent (`RED_MUTATE_BYPASS`, iterative Fog of War)
@@ -499,42 +497,18 @@ def _run_m4_fuzz_to_fix(
         if ws_info is not None and staged is not None:
             ws_info.original_untouched = _sha256_bytes(Path(staged.target_file_path).read_bytes()) == staged.original_sha256
 
-        certified = bool(pre_breach and func_ok and has_valid_evidence and post_crashes == 0 and exec_errors == 0 and defense_mode != "naive_block_all")
-        if exec_errors > 0:
-            cert_verdict = "REJECTED_MUTATION_EXECUTION_ERROR"
-            rationale = f"Certificazione negata (fail-closed): {exec_errors} round di fuzzing non validi (`EXECUTION_ERROR`)."
-        elif certified and not is_builtin_tlv:
-            cert_verdict = "VERIFIED_WORKSPACE_PARSER_PATCH"
-            rationale = f"Workspace `{target_filename}.{fn_name}`: crash minimizzato, patch verificata su {len(valid_corpus)} casi validi e {rounds_to_run} classi avversarie; file originale intatto."
-        elif certified:
-            cert_verdict = "CERTIFIED_ZERO_CRASH_PARSER"
-            rationale = "Crash riprodotto pre-fix, eliminato post-patch su tutte le varianti Python testate (modalità Lab)."
-        else:
-            cert_verdict = "PARSER_STILL_CRASHING"
-            rationale = f"{post_crashes} mutazioni continuano a causare crash nel parser."
-
-        executed = [
-            "valid_baseline_capture", "red_subagent_recon_and_weaponize", "crash_delta_minimization",
-            "blue_subagent_triage_and_patch", "post_patch_valid_regression", "red_bypass_mutation_rounds",
-        ]
-        not_executed = ["real_asan_ubsan_native_sanitizers", "real_container_or_microvm_sandbox"]
-        if staged is not None and not staged.user_supplied_corpus:
-            not_executed.append("user_supplied_valid_corpus_regression")
-
-        transitions.append(AckStateTransition(state="CERTIFY_REPORT", actor="ORACLE", summary=rationale, passed=certified))
-        return _MissionExecutionOutcome(
-            transitions=transitions, contracts=contracts, evidences=evidences, mutation_rounds=mut_results,
-            tpr_fpr_matrix=AckTprFprMatrix(
-                true_positive_rate=evasion_res, false_positive_rate=fpr_val, evasion_resistance_rate=evasion_res,
-                functional_survival_rate=func_survival, pre_patch_breach_confirmed=pre_breach,
-                post_patch_breaches=post_crashes + exec_errors, fpr_measured=fpr_measured,
-                benign_corpus_size=total_eval if fpr_measured else len(valid_corpus), attack_variants_tested=rounds_to_run,
-            ),
-            blue_summary=blue_summary, certified=certified, certification_verdict=cert_verdict,
-            rationale=rationale, audit_scope=audit_scope, verification_tier=verification_tier,
-            executed_checks=executed, not_executed_checks=not_executed, subagent_traces=traces,
-            patch_diff=patch_diff, regression_test_code=regression_code,
-            execution_logs=exec_logs, repro_artifacts=repro_artifacts, workspace_target=ws_info,
+        return build_m4_final_outcome(
+            patch_origin=patch_origin, defense_mode=defense_mode, is_builtin_tlv=is_builtin_tlv,
+            pre_breach=pre_breach, func_ok=func_ok, post_crashes=post_crashes, exec_errors=exec_errors,
+            rounds_to_run=rounds_to_run, evasion_res=evasion_res, rej_rate=rej_rate, mis_rate=mis_rate,
+            sem_rate=sem_rate, sem_checked=sem_checked, sem_passed=sem_passed, func_survival=func_survival,
+            total_valid=len(valid_corpus), benign_corpus_size=total_eval if total_eval > 0 else len(valid_corpus),
+            target_filename=target_filename, fn_name=fn_name, patch_meta=patch_meta, blue_summary=blue_summary,
+            audit_scope=audit_scope, verification_tier=verification_tier,
+            has_user_supplied_corpus=bool(staged.user_supplied_corpus) if staged is not None else False,
+            transitions=transitions, contracts=contracts, evidences=evidences, mut_results=mut_results,
+            traces=traces, patch_diff=patch_diff, regression_code=regression_code,
+            exec_logs=exec_logs, repro_artifacts=repro_artifacts, ws_info=ws_info,
         )
     finally:
         if staged is not None:

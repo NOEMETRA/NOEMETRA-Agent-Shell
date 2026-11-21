@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -43,6 +46,47 @@ def _req_assistant(request: Request):
         profile_name, authorized_home = ctx
         return get_cyber_assistant(profile=profile_name, home_dir=authorized_home)
     return get_cyber_assistant()
+
+
+def _enforce_gateway_auth_if_active(request: Request) -> None:
+    """Enforce Hermes gateway/hosted admission when mounted inside web_server or PluginHost."""
+    hosted = getattr(request.state, "hosted_http_authenticated", None)
+    if hosted is False:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if hosted is True or getattr(request.state, "native_http_principal", None):
+        return
+    web_srv = sys.modules.get("hermes_cli.web_server")
+    in_gateway = bool(getattr(request.app.state, "auth_required", False)) or (
+        web_srv is not None and getattr(web_srv, "app", None) is request.app
+    )
+    if in_gateway:
+        from hermes_cli.web_server import _require_token
+        _require_token(request)
+
+
+def _is_remote_http_client(request: Request) -> bool:
+    """Return True if the request arrived over a proxy or non-loopback client address."""
+    if "x-forwarded-for" in request.headers or "forwarded" in request.headers:
+        return True
+    host = (request.client.host if request.client else "").strip().lower()
+    return host not in ("127.0.0.1", "::1", "localhost")
+
+
+def _resolve_operator_principal_id(request: Request) -> str:
+    """Derive a stable operator principal identifier from request auth state."""
+    native = getattr(request.state, "native_http_principal", None)
+    if native is not None:
+        raw = json.dumps(native, sort_keys=True, default=str) if isinstance(native, dict) else str(native)
+        return f"native:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
+    sess = getattr(request.state, "session", None)
+    if sess is not None:
+        uid = getattr(sess, "user_id", None) or getattr(sess, "sub", None) or getattr(sess, "email", None)
+        prov = getattr(sess, "provider", None) or ""
+        raw = f"{prov}:{uid}" if uid else repr(sess)
+        return f"session:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
+    if getattr(request.state, "hosted_http_authenticated", None) is True:
+        return "hosted"
+    return ""
 
 
 class ScenarioAnalyzeRequest(BaseModel):
@@ -94,9 +138,18 @@ class AckMissionRunRequest(BaseModel):
     workspace_mode: Literal["isolated_copy", "git_worktree"] = "isolated_copy"
 
 
+class AckApplyApprovalRequest(BaseModel):
+    run_id: str
+    target_file_path: str
+    session_id: str
+    acknowledge_manual_review: bool = False
+
+
 class AckApplyPatchRequest(BaseModel):
     run_id: str
     confirm_apply: bool = False
+    approval_token: str = ""
+    session_id: str = ""
 
 
 @router.get("/status")
@@ -228,14 +281,43 @@ async def run_ack_mission(req: AckMissionRunRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@router.post("/ack/apply-approval")
+async def issue_ack_apply_approval_endpoint(req: AckApplyApprovalRequest, request: Request):
+    _enforce_gateway_auth_if_active(request)
+    assistant = _req_assistant(request)
+    remote_client = _is_remote_http_client(request)
+    operator_principal = _resolve_operator_principal_id(request)
+    try:
+        return await asyncio.to_thread(
+            assistant.issue_ack_patch_approval,
+            req.run_id,
+            session_id=req.session_id,
+            expected_target_file_path=req.target_file_path,
+            acknowledge_manual_review=req.acknowledge_manual_review,
+            remote_client=remote_client,
+            operator_principal=operator_principal,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @router.post("/ack/apply-patch")
 async def apply_ack_patch_endpoint(req: AckApplyPatchRequest, request: Request):
+    _enforce_gateway_auth_if_active(request)
     assistant = _req_assistant(request)
+    operator_principal = _resolve_operator_principal_id(request)
     try:
         return await asyncio.to_thread(
             assistant.apply_ack_patch,
             req.run_id,
             confirm_apply=req.confirm_apply,
+            approval_token=req.approval_token,
+            session_id=req.session_id,
+            operator_principal=operator_principal,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
